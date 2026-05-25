@@ -8,6 +8,7 @@ from core.config.repositories import (
     ConfigVersionRepo,
     SubscriptionRepo,
 )
+from core.config.snapshot import load_snapshot
 
 pytestmark = pytest.mark.integration
 
@@ -99,3 +100,31 @@ async def test_checkpoint_upsert(db) -> None:
         row = await cp.get("eth-mainnet")
         assert row is not None
         assert row.last_block == 101 and row.last_block_hash == "0xbb"
+
+
+@pytest.mark.asyncio
+async def test_load_snapshot_round_trip(db) -> None:
+    async with db.session() as s:
+        await ChainRepo(s).create(
+            id="eth-mainnet", kind=ChainKind.evm, rpc_http="http://x",
+            rpc_ws=None, confirmations=12, poll_interval_ms=3000, enabled=True,
+        )
+        ch = await ChannelRepo(s).create(name="hook", type=ChannelType.http, config={"url": "http://x"})
+        sub = await SubscriptionRepo(s).create(
+            name="wallet1", chain_id="eth-mainnet", address="0xabc", abi_id=None,
+            match_kind=MatchKind.native_transfer, match_name=None,
+            arg_filters={"to": "0xabc"}, enabled=True,
+        )
+        await SubscriptionRepo(s).bind_channel(sub.id, ch.id)
+        await ConfigVersionRepo(s).bump()
+        await s.commit()
+
+    async with db.session() as s:
+        snap = await load_snapshot(s)
+    assert snap.version == 1
+    assert len(snap.chains) == 1 and snap.chains[0].id == "eth-mainnet"
+    assert len(snap.subscriptions) == 1
+    assert snap.subscriptions[0].channel_ids == [ch.id]
+    assert snap.subscriptions[0].arg_filters == {"to": "0xabc"}
+    assert len(snap.channels) == 1
+    assert snap.channels[0].type == "http"

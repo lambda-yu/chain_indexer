@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.config.repositories import (
+    ChainRepo,
+    ConfigVersionRepo,
+    SubscriptionRepo,
+)
+
+
+@dataclass(frozen=True)
+class SnapshotSubscription:
+    id: str
+    name: str
+    chain_id: str
+    address: str | None
+    abi_id: str | None
+    match_kind: str
+    match_name: str | None
+    arg_filters: dict[str, Any]
+    enabled: bool
+    channel_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SnapshotChannel:
+    id: str
+    name: str
+    type: str
+    config: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SnapshotChain:
+    id: str
+    kind: str
+    rpc_http: str
+    rpc_ws: str | None
+    confirmations: int
+    poll_interval_ms: int
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """Read-only snapshot. The `list[...]` fields are mutable-typed but treat as immutable;
+    rebuild a new snapshot rather than mutating in place."""
+    version: int
+    subscriptions: list[SnapshotSubscription]
+    channels: list[SnapshotChannel]
+    chains: list[SnapshotChain] = field(default_factory=list)
+
+    def subscriptions_for_chain(self, chain_id: str) -> list[SnapshotSubscription]:
+        return [s for s in self.subscriptions if s.chain_id == chain_id and s.enabled]
+
+    def channels_for_subscription(
+        self, sub: SnapshotSubscription
+    ) -> list[SnapshotChannel]:
+        by_id = {c.id: c for c in self.channels}
+        return [by_id[cid] for cid in sub.channel_ids if cid in by_id]
+
+
+async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
+    """Build a ConfigSnapshot from the database in a single transaction."""
+    version = await ConfigVersionRepo(session).get()
+    chains_rows = await ChainRepo(session).list_enabled()
+    sub_bindings = await SubscriptionRepo(session).list_enabled_with_channels()
+
+    snap_chains = [
+        SnapshotChain(
+            id=c.id,
+            kind=c.kind.value,
+            rpc_http=c.rpc_http,
+            rpc_ws=c.rpc_ws,
+            confirmations=c.confirmations,
+            poll_interval_ms=c.poll_interval_ms,
+        )
+        for c in chains_rows
+    ]
+
+    snap_channels_by_id: dict[str, SnapshotChannel] = {}
+    snap_subs: list[SnapshotSubscription] = []
+    for sub, channels in sub_bindings:
+        for ch in channels:
+            snap_channels_by_id.setdefault(
+                ch.id,
+                SnapshotChannel(id=ch.id, name=ch.name, type=ch.type.value, config=ch.config),
+            )
+        snap_subs.append(
+            SnapshotSubscription(
+                id=sub.id,
+                name=sub.name,
+                chain_id=sub.chain_id,
+                address=sub.address,
+                abi_id=sub.abi_id,
+                match_kind=sub.match_kind.value,
+                match_name=sub.match_name,
+                arg_filters=sub.arg_filters or {},
+                enabled=sub.enabled,
+                channel_ids=[c.id for c in channels],
+            )
+        )
+
+    return ConfigSnapshot(
+        version=version,
+        subscriptions=snap_subs,
+        channels=list(snap_channels_by_id.values()),
+        chains=snap_chains,
+    )

@@ -34,6 +34,7 @@ dev = [
     "testcontainers>=4.0",
     "respx>=0.20",                # httpx mocking
     "types-PyYAML>=6.0",
+    "eth-account>=0.11,<1",
 ]
 
 [build-system]
@@ -67,6 +68,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: requires testcontainers",
-    "e2e: requires anvil",
+    "e2e: end-to-end tests; require Foundry/Anvil and run a webhook receiver in-process",
 ]
 addopts = "-q --strict-markers"

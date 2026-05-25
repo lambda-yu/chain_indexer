@@ -74,8 +74,12 @@ class ConfigWatcher:
             if t is None:
                 continue
             t.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):  # noqa: BLE001
+            try:
                 await t
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                log.exception("config_watcher.task_stop_failed", task=t.get_name())
         self._sub_task = self._poll_task = None
 
     async def _run_subscriber(self) -> None:

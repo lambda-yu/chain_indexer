@@ -139,6 +139,14 @@ class ChainRunner:
 
     async def _handle_head(self, header: BlockHeader) -> None:
         assert self._buffer is not None and self._adapter is not None
+        # Capture matcher/notifier refs once per head so a concurrent
+        # apply_snapshot() swap doesn't drop events on a half-rebuilt notifier.
+        # Matches the documented contract: snapshot swaps don't replay history,
+        # and any block already in flight finishes under the snapshot it started.
+        assert self._matcher is not None and self._notifier is not None
+        matcher = self._matcher
+        notifier = self._notifier
+
         # Pre-fetch ancestors only when the head doesn't link cleanly. The
         # buffer's sync resolver then becomes a pure dict lookup.
         cache: dict[str, BlockHeader] = {}
@@ -170,7 +178,7 @@ class ChainRunner:
             confirmed = result  # list[BlockHeader]
 
         for h in confirmed:
-            await self._process_confirmed_block(h.number)
+            await self._process_confirmed_block(h.number, matcher=matcher, notifier=notifier)
 
     async def _prefetch_ancestors_for(self, header: BlockHeader) -> dict[str, BlockHeader]:
         """Fetch up to `confirmations + 1` blocks at the heights below `header`
@@ -192,16 +200,21 @@ class ChainRunner:
             out[blk.header.hash] = blk.header
         return out
 
-    async def _process_confirmed_block(self, number: int) -> None:
-        assert self._adapter is not None and self._matcher is not None
-        assert self._notifier is not None
+    async def _process_confirmed_block(
+        self,
+        number: int,
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        assert self._adapter is not None
         block = await self._adapter.fetch_block(number)
         events = list(self._pipeline.run(block))
         for event in events:
-            hits = [(sub, chans) for sub, chans in self._matcher.match(event) if chans]
+            hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
             if not hits:
                 continue
-            await self._notifier.dispatch(event, hits)
+            await notifier.dispatch(event, hits)
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
 
     async def stop(self) -> None:

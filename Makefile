@@ -14,7 +14,7 @@ typecheck:
 	mypy core apps
 
 test:
-	pytest
+	pytest tests/unit tests/integration -v -m "not e2e"
 
 test-unit:
 	pytest tests/unit
@@ -23,7 +23,7 @@ test-integration:
 	pytest tests/integration -m integration
 
 test-e2e:
-	pytest tests/e2e -m e2e
+	pytest tests/e2e -v -m e2e
 
 migrate:
 	alembic upgrade head

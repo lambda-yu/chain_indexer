@@ -167,6 +167,15 @@ Channel registry: `CHANNEL_REGISTRY: dict[str, type[Channel]]`. Only enabled cha
 
 MQ uses a sub-driver pattern: `MqChannel` holds a `MqDriver` instance.
 
+```python
+class MqDriver(Protocol):
+    async def start(self, config: dict) -> None: ...
+    async def stop(self) -> None: ...
+    async def publish(self, payload: dict, *, routing: dict) -> None: ...
+```
+
+`routing` carries already-rendered values (e.g. resolved `routing_key` / `topic` / `subject`) so the driver stays dumb.
+
 | Driver | Lib | Key config |
 |---|---|---|
 | `rabbitmq` | aio-pika | exchange, routing_key (templated: `{chain_id}`, `{name}`) |
@@ -178,7 +187,7 @@ MQ uses a sub-driver pattern: `MqChannel` holds a `MqDriver` instance.
 
 - Repository pattern over SQLAlchemy async.
 - On worker startup: full snapshot into in-memory subscription index.
-- Hot reload: on `config_changed` Redis event OR periodic 5s poll of `config_version.version`, the worker refreshes its index.
+- Hot reload: on `config_changed` Redis event OR periodic 5s poll of `config_version.version`, the worker refreshes its index. The poll is the authoritative fallback: if Redis is unreachable, the 5s poll alone guarantees eventual consistency.
 
 ### 5.6 `core/bus/` — Internal Bus
 
@@ -258,8 +267,19 @@ Documented downstream contract: a notified event with `(chain_id, tx_hash, log_i
 | `abi_id` | fk → `abis` \| null | required for `event` / `call` |
 | `match_kind` | enum | `native_transfer` / `token_transfer` / `event` / `call` |
 | `match_name` | str \| null | required for `event` / `call` |
-| `arg_filters` | json | `{ "to": "0xabc", "value_gte": "1000000000000000000" }` |
+| `arg_filters` | json | see filter grammar below |
 | `enabled` | bool | |
+
+**`arg_filters` grammar** (closed set, no expression language):
+
+| Key suffix | Operator | Example |
+|---|---|---|
+| `<field>` | equality (case-insensitive for hex addresses) | `{ "to": "0xabc..." }` |
+| `<field>_in` | membership | `{ "to_in": ["0xa...", "0xb..."] }` |
+| `<field>_gte` | ≥ (decimal string for big ints) | `{ "value_gte": "1000000000000000000" }` |
+| `<field>_lte` | ≤ | `{ "value_lte": "1000" }` |
+
+All operators on the same map are AND-combined. Unknown operators are rejected at write time.
 
 ### 7.4 `channels`
 
@@ -329,7 +349,9 @@ Single row, `version int`. Incremented on every config write. Worker uses it to 
 }
 ```
 
-`delivery_id` is the idempotency key for downstream dedupe.
+**Two distinct dedup keys** (different layers, both useful):
+- `(chain_id, tx_hash, log_index, block_hash)` — logical event identity. Survives across restarts and is what downstream should use to reconcile reorgs (same event under a new `block_hash` after a reorg).
+- `delivery_id` — per-attempt idempotency key. Lets a channel consumer skip a duplicate caused by at-least-once retry of the same logical event, without having to compute the event key.
 
 ## 9. Error Handling
 
@@ -339,6 +361,7 @@ Single row, `version int`. Incremented on every config write. Worker uses it to 
 | RPC WS disconnect | Reconnect every ≤5s; HTTP poll bridges the gap (no block loss) |
 | Malformed block from RPC | Skip block, log WARN; do not block subsequent blocks |
 | Reorg | ConfirmationBuffer rewinds to common ancestor; already-emitted events are NOT retracted (consumers reconcile via `block_hash`) |
+| Deep reorg (beyond `confirmations`) | Log ERROR with the divergent block range; skip the affected range and continue from the new canonical head. Operationally rare; consumers must reconcile by `block_hash`. |
 | ABI decode failure | Downgrade event to `kind="log"` with raw payload; still subject to matching |
 | Matcher exception per event | Skip event, increment error counter, log ERROR |
 | `Channel.send` exception | Retry 3× with exponential backoff (1/4/16s); final failure → log only |

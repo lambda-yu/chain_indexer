@@ -11,11 +11,11 @@ context manager (which is what would otherwise trigger the lifespan).
 """
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, cast
 
+import structlog
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -25,16 +25,26 @@ from core.bus.redis_bus import RedisBus
 from core.config.db import Database
 from core.settings import load_settings
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Open DB pool and Redis bus on startup; close on shutdown.
+
+    If `bus.connect()` raises after `db.connect()` has succeeded, the DB pool
+    must still be released. Both connect calls live inside try-blocks that
+    unwind on failure so no resource leaks even on partial startup.
+    """
     settings = load_settings()
     db = Database(settings.database.url)
     bus = RedisBus(url=settings.redis.url)
     await db.connect()
-    await bus.connect()
+    try:
+        await bus.connect()
+    except BaseException:
+        await db.disconnect()
+        raise
     app.state.db = db
     app.state.bus = bus
     try:

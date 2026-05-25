@@ -7,14 +7,15 @@ within 5 s (spec §5.5).
 """
 from __future__ import annotations
 
-import logging
+import asyncio
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.bus.redis_bus import RedisBus
 from core.config.repositories import ConfigVersionRepo
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 
 async def bump_and_publish(
@@ -38,7 +39,15 @@ async def bump_and_publish(
             "config_changed",
             {"entity": entity, "id": entity_id, "action": action, "version": new_version},
         )
-    except Exception as exc:  # noqa: BLE001 — Redis publish is best-effort
-        # Poll fallback covers this — see spec §5.5.
-        log.warning("config_changed publish failed: %r", exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — Redis publish is best-effort; poll fallback covers it (spec §5.5).
+        log.warning(
+            "web.config_changed_publish_failed",
+            entity=entity,
+            entity_id=entity_id,
+            action=action,
+            version=new_version,
+            exc=repr(exc),
+        )
     return new_version

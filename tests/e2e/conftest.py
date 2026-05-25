@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import socket
 import subprocess
@@ -82,8 +83,8 @@ async def anvil() -> AsyncIterator[AnvilHandle]:
             "--block-time", "1",  # mine a block every second to keep the test snappy
             "--silent",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
     rpc_url = f"http://127.0.0.1:{port}"
@@ -164,3 +165,5 @@ async def webhook_receiver() -> AsyncIterator[WebhookHandle]:
             await asyncio.wait_for(serve_task, timeout=3.0)
         except TimeoutError:
             serve_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await serve_task

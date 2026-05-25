@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+from typing import Any
+
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.config.models import (
+    Abi,
+    AbiKind,
+    Chain,
+    ChainKind,
+    Channel,
+    ChannelType,
+    Checkpoint,
+    ConfigVersion,
+    MatchKind,
+    Subscription,
+    SubscriptionChannel,
+)
+
+
+class ChainRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def create(
+        self,
+        *,
+        id: str,
+        kind: ChainKind,
+        rpc_http: str,
+        rpc_ws: str | None,
+        confirmations: int,
+        poll_interval_ms: int,
+        enabled: bool,
+    ) -> Chain:
+        c = Chain(
+            id=id, kind=kind, rpc_http=rpc_http, rpc_ws=rpc_ws,
+            confirmations=confirmations, poll_interval_ms=poll_interval_ms,
+            enabled=enabled,
+        )
+        self.s.add(c)
+        await self.s.flush()
+        return c
+
+    async def get(self, chain_id: str) -> Chain | None:
+        r = await self.s.execute(select(Chain).where(Chain.id == chain_id))
+        return r.scalar_one_or_none()
+
+    async def list_enabled(self) -> list[Chain]:
+        r = await self.s.execute(select(Chain).where(Chain.enabled.is_(True)))
+        return list(r.scalars().all())
+
+    async def update(self, chain_id: str, **fields: Any) -> None:
+        await self.s.execute(sa_update(Chain).where(Chain.id == chain_id).values(**fields))
+
+    async def delete(self, chain_id: str) -> None:
+        c = await self.get(chain_id)
+        if c is not None:
+            await self.s.delete(c)
+
+
+class ChannelRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def create(self, *, name: str, type: ChannelType, config: dict[str, Any]) -> Channel:
+        c = Channel(name=name, type=type, config=config)
+        self.s.add(c)
+        await self.s.flush()
+        return c
+
+    async def get(self, channel_id: str) -> Channel | None:
+        r = await self.s.execute(select(Channel).where(Channel.id == channel_id))
+        return r.scalar_one_or_none()
+
+    async def list_all(self) -> list[Channel]:
+        r = await self.s.execute(select(Channel))
+        return list(r.scalars().all())
+
+    async def update(self, channel_id: str, **fields: Any) -> None:
+        await self.s.execute(sa_update(Channel).where(Channel.id == channel_id).values(**fields))
+
+    async def delete(self, channel_id: str) -> None:
+        c = await self.get(channel_id)
+        if c is not None:
+            await self.s.delete(c)
+
+
+class SubscriptionRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def create(
+        self,
+        *,
+        name: str,
+        chain_id: str,
+        address: str | None,
+        abi_id: str | None,
+        match_kind: MatchKind,
+        match_name: str | None,
+        arg_filters: dict[str, Any],
+        enabled: bool,
+    ) -> Subscription:
+        sub = Subscription(
+            name=name, chain_id=chain_id, address=address, abi_id=abi_id,
+            match_kind=match_kind, match_name=match_name, arg_filters=arg_filters,
+            enabled=enabled,
+        )
+        self.s.add(sub)
+        await self.s.flush()
+        return sub
+
+    async def get(self, sub_id: str) -> Subscription | None:
+        r = await self.s.execute(select(Subscription).where(Subscription.id == sub_id))
+        return r.scalar_one_or_none()
+
+    async def list_all(self) -> list[Subscription]:
+        r = await self.s.execute(select(Subscription))
+        return list(r.scalars().all())
+
+    async def list_enabled_with_channels(self) -> list[tuple[Subscription, list[Channel]]]:
+        subs_res = await self.s.execute(
+            select(Subscription).where(Subscription.enabled.is_(True))
+        )
+        subs = list(subs_res.scalars().all())
+        out: list[tuple[Subscription, list[Channel]]] = []
+        for sub in subs:
+            ch_res = await self.s.execute(
+                select(Channel)
+                .join(SubscriptionChannel, SubscriptionChannel.channel_id == Channel.id)
+                .where(SubscriptionChannel.subscription_id == sub.id)
+            )
+            out.append((sub, list(ch_res.scalars().all())))
+        return out
+
+    async def bind_channel(self, sub_id: str, channel_id: str) -> None:
+        self.s.add(SubscriptionChannel(subscription_id=sub_id, channel_id=channel_id))
+        await self.s.flush()
+
+    async def unbind_channel(self, sub_id: str, channel_id: str) -> None:
+        await self.s.execute(
+            sa_delete(SubscriptionChannel).where(
+                SubscriptionChannel.subscription_id == sub_id,
+                SubscriptionChannel.channel_id == channel_id,
+            )
+        )
+
+    async def update(self, sub_id: str, **fields: Any) -> None:
+        await self.s.execute(sa_update(Subscription).where(Subscription.id == sub_id).values(**fields))
+
+    async def delete(self, sub_id: str) -> None:
+        sub = await self.get(sub_id)
+        if sub is not None:
+            await self.s.delete(sub)
+
+
+class AbiRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def create(self, *, name: str, kind: AbiKind, body: Any) -> Abi:
+        a = Abi(name=name, kind=kind, body=body)
+        self.s.add(a)
+        await self.s.flush()
+        return a
+
+    async def get(self, abi_id: str) -> Abi | None:
+        r = await self.s.execute(select(Abi).where(Abi.id == abi_id))
+        return r.scalar_one_or_none()
+
+    async def list_all(self) -> list[Abi]:
+        r = await self.s.execute(select(Abi))
+        return list(r.scalars().all())
+
+
+class CheckpointRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def get(self, chain_id: str) -> Checkpoint | None:
+        r = await self.s.execute(select(Checkpoint).where(Checkpoint.chain_id == chain_id))
+        return r.scalar_one_or_none()
+
+    async def upsert(self, chain_id: str, *, last_block: int, last_block_hash: str) -> None:
+        # SELECT-then-INSERT/UPDATE: deliberately portable across SQLite/PG/MySQL
+        # instead of dialect-specific ON CONFLICT. Single-writer worker process,
+        # so the race window is benign in practice.
+        existing = await self.get(chain_id)
+        if existing is None:
+            self.s.add(
+                Checkpoint(
+                    chain_id=chain_id, last_block=last_block, last_block_hash=last_block_hash
+                )
+            )
+        else:
+            existing.last_block = last_block
+            existing.last_block_hash = last_block_hash
+        await self.s.flush()
+
+
+class ConfigVersionRepo:
+    """Single-row, monotonic version counter. Bumped on every config write."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def get(self) -> int:
+        r = await self.s.execute(select(ConfigVersion).where(ConfigVersion.id == 1))
+        row = r.scalar_one_or_none()
+        return row.version if row else 0
+
+    async def bump(self) -> int:
+        row = await self.s.get(ConfigVersion, 1)
+        if row is None:
+            row = ConfigVersion(id=1, version=1)
+            self.s.add(row)
+            await self.s.flush()
+            return 1
+        row.version += 1
+        await self.s.flush()
+        return row.version

@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+
+from apps.worker.chain_runner import ChainRunner
+from core.chains.types import Block, BlockHeader, Tx
+from core.config.snapshot import (
+    ConfigSnapshot,
+    SnapshotChain,
+    SnapshotChannel,
+    SnapshotSubscription,
+)
+from core.notifier.channel import Channel
+
+
+def _chain() -> SnapshotChain:
+    return SnapshotChain(
+        id="eth-test",
+        kind="evm",
+        rpc_http="http://x",
+        rpc_ws=None,
+        confirmations=2,
+        poll_interval_ms=10,
+    )
+
+
+def _sub(channel_ids: list[str], **overrides: Any) -> SnapshotSubscription:
+    base: dict[str, Any] = dict(
+        id="s1",
+        name="sub",
+        chain_id="eth-test",
+        address=None,
+        abi_id=None,
+        match_kind="native_transfer",
+        match_name=None,
+        arg_filters={},
+        enabled=True,
+        channel_ids=channel_ids,
+    )
+    base.update(overrides)
+    return SnapshotSubscription(**base)
+
+
+def _ch(id_: str = "c1") -> SnapshotChannel:
+    return SnapshotChannel(id=id_, name="hook", type="collect", config={})
+
+
+class _CollectingChannel(Channel):
+    type = "collect"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+
+    async def send(self, payload: dict[str, Any]) -> None:
+        self.calls.append(payload)
+
+
+class _FakeAdapter:
+    """Stand-in for EvmAdapter. Drives BlockHeaders from a test-controlled queue.
+
+    Matches the EvmAdapter lifecycle from Chunk 3: explicit `connect()` /
+    `disconnect()` calls. `fetch_block(n)` is the only I/O ChainRunner needs;
+    `subscribe_heads()` returns an unbounded async generator that the test
+    cancels via `task.cancel()`.
+    """
+
+    chain_id = "eth-test"
+    confirmations = 2
+
+    def __init__(self, blocks: list[Block]) -> None:
+        self._blocks = {b.header.number: b for b in blocks}
+        self._head_q: asyncio.Queue[BlockHeader] = asyncio.Queue()
+        self.connected = False
+
+    def add_block(self, block: Block) -> None:
+        """Add a block to the fetch-by-number index BEFORE pushing its head."""
+        self._blocks[block.header.number] = block
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def push_head(self, header: BlockHeader) -> None:
+        await self._head_q.put(header)
+
+    def subscribe_heads(self) -> AsyncIterator[BlockHeader]:
+        async def _gen() -> AsyncIterator[BlockHeader]:
+            while True:
+                yield await self._head_q.get()
+
+        return _gen()
+
+    async def fetch_block(self, number: int) -> Block:
+        return self._blocks[number]
+
+    async def fetch_logs(self, _from: int, _to: int, _addr: list[str] | None = None) -> list[Any]:
+        return []
+
+    async def get_latest_block_number(self) -> int:
+        return max(self._blocks) if self._blocks else 0
+
+    async def disconnect(self) -> None:
+        self.connected = False
+
+
+def _hdr(n: int, parent: str = "0xp") -> BlockHeader:
+    return BlockHeader(number=n, hash=f"0xh{n}", parent_hash=parent, timestamp=n * 10)
+
+
+def _block_with_native(n: int, value_wei: int, to: str = "0xdead") -> Block:
+    return Block(
+        header=_hdr(n, parent=f"0xh{n - 1}" if n > 0 else "0x0"),
+        txs=[
+            Tx(
+                hash=f"0xt{n}",
+                index=0,
+                from_addr="0xc0ffee",
+                to_addr=to,
+                value=value_wei,
+                input="0x",
+                status=1,
+            )
+        ],
+        logs=[],
+    )
+
+
+class _CheckpointStub:
+    """In-memory stand-in for the checkpoint repo."""
+
+    def __init__(self, initial: tuple[int, str] | None = None) -> None:
+        self.value = initial
+        self.saves: list[tuple[int, str]] = []
+
+    async def get(self, _chain_id: str) -> tuple[int, str] | None:
+        return self.value
+
+    async def save(self, chain_id: str, last_block: int, last_block_hash: str) -> None:
+        self.value = (last_block, last_block_hash)
+        self.saves.append((last_block, last_block_hash))
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_native_transfer_through_pipeline() -> None:
+    chain = _chain()
+    blocks = [_block_with_native(n, value_wei=10**18) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"])],
+        channels=[_ch("c1")],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        # block 1 + 2 are inside the confirmation window (depth<2) and not emitted yet.
+        # block 3 confirms block 1; block 4 confirms block 2.
+        # Expect 2 dispatches.
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        assert {c["event"]["block_number"] for c in coll.calls} == {1, 2}
+        assert cp.value == (2, "0xh2")  # last checkpoint = last confirmed block
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_apply_snapshot_swaps_subscriptions_live() -> None:
+    chain = _chain()
+    blocks = [_block_with_native(n, value_wei=10**18) for n in (1, 2, 3)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    initial_snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], enabled=False)],  # disabled at start
+        channels=[_ch("c1")],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+    )
+    await runner.start(initial_snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        # Push block 1; should NOT dispatch (subscription disabled).
+        await adapter.push_head(blocks[0].header)
+        await adapter.push_head(blocks[1].header)
+        await adapter.push_head(blocks[2].header)
+        await asyncio.sleep(0.1)
+        assert len(coll.calls) == 0
+
+        # Hot-reload: enable the subscription.
+        new_snap = ConfigSnapshot(
+            version=2,
+            chains=[chain],
+            subscriptions=[_sub(channel_ids=["c1"], enabled=True)],
+            channels=[_ch("c1")],
+        )
+        await runner.apply_snapshot(new_snap)
+
+        # Register block 4 BEFORE pushing its header so fetch_block won't KeyError.
+        adapter.add_block(_block_with_native(4, value_wei=10**18))
+        await adapter.push_head(_hdr(4, parent="0xh3"))
+        # block 2 now sits at depth 2 (tip=4) and will dispatch under the new snapshot.
+        # block 1 was already confirmed before the reload and is NOT replayed
+        # (apply_snapshot doesn't rewind history — documented contract).
+        for _ in range(30):
+            if coll.calls:
+                break
+            await asyncio.sleep(0.02)
+        assert any(c["event"]["block_number"] == 2 for c in coll.calls)
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_seeds_buffer_from_checkpoint() -> None:
+    chain = _chain()
+    adapter = _FakeAdapter(blocks=[])
+    cp = _CheckpointStub(initial=(42, "0xh42"))
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=cp,
+    )
+    snap = ConfigSnapshot(version=1, chains=[chain], subscriptions=[], channels=[])
+    await runner.start(snap)
+    try:
+        assert runner.resume_from == (42, "0xh42")
+    finally:
+        await runner.stop()

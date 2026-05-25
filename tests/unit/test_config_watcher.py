@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import cast
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.worker.config_watcher import ConfigWatcher
 from core.config.snapshot import ConfigSnapshot
@@ -53,10 +55,13 @@ class _FakeSessionFactory:
         self.load_calls = 0
 
     @asynccontextmanager
-    async def __call__(self) -> AsyncIterator[object]:
-        yield self  # the loader never touches the session in this fake
+    async def __call__(self) -> AsyncIterator[AsyncSession]:
+        # The loader never touches the session in these unit tests; cast lets
+        # the fake satisfy the SessionFactory[AsyncSession] type without a
+        # real DB engine.
+        yield cast(AsyncSession, self)
 
-    async def load_snapshot_fn(self, _session: object) -> ConfigSnapshot:
+    async def load_snapshot_fn(self, _session: AsyncSession) -> ConfigSnapshot:
         self.load_calls += 1
         v = self.versions[min(self.load_calls - 1, len(self.versions) - 1)]
         return _snap(v)
@@ -170,7 +175,7 @@ async def test_watcher_continues_on_load_error() -> None:
 
     calls = {"n": 0}
 
-    async def flaky_loader(_session: object) -> ConfigSnapshot:
+    async def flaky_loader(_session: AsyncSession) -> ConfigSnapshot:
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("db blip")

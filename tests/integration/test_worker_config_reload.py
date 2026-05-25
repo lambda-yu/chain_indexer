@@ -23,7 +23,7 @@ async def test_redis_bump_reloads_snapshot(db, redis_url) -> None:
         watcher = ConfigWatcher(
             bus=bus,
             session_factory=db.session,
-            load_snapshot=load_snapshot,  # type: ignore[arg-type]
+            load_snapshot=load_snapshot,
             out_queue=out,
             poll_interval_s=30.0,  # rely on redis, not poll
         )
@@ -55,7 +55,7 @@ async def test_poll_fallback_reloads_when_redis_silent(db, redis_url) -> None:
         watcher = ConfigWatcher(
             bus=bus,
             session_factory=db.session,
-            load_snapshot=load_snapshot,  # type: ignore[arg-type]
+            load_snapshot=load_snapshot,
             out_queue=out,
             poll_interval_s=0.2,  # poll fast
         )

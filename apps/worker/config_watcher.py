@@ -7,6 +7,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import Protocol
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config.snapshot import ConfigSnapshot
 
@@ -22,9 +23,9 @@ class _Bus(Protocol):
         ...
 
 
-SessionCM = AbstractAsyncContextManager[object]
+SessionCM = AbstractAsyncContextManager[AsyncSession]
 SessionFactory = Callable[[], SessionCM]
-LoadSnapshotFn = Callable[[object], Awaitable[ConfigSnapshot]]
+LoadSnapshotFn = Callable[[AsyncSession], Awaitable[ConfigSnapshot]]
 
 
 class ConfigWatcher:

@@ -86,7 +86,7 @@ class _Worker:
         self._watcher = ConfigWatcher(
             bus=self._bus,
             session_factory=self._db.session,
-            load_snapshot=load_snapshot,  # type: ignore[arg-type]
+            load_snapshot=load_snapshot,
             out_queue=self._snap_queue,
             poll_interval_s=5.0,
         )
@@ -141,6 +141,9 @@ class _Worker:
 
     async def _stop_runner(self, chain_id: str) -> None:
         runner, task = self._runners.pop(chain_id)
+        # stop() sets the runner's _stop event so its `async for header` exits
+        # on the next head; cancel() is the safety net for runners blocked in
+        # subscribe_heads() with no traffic.
         await runner.stop()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -148,7 +151,9 @@ class _Worker:
         log.info("worker.chain_runner_stopped", chain_id=chain_id)
 
     async def shutdown(self) -> None:
-        """Trigger graceful drain per spec §9.1. Idempotent."""
+        """Trigger graceful drain per spec §9.1. Idempotent and safe to call
+        after a partially-failed `start()` — `RedisBus.disconnect()` and
+        `Database.disconnect()` both guard on connection state."""
         if self._stop.is_set():
             return
         self._stop.set()
@@ -168,9 +173,16 @@ async def run_worker(settings: Settings, stop_event: asyncio.Event) -> None:
     Does NOT install signal handlers — the caller is responsible for triggering
     `stop_event` (E2E tests do this directly; the CLI entry point does it from
     SIGTERM/SIGINT handlers via `_amain` below).
+
+    If `worker.start()` fails partway through, `shutdown()` is called to
+    release any resources that were already acquired (DB pool, Redis pool).
     """
     worker = _Worker(settings)
-    await worker.start()
+    try:
+        await worker.start()
+    except BaseException:
+        await worker.shutdown()
+        raise
     run_task = asyncio.create_task(worker.run(), name="worker-main-loop")
     stop_task = asyncio.create_task(stop_event.wait(), name="worker-stop-wait")
     try:

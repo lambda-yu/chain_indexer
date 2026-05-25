@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.web.deps import get_bus, get_session
@@ -12,7 +14,7 @@ from apps.web.schemas import (
     SubscriptionOut,
 )
 from core.bus.redis_bus import RedisBus
-from core.config.models import MatchKind
+from core.config.models import MatchKind, SubscriptionChannel
 from core.config.repositories import (
     ChainRepo,
     ChannelRepo,
@@ -63,14 +65,11 @@ async def get_subscription(
     # Direct query for bound channel ids — NOT `list_enabled_with_channels`, which
     # filters subs by `enabled=True` and would silently hide bindings on disabled
     # subs (an operator surprise we want to avoid).
-    from sqlalchemy import select  # local import to keep header tidy
-
-    from core.config.models import SubscriptionChannel
     res = await session.execute(
         select(SubscriptionChannel.channel_id)
         .where(SubscriptionChannel.subscription_id == sub_id)
     )
-    channel_ids = [row[0] for row in res.all()]
+    channel_ids: list[str] = list(res.scalars().all())
     return SubscriptionDetail(
         id=sub.id, name=sub.name, chain_id=sub.chain_id, address=sub.address,
         abi_id=sub.abi_id, match_kind=sub.match_kind.value, match_name=sub.match_name,
@@ -91,6 +90,12 @@ async def bind_channel(
         raise HTTPException(status_code=404, detail="subscription not found")
     if await ChannelRepo(session).get(payload.channel_id) is None:
         raise HTTPException(status_code=404, detail="channel not found")
-    await sub_repo.bind_channel(sub_id, payload.channel_id)
+    # Composite-PK (sub_id, channel_id) means a re-bind raises IntegrityError —
+    # translate that to 409 instead of letting it surface as a 500.
+    try:
+        await sub_repo.bind_channel(sub_id, payload.channel_id)
+    except IntegrityError as e:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="channel already bound") from e
     await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="bind_channel")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

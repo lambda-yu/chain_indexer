@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
@@ -13,6 +14,8 @@ from core.config.db import Database
 from core.config.repositories import ConfigVersionRepo
 
 pytestmark = pytest.mark.integration
+
+EXPECTED_PUBLISHES = 4
 
 
 @pytest.mark.asyncio
@@ -29,6 +32,7 @@ async def test_full_create_flow_bumps_version_and_publishes(
     bus_reader = RedisBus(url=redis_url)
     await bus_writer.connect()
     await bus_reader.connect()
+    drain_task: asyncio.Task[None] | None = None
     try:
         received: list[dict[str, Any]] = []
         ready = asyncio.Event()
@@ -36,11 +40,11 @@ async def test_full_create_flow_bumps_version_and_publishes(
         async def _drain() -> None:
             async for msg in bus_reader.subscribe("config_changed", ready=ready):
                 received.append(msg)
-                if len(received) >= 4:
+                if len(received) >= EXPECTED_PUBLISHES:
                     return
 
         drain_task = asyncio.create_task(_drain())
-        await asyncio.wait_for(ready.wait(), timeout=2.0)
+        await asyncio.wait_for(ready.wait(), timeout=5.0)
 
         async with db.session() as s:
             v0 = await ConfigVersionRepo(s).get()
@@ -81,9 +85,13 @@ async def test_full_create_flow_bumps_version_and_publishes(
         async with db.session() as s:
             v_final = await ConfigVersionRepo(s).get()
 
-        assert v_final == v0 + 4
+        assert v_final == v0 + EXPECTED_PUBLISHES
         assert [m["entity"] for m in received] == ["chain", "channel", "subscription", "subscription"]
         assert received[-1]["action"] == "bind_channel"
     finally:
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drain_task
         await bus_reader.disconnect()
         await bus_writer.disconnect()

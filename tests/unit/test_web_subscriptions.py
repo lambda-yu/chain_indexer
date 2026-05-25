@@ -124,3 +124,20 @@ def test_invalid_match_kind_422(db: Database) -> None:
             "arg_filters": {}, "enabled": True,
         })
     assert r.status_code == 422
+
+
+def test_rebind_same_channel_409(db: Database) -> None:
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        chain_id, channel_id = _seed_chain_and_channel(c)
+        sub = c.post("/api/subscriptions", json={
+            "name": "x", "chain_id": chain_id, "address": "0x1",
+            "abi_id": None, "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        }).json()
+        first = c.post(f"/api/subscriptions/{sub['id']}/channels",
+                       json={"channel_id": channel_id})
+        assert first.status_code == 204
+        second = c.post(f"/api/subscriptions/{sub['id']}/channels",
+                        json={"channel_id": channel_id})
+    assert second.status_code == 409

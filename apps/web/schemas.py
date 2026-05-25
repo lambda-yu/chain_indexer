@@ -83,3 +83,7 @@ class SubscriptionOut(BaseModel):
 
 class ChannelBindRequest(BaseModel):
     channel_id: str
+
+
+class SubscriptionDetail(SubscriptionOut):
+    channel_ids: list[str] = Field(default_factory=list)

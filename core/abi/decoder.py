@@ -242,6 +242,10 @@ def anchor_event_discriminator(event_name: str) -> bytes:
     return hashlib.sha256(f"event:{event_name}".encode()).digest()[:8]
 
 
+def anchor_call_discriminator(fn_name: str) -> bytes:
+    return hashlib.sha256(f"global:{fn_name}".encode()).digest()[:8]
+
+
 def build_anchor_event_struct(
     idl_event: dict[str, Any],
     types_section: list[dict[str, Any]] | None = None,

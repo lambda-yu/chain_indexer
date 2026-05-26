@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any
-
-import pytest
 
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
 from core.parser.event import Event
-
-pytestmark = pytest.mark.asyncio
 
 
 class _StubChannel(Channel):
@@ -57,7 +52,7 @@ async def test_first_send_binds_sem_to_running_loop(tmp_path: Any) -> None:
     await n.dispatch(ev, [(sub, [chan])])
 
     # After first dispatch the semaphore exists and is bound to *this* loop.
-    sem = getattr(n, "_sem")
+    sem = n._sem
     assert sem is not None
     assert sem._value == 3  # default value, fully released
 

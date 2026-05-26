@@ -424,3 +424,34 @@ async def test_chain_runner_dispatches_abi_event_match() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+def test_chain_runner_pipeline_includes_abi_call_parser_when_registry_given() -> None:
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    chain = _chain()
+    runner_with = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+        abi_registry=reg,
+    )
+    types_with = [type(p).__name__ for p in runner_with._pipeline._parsers]
+    assert "AbiEventParser" in types_with
+    assert "AbiCallParser" in types_with
+
+    runner_without = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
+    assert "AbiCallParser" not in types_without
+    assert "AbiEventParser" not in types_without
+    assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
+    assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without

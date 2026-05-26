@@ -12,3 +12,5 @@ build/
 .env
 *.db
 .idea/
+web/node_modules/
+web/dist/

@@ -8,15 +8,16 @@ from typing import Any
 import pytest
 
 from apps.worker.chain_runner import ChainRunner
-from core.abi.decoder import event_topic0 as _event_topic0
 from core.abi.registry import AbiRegistry as _AbiRegistry
 from core.chains.types import Block, BlockHeader, Log, Tx
 from core.config.snapshot import (
     ConfigSnapshot,
-    SnapshotAbi as _SnapshotAbi,
     SnapshotChain,
     SnapshotChannel,
     SnapshotSubscription,
+)
+from core.config.snapshot import (
+    SnapshotAbi as _SnapshotAbi,
 )
 from core.notifier.channel import Channel
 from core.parser.erc20 import ERC20_TRANSFER_TOPIC0

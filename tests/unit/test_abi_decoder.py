@@ -90,3 +90,17 @@ def test_decode_function_call_fails_on_wrong_selector() -> None:
     bad = "0xdeadbeef" + ("00" * 32)
     with pytest.raises(DecodeFailed, match="selector"):
         decode_function_call(_TRANSFER_FN, bad)
+
+
+def test_decode_event_indexed_reference_type_surfaces_topic_hash() -> None:
+    """Indexed reference-typed args (string/bytes/arrays/tuples) carry the
+    32-byte topic hash, not the plaintext — Solidity hashes them into the
+    topic and the original value is unrecoverable."""
+    event_abi = {
+        "type": "event", "name": "Logged",
+        "inputs": [{"name": "who", "type": "string", "indexed": True}],
+    }
+    topic0 = event_topic0(event_abi)
+    who_hash = "0x" + "11" * 32
+    args = decode_event(event_abi, [topic0, who_hash], "0x")
+    assert args == {"who": who_hash}

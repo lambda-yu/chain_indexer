@@ -6,6 +6,7 @@ from typing import Protocol
 
 import structlog
 
+from core.abi.registry import AbiRegistry
 from core.chains.adapter import ChainAdapter
 from core.chains.confirmation_buffer import ConfirmationBuffer, ReorgEvent
 from core.chains.types import BlockHeader
@@ -17,7 +18,6 @@ from core.config.snapshot import (
 from core.matcher.matcher import Matcher
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
-from core.abi.registry import AbiRegistry
 from core.parser.abi_event import AbiEventParser
 from core.parser.erc20 import Erc20TransferParser
 from core.parser.native import NativeTransferParser

@@ -2608,3 +2608,932 @@ Expected: clean.
 
 ---
 
+## Chunk 4: `EventKind` rename + `AbiEventParser`
+
+Closes spec §4.9's `EventKind ↔ MatchKind` drift and introduces the generic ABI-driven event parser. M1 left `EventKind = Literal["native_transfer", "token_transfer", "log", "call"]` (core/parser/event.py:6) while `MatchKind` (core/config/models.py:36) declared `event` instead of `log`. The matcher keys on string equality, so any future `AbiEventParser` emitting `kind="log"` would have silently never matched a subscription with `match_kind="event"`. This chunk fixes that and lights up the matcher's `event`-kind path.
+
+**Spec §4.9, §4.2, §4.1, §6 scope:**
+- Rename `EventKind.log → event`. Update the only known internal call site (`tests/unit/test_pipeline.py:22`). No DB / API schema change.
+- Implement `AbiEventParser` (`core/parser/abi_event.py`) that walks `block.logs`, looks up each topic0 in the `AbiRegistry`, and emits:
+  - **Match path:** `kind="event"`, `name=<event_name>`, `args=<decoded>`, `contract=log.address` for known topic0s.
+  - **Downgrade path:** `kind="event"`, `name=None`, `args={}`, `contract=log.address`, raw log payload preserved in `event.raw` for unknown topic0s (spec §4.1, §6).
+- Add an `AbiRegistry.lookup_event_by_topic0` method backed by a `topic0 → (abi_id, event_name)` index built at refresh time.
+- Wire `AbiRegistry` into `_Worker` as a singleton: build once in `__init__`, refresh on each `_reconcile(snap)` **before** dispatching to runners (spec §4.1 deferred-from-chunk-2 hook).
+- Thread the registry into `ChainRunner` via an optional kwarg; when set, the runner instantiates `AbiEventParser` alongside `NativeTransferParser` and `Erc20TransferParser`.
+
+**Interaction with chunk 3 (`Erc20TransferParser`):**
+`Erc20TransferParser` emits `kind="token_transfer"` and `AbiEventParser` emits `kind="event"` for the same ERC-20 Transfer log when an ABI references it. Both events flow downstream; subscriptions route by `match_kind`. There is no de-dup — that's by design (a sub keyed on `token_transfer` and another keyed on `event` both fire). Coverage of this overlap lives in the chunk-4 ChainRunner integration test (Task 4.5).
+
+**New files this chunk:**
+- `core/parser/abi_event.py`
+- `tests/unit/test_abi_event_parser.py`
+
+**Modified files this chunk:**
+- `core/parser/event.py` — `EventKind` literal rename.
+- `tests/unit/test_pipeline.py` — single `kind="log" → "event"` fix.
+- `core/abi/registry.py` — `_topic0_index` build + `lookup_event_by_topic0`.
+- `tests/unit/test_abi_registry.py` — `lookup_event_by_topic0` tests.
+- `apps/worker/chain_runner.py` — optional `abi_registry` constructor kwarg + parser-list extension.
+- `apps/worker/main.py` — `_Worker._registry` field, instantiation, and refresh call from `_reconcile`.
+- `tests/unit/test_chain_runner.py` — extend with one ABI-driven dispatch test.
+
+**Out of scope this chunk:**
+- `AbiCallParser` — chunk 5.
+- Address-scoped topic0 lookup (subscription with `address` set) — handled by the matcher's existing address filter; the parser does not pre-filter.
+- Collision handling for two ABIs declaring the same topic0 — the registry's `_topic0_index` is first-write-wins with a warning log; subscribers needing multi-ABI fan-out are M3+ territory.
+
+### Task 4.1: Rename `EventKind.log → event`
+
+**Files:**
+- Modify: `core/parser/event.py:6`
+- Modify: `tests/unit/test_pipeline.py:22` (only call site)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/unit/test_event.py` (the existing event-dataclass smoke-test file):
+
+```python
+# tests/unit/test_event.py — append
+from typing import get_args
+
+from core.parser.event import EventKind
+
+
+def test_event_kind_literal_contains_event_not_log() -> None:
+    """Spec §4.9 rename: matcher uses `match_kind="event"`, so the parser
+    enum must expose `event` (NOT `log`) to align."""
+    kinds = set(get_args(EventKind))
+    assert "event" in kinds
+    assert "log" not in kinds
+    # Other M1 kinds must still be present.
+    assert {"native_transfer", "token_transfer", "call"}.issubset(kinds)
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_event.py::test_event_kind_literal_contains_event_not_log -v`
+Expected: FAIL — `"log" in kinds` and `"event" not in kinds`.
+
+- [ ] **Step 3: Rename in `core/parser/event.py:6`**
+
+Change:
+
+```python
+EventKind = Literal["native_transfer", "token_transfer", "log", "call"]
+```
+
+to:
+
+```python
+EventKind = Literal["native_transfer", "token_transfer", "event", "call"]
+```
+
+- [ ] **Step 4: Fix the one M1 call site**
+
+Edit `tests/unit/test_pipeline.py:22`. Change:
+
+```python
+            kind="log",
+```
+
+to:
+
+```python
+            kind="event",
+```
+
+(There are no other `kind="log"` references in the codebase — confirm with `grep -rn 'kind="log"' core/ apps/ tests/` before proceeding; expected: zero hits.)
+
+- [ ] **Step 5: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_event.py tests/unit/test_pipeline.py -v`
+Expected: both files PASS.
+
+- [ ] **Step 6: Full suite regression sweep**
+
+Run: `pytest tests/ -v`
+Expected: no failures introduced by the rename.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core/parser/event.py tests/unit/test_event.py tests/unit/test_pipeline.py
+git commit -m "refactor(event): rename EventKind.log → event to match MatchKind"
+```
+
+### Task 4.2: `AbiRegistry.lookup_event_by_topic0`
+
+The parser needs an O(1) "given a topic0, which ABI declares this event?" lookup. Build it at refresh time as `_topic0_index: dict[str, tuple[abi_id, event_name]]`; on collisions, first-write-wins with a warning log.
+
+**Files:**
+- Modify: `core/abi/registry.py`
+- Test: extend `tests/unit/test_abi_registry.py`
+
+- [ ] **Step 1: Append the failing test**
+
+```python
+# tests/unit/test_abi_registry.py — append
+
+_SECOND_EVENT = {
+    "type": "event", "name": "Approval",
+    "inputs": [
+        {"name": "owner",   "type": "address", "indexed": True},
+        {"name": "spender", "type": "address", "indexed": True},
+        {"name": "value",   "type": "uint256", "indexed": False},
+    ],
+}
+
+
+def test_lookup_event_by_topic0_returns_decoder_for_known_topic() -> None:
+    snap = _snap_with(SnapshotAbi(
+        id="a1", name="erc20", kind="evm_abi",
+        body=[_ERC20_TRANSFER, _SECOND_EVENT],
+    ))
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    result = r.lookup_event_by_topic0(t0)
+    assert result is not None
+    name, decoder = result
+    assert name == "Transfer"
+    args = decoder(
+        topics=[
+            t0,
+            "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ],
+        data="0x000000000000000000000000000000000000000000000000000000000000007b",
+    )
+    assert args["value"] == "123"
+
+
+def test_lookup_event_by_topic0_returns_none_for_unknown() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    assert r.lookup_event_by_topic0("0xdead" + "00" * 30) is None
+
+
+def test_lookup_event_picks_first_abi_on_topic0_collision(caplog) -> None:
+    """Two ABIs both declare Transfer with the same canonical signature →
+    same topic0. The registry keeps the first-encountered abi_id and logs
+    the collision; lookups consistently use the first."""
+    snap = _snap_with(
+        SnapshotAbi(id="a1", name="erc20a", kind="evm_abi", body=[_ERC20_TRANSFER]),
+        SnapshotAbi(id="a2", name="erc20b", kind="evm_abi", body=[_ERC20_TRANSFER]),
+    )
+    r = AbiRegistry()
+    with caplog.at_level("WARNING"):
+        r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    result = r.lookup_event_by_topic0(t0)
+    assert result is not None
+    # Stability: looking up twice returns the same decoder (cache hit).
+    assert r.lookup_event_by_topic0(t0) is result
+
+
+def test_topic0_index_rebuilt_on_abi_removal() -> None:
+    """After an abi is removed, its events should no longer be looked-up-able."""
+    snap_with = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    snap_without = _snap_with()
+    r = AbiRegistry()
+    r.refresh(snap_with)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    assert r.lookup_event_by_topic0(t0) is not None
+    r.refresh(snap_without)
+    assert r.lookup_event_by_topic0(t0) is None
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_registry.py -k lookup_event_by_topic0 -v`
+Expected: `AttributeError: 'AbiRegistry' object has no attribute 'lookup_event_by_topic0'`.
+
+- [ ] **Step 3: Add `_topic0_index` build + `lookup_event_by_topic0`**
+
+Edit `core/abi/registry.py`. In `__init__`, add the new instance attribute:
+
+```python
+        self._topic0_index: dict[str, tuple[str, str]] = {}  # topic0 → (abi_id, event_name)
+```
+
+In `refresh()`, after the existing eviction loop and the `self._abis = new_abis` assignment, rebuild the index. The full updated `refresh` body is:
+
+```python
+    def refresh(self, snap: ConfigSnapshot) -> None:
+        new_abis: dict[str, SnapshotAbi] = {a.id: a for a in snap.abis}
+        # Drop decoders for deleted or changed abis.
+        for abi_id in list(self._hashes.keys()):
+            if abi_id not in new_abis:
+                self._evict(abi_id)
+                continue
+            new_hash = _hash_body(new_abis[abi_id].body)
+            if new_hash != self._hashes[abi_id]:
+                self._evict(abi_id)
+        # Record fresh state.
+        self._abis = new_abis
+        self._hashes = {aid: _hash_body(a.body) for aid, a in new_abis.items()}
+        self._rebuild_topic0_index()
+        log.info("abi_registry.refreshed", count=len(new_abis))
+
+    def _rebuild_topic0_index(self) -> None:
+        idx: dict[str, tuple[str, str]] = {}
+        for abi_id, abi in self._abis.items():
+            body = abi.body if isinstance(abi.body, list) else [abi.body]
+            for entry in body:
+                if entry.get("type") != "event":
+                    continue
+                try:
+                    t0 = event_topic0(entry).lower()
+                except Exception:  # noqa: BLE001 — malformed ABI entry, skip
+                    log.warning(
+                        "abi_registry.topic0_compute_failed",
+                        abi_id=abi_id,
+                        event=entry.get("name"),
+                    )
+                    continue
+                if t0 in idx:
+                    log.warning(
+                        "abi_registry.topic0_collision",
+                        topic0=t0,
+                        first=idx[t0],
+                        second=(abi_id, entry.get("name")),
+                    )
+                    continue  # first-write-wins
+                idx[t0] = (abi_id, entry.get("name", ""))
+        self._topic0_index = idx
+```
+
+Then add the `lookup_event_by_topic0` method (place it next to `get_event_decoder` for cohesion):
+
+```python
+    def lookup_event_by_topic0(
+        self, topic0: str
+    ) -> tuple[str, EventDecoder] | None:
+        """Resolve a log's `topics[0]` to a `(event_name, decoder)` pair.
+
+        Returns None if no known ABI declares an event with this topic0.
+        The decoder return value reuses the per-`(abi_id, topic0)` cache
+        from `get_event_decoder`, so repeated calls for the same topic
+        return the same callable identity.
+        """
+        entry = self._topic0_index.get(topic0.lower())
+        if entry is None:
+            return None
+        abi_id, event_name = entry
+        decoder = self.get_event_decoder(abi_id, topic0)
+        return event_name, decoder
+```
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_registry.py -v`
+Expected: all existing tests + 4 new tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/abi/registry.py tests/unit/test_abi_registry.py
+git commit -m "feat(abi): topic0 index + lookup_event_by_topic0 with collision handling"
+```
+
+### Task 4.3: `AbiEventParser` (match + downgrade)
+
+The parser walks `block.logs` and emits one `kind="event"` Event per log: with `name=<event_name>` + decoded args when topic0 is known, and with `name=None` + empty args + raw payload preserved when topic0 is unknown.
+
+**Files:**
+- Create: `core/parser/abi_event.py`
+- Test: `tests/unit/test_abi_event_parser.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_abi_event_parser.py
+from __future__ import annotations
+
+from core.abi.decoder import event_topic0
+from core.abi.registry import AbiRegistry
+from core.chains.types import Block, BlockHeader, Log, Tx
+from core.config.snapshot import ConfigSnapshot, SnapshotAbi
+from core.parser.abi_event import AbiEventParser
+
+
+_ERC20_TRANSFER = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from", "type": "address", "indexed": True},
+        {"name": "to",   "type": "address", "indexed": True},
+        {"name": "value","type": "uint256", "indexed": False},
+    ],
+}
+_FROM = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_TO   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_PAD = "0" * 24
+_TOPIC0 = event_topic0(_ERC20_TRANSFER)
+
+
+def _registry_with_transfer() -> AbiRegistry:
+    snap = ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER])],
+    )
+    r = AbiRegistry()
+    r.refresh(snap)
+    return r
+
+
+def _block(logs: list[Log]) -> Block:
+    return Block(
+        header=BlockHeader(number=42, hash="0xh42", parent_hash="0xh41", timestamp=1700000000),
+        txs=[Tx(hash="0xtA", index=0, from_addr="0xf", to_addr="0xt",
+                value=0, input="0x", status=1)],
+        logs=logs,
+    )
+
+
+def _transfer_log(topic0: str = _TOPIC0, value_hex: str = "0x" + "0" * 62 + "7b") -> Log:
+    return Log(
+        tx_hash="0xtA", log_index=0, address="0xcafe",
+        topics=[topic0, "0x" + _PAD + _FROM, "0x" + _PAD + _TO],
+        data=value_hex,
+    )
+
+
+def test_emits_event_kind_for_known_topic0_with_decoded_args() -> None:
+    reg = _registry_with_transfer()
+    p = AbiEventParser(chain_id="eth-mainnet", registry=reg)
+    events = list(p.parse(_block([_transfer_log()])))
+    assert len(events) == 1
+    e = events[0]
+    assert e.kind == "event"
+    assert e.name == "Transfer"
+    assert e.contract == "0xcafe"
+    assert e.args == {
+        "from":  "0x" + _FROM,
+        "to":    "0x" + _TO,
+        "value": "123",
+    }
+    assert e.chain_id == "eth-mainnet"
+    assert e.block_number == 42
+    assert e.tx_hash == "0xtA"
+    assert e.log_index == 0
+
+
+def test_downgrades_unknown_topic0_to_event_with_name_none() -> None:
+    reg = _registry_with_transfer()
+    p = AbiEventParser(chain_id="eth-mainnet", registry=reg)
+    unknown_topic0 = "0xdead" + "00" * 30
+    events = list(p.parse(_block([_transfer_log(topic0=unknown_topic0)])))
+    assert len(events) == 1
+    e = events[0]
+    assert e.kind == "event"
+    assert e.name is None
+    assert e.args == {}
+    # Raw payload preserved per spec §4.1.
+    assert e.raw["topics"][0] == unknown_topic0
+    assert e.raw["data"].startswith("0x")
+    assert e.contract == "0xcafe"
+
+
+def test_downgrade_when_decode_raises() -> None:
+    """A known topic0 whose data fails to decode (e.g. malformed data length)
+    also downgrades — the matcher still gets a kind=event row with name=None
+    and the raw payload, per spec §6 'ABI decode failure'."""
+    reg = _registry_with_transfer()
+    p = AbiEventParser(chain_id="eth-mainnet", registry=reg)
+    bad = Log(
+        tx_hash="0xtA", log_index=1, address="0xcafe",
+        topics=[_TOPIC0, "0x" + _PAD + _FROM, "0x" + _PAD + _TO],
+        data="0xdead",  # < 32 bytes for the uint256 → eth-abi raises
+    )
+    events = list(p.parse(_block([bad])))
+    assert len(events) == 1
+    assert events[0].kind == "event"
+    assert events[0].name is None
+    assert events[0].raw["topics"][0] == _TOPIC0
+
+
+def test_empty_topics_log_is_skipped_not_downgraded() -> None:
+    """An anonymous-event log (topics=[]) carries no topic0 to scan against.
+    We skip these entirely rather than downgrade — they can't realistically
+    represent a subscribable event and would just noise up the pipeline.
+    """
+    reg = _registry_with_transfer()
+    p = AbiEventParser(chain_id="eth-mainnet", registry=reg)
+    anon = Log(tx_hash="0xtA", log_index=0, address="0xcafe", topics=[], data="0xff")
+    events = list(p.parse(_block([anon])))
+    assert events == []
+
+
+def test_emits_one_event_per_log() -> None:
+    reg = _registry_with_transfer()
+    p = AbiEventParser(chain_id="eth-mainnet", registry=reg)
+    logs = [
+        _transfer_log(value_hex="0x" + "0" * 63 + "1"),
+        Log(tx_hash="0xtA", log_index=1, address="0xcafe",
+            topics=["0xfeed" + "00" * 30], data="0x"),
+    ]
+    events = list(p.parse(_block(logs)))
+    assert [e.name for e in events] == ["Transfer", None]
+    assert [e.kind for e in events] == ["event", "event"]
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_event_parser.py -v`
+Expected: `ImportError: cannot import name 'AbiEventParser'`.
+
+- [ ] **Step 3: Implement `core/parser/abi_event.py`**
+
+```python
+# core/parser/abi_event.py
+"""Generic ABI-driven event log parser.
+
+Per spec §4.1 / §4.2 / §6:
+- Match: emit `kind="event"`, `name=<event_name>`, decoded args.
+- Downgrade (unknown topic0 OR decode failure): emit `kind="event"`,
+  `name=None`, `args={}`, raw log payload preserved in `event.raw`.
+
+The parser does NOT pre-bind to specific ABI IDs — it consults the
+shared `AbiRegistry` on every log, so newly-added ABIs become observable
+on the very next block without rebuilding the pipeline.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import structlog
+
+from core.abi.errors import DecodeFailed
+from core.abi.registry import AbiRegistry
+from core.chains.types import Block, Log
+from core.parser.event import Event
+
+log = structlog.get_logger(__name__)
+
+
+class AbiEventParser:
+    def __init__(self, *, chain_id: str, registry: AbiRegistry) -> None:
+        self._chain_id = chain_id
+        self._registry = registry
+
+    def parse(self, block: Block) -> Iterable[Event]:
+        h = block.header
+        for log_entry in block.logs:
+            ev = self._handle_log(log_entry, h.number, h.hash, h.timestamp)
+            if ev is not None:
+                yield ev
+
+    def _handle_log(
+        self,
+        log_entry: Log,
+        block_number: int,
+        block_hash: str,
+        block_ts: int,
+    ) -> Event | None:
+        if not log_entry.topics:
+            return None
+        topic0 = log_entry.topics[0]
+
+        lookup = self._registry.lookup_event_by_topic0(topic0)
+        if lookup is None:
+            return self._downgraded(log_entry, block_number, block_hash, block_ts)
+
+        event_name, decoder = lookup
+        try:
+            args = decoder(topics=log_entry.topics, data=log_entry.data)
+        except DecodeFailed as exc:
+            log.warning(
+                "abi_event_parser.decode_failed",
+                topic0=topic0,
+                event=event_name,
+                tx_hash=log_entry.tx_hash,
+                error=str(exc),
+            )
+            return self._downgraded(log_entry, block_number, block_hash, block_ts)
+
+        return Event(
+            chain_id=self._chain_id,
+            block_number=block_number,
+            block_hash=block_hash,
+            block_timestamp=block_ts,
+            tx_hash=log_entry.tx_hash,
+            tx_index=None,
+            log_index=log_entry.log_index,
+            kind="event",
+            contract=log_entry.address.lower(),
+            name=event_name,
+            args=args,
+            raw={
+                "tx_hash": log_entry.tx_hash,
+                "log_index": log_entry.log_index,
+            },
+        )
+
+    def _downgraded(
+        self,
+        log_entry: Log,
+        block_number: int,
+        block_hash: str,
+        block_ts: int,
+    ) -> Event:
+        return Event(
+            chain_id=self._chain_id,
+            block_number=block_number,
+            block_hash=block_hash,
+            block_timestamp=block_ts,
+            tx_hash=log_entry.tx_hash,
+            tx_index=None,
+            log_index=log_entry.log_index,
+            kind="event",
+            contract=log_entry.address.lower(),
+            name=None,
+            args={},
+            raw={
+                "tx_hash": log_entry.tx_hash,
+                "log_index": log_entry.log_index,
+                "topics": list(log_entry.topics),
+                "data": log_entry.data,
+            },
+        )
+```
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_event_parser.py -v`
+Expected: 5 PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/parser/abi_event.py tests/unit/test_abi_event_parser.py
+git commit -m "feat(parser): AbiEventParser with topic0 lookup + decode-failure downgrade"
+```
+
+### Task 4.4: Thread `AbiRegistry` through `ChainRunner`
+
+`ChainRunner` accepts an optional `abi_registry` constructor kwarg. When provided, the pipeline appends `AbiEventParser`. When omitted (legacy tests, no-ABI scenarios), the pipeline is unchanged.
+
+**Files:**
+- Modify: `apps/worker/chain_runner.py`
+
+- [ ] **Step 1: Append a failing test that asserts the parser is wired**
+
+Append to `tests/unit/test_chain_runner.py`:
+
+```python
+# tests/unit/test_chain_runner.py — append
+from core.abi.decoder import event_topic0 as _event_topic0
+from core.abi.registry import AbiRegistry as _AbiRegistry
+from core.config.snapshot import SnapshotAbi as _SnapshotAbi
+from core.parser.abi_event import AbiEventParser as _AbiEventParser
+
+
+_TRANSFER_ABI = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from",  "type": "address", "indexed": True},
+        {"name": "to",    "type": "address", "indexed": True},
+        {"name": "value", "type": "uint256", "indexed": False},
+    ],
+}
+
+
+def test_chain_runner_pipeline_includes_abi_event_parser_when_registry_given() -> None:
+    """Construction-time wiring check: passing `abi_registry=` adds an
+    AbiEventParser to the pipeline. Without it, the pipeline stays at
+    native + erc20.
+    """
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    chain = _chain()
+    runner_with = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+        abi_registry=reg,
+    )
+    types_with = [type(p).__name__ for p in runner_with._pipeline._parsers]
+    assert "AbiEventParser" in types_with
+
+    runner_without = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
+    assert "AbiEventParser" not in types_without
+    # Sanity: native + erc20 are still there in both cases.
+    assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
+    assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_pipeline_includes_abi_event_parser_when_registry_given -v`
+Expected: `TypeError: ChainRunner.__init__() got an unexpected keyword argument 'abi_registry'`.
+
+- [ ] **Step 3: Add `abi_registry` to `ChainRunner.__init__`**
+
+Edit `apps/worker/chain_runner.py`:
+
+1. Add import alongside `NativeTransferParser` / `Erc20TransferParser`:
+
+```python
+from core.abi.registry import AbiRegistry
+from core.parser.abi_event import AbiEventParser
+```
+
+2. Extend the `__init__` signature with `abi_registry: AbiRegistry | None = None,`:
+
+```python
+    def __init__(
+        self,
+        *,
+        chain: SnapshotChain,
+        adapter_factory: AdapterFactory,
+        channel_factory: ChannelFactory,
+        checkpoint_repo: _CheckpointRepo,
+        notifier_max_concurrency: int = 50,
+        abi_registry: AbiRegistry | None = None,
+    ) -> None:
+```
+
+3. Build the parser list conditionally:
+
+```python
+        parsers: list[Parser] = [
+            NativeTransferParser(chain_id=self._chain.id),
+            Erc20TransferParser(chain_id=self._chain.id),
+        ]
+        if abi_registry is not None:
+            parsers.append(AbiEventParser(chain_id=self._chain.id, registry=abi_registry))
+        self._pipeline = ParserPipeline(parsers)
+```
+
+You'll also need `from core.parser.base import Parser` (M1's `chain_runner.py` doesn't currently import it — add it next to the other parser imports so the `parsers: list[Parser] = [...]` annotation type-checks).
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_chain_runner.py -v`
+Expected: existing tests still pass + new wiring test passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add apps/worker/chain_runner.py tests/unit/test_chain_runner.py
+git commit -m "feat(runner): optional abi_registry kwarg threads AbiEventParser into pipeline"
+```
+
+### Task 4.5: `_Worker` owns the `AbiRegistry` and refreshes it on reconcile
+
+The worker holds the single `AbiRegistry` instance and calls `registry.refresh(snap)` at the top of `_reconcile` so all runners observe the same ABI state for a given snapshot version.
+
+**Files:**
+- Modify: `apps/worker/main.py`
+- Test: extend `tests/integration/test_worker_config_reload.py` with an ABI-CRUD reload case.
+
+- [ ] **Step 1: Write the failing integration test**
+
+Append to `tests/integration/test_worker_config_reload.py` (or create a new test file `tests/integration/test_worker_abi_reload.py` if the existing file is already large — pick whichever keeps each file under ~400 lines). The added test asserts that:
+
+1. Worker boots with an empty ABI set; registry is empty.
+2. POST `/api/abis` creates an ABI.
+3. Worker observes the new snapshot via Redis pub/sub.
+4. `worker._registry.lookup_event_by_topic0(<known>)` resolves to the new ABI.
+
+```python
+# tests/integration/test_worker_abi_reload.py (new file)
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from apps.worker.main import _Worker
+from core.abi.decoder import event_topic0
+from core.bus.redis_bus import RedisBus
+from core.config.db import Database
+from core.config.models import Base
+from core.settings import Settings
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+
+_TRANSFER = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from", "type": "address", "indexed": True},
+        {"name": "to",   "type": "address", "indexed": True},
+        {"name": "value","type": "uint256", "indexed": False},
+    ],
+}
+
+
+async def test_worker_registry_picks_up_new_abi_on_config_reload(
+    tmp_path, redis_url: str
+) -> None:
+    """E2E-style integration: API creates an ABI, worker's _registry sees it
+    on the very next reconcile cycle."""
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'abi.sqlite'}"
+    db = Database(db_url)
+    await db.connect()
+    async with db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    settings = Settings(database={"url": db_url}, redis={"url": redis_url})
+    worker = _Worker(settings)
+    await worker.start()
+    run_task = asyncio.create_task(worker.run())
+
+    # Give the watcher a moment to flush the initial (empty) snapshot.
+    await asyncio.sleep(0.3)
+
+    bus = RedisBus(url=redis_url)
+    await bus.connect()
+    try:
+        app = create_app(lifespan=None)
+        app.dependency_overrides[get_db] = lambda: db
+        app.dependency_overrides[get_bus] = lambda: bus
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.post("/api/abis", json={
+                "name": "erc20", "kind": "evm_abi", "body": [_TRANSFER],
+            })
+            assert r.status_code == 201, r.text
+
+        # Wait up to 3 seconds for the worker to observe the bumped version.
+        target = event_topic0(_TRANSFER).lower()
+        for _ in range(60):
+            result = worker._registry.lookup_event_by_topic0(target)
+            if result is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert worker._registry.lookup_event_by_topic0(target) is not None
+    finally:
+        await bus.disconnect()
+        await worker.shutdown()
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+        await db.disconnect()
+```
+
+The `redis_url` fixture is provided by `tests/conftest.py` (M1).
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/integration/test_worker_abi_reload.py -v`
+Expected: `AttributeError: '_Worker' object has no attribute '_registry'`.
+
+- [ ] **Step 3: Add `_registry` to `_Worker` and call `refresh` from `_reconcile`**
+
+Edit `apps/worker/main.py`:
+
+1. Import at the top:
+
+```python
+from core.abi.registry import AbiRegistry
+```
+
+2. In `_Worker.__init__`, add the registry alongside `_db`/`_bus`:
+
+```python
+        self._registry = AbiRegistry()
+```
+
+3. In `_reconcile`, refresh the registry **before** iterating chains so each runner constructed in this pass picks up the fresh state:
+
+```python
+    async def _reconcile(self, snap: ConfigSnapshot) -> None:
+        self._registry.refresh(snap)
+        enabled = {c.id: c for c in snap.chains}
+        # ... rest unchanged ...
+```
+
+4. Pass the registry into new `ChainRunner` instances (in the `else` branch of the existing reconcile loop):
+
+```python
+                runner = ChainRunner(
+                    chain=cfg,
+                    adapter_factory=_default_adapter_factory,
+                    channel_factory=_default_channel_factory,
+                    checkpoint_repo=self._checkpoint_adapter,
+                    abi_registry=self._registry,
+                )
+```
+
+Existing runners (`if chain_id in self._runners` branch) continue to use the registry they were given at construction time — same instance, same refresh — so they see the new ABIs automatically.
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/integration/test_worker_abi_reload.py -v`
+Expected: PASS within ~3 seconds.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add apps/worker/main.py tests/integration/test_worker_abi_reload.py
+git commit -m "feat(worker): own AbiRegistry; refresh on every reconcile"
+```
+
+### Task 4.6: End-to-end AbiEventParser dispatch through `ChainRunner`
+
+A high-level test: feed a block containing an ERC-20 Transfer log into a `ChainRunner` constructed with a populated `AbiRegistry` and a subscription `match_kind="event"`. The notifier should receive a payload with `name="Transfer"` and decoded args.
+
+**Files:**
+- Test: extend `tests/unit/test_chain_runner.py`
+
+- [ ] **Step 1: Append the test**
+
+```python
+# tests/unit/test_chain_runner.py — append
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_abi_event_match() -> None:
+    """ChainRunner with an AbiRegistry containing ERC-20 Transfer fires
+    a `kind="event", name="Transfer"` dispatch for the subscription."""
+    chain = _chain()
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    blocks = [_block_with_erc20_log(n, value=n * 100) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="event", match_name="Transfer")],
+        channels=[_ch("c1")],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+        abi_registry=reg,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        names = {c["event"]["name"] for c in coll.calls}
+        assert names == {"Transfer"}
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"event"}
+        # value is decoded by the registry's EVM event decoder.
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        assert values == {"100", "200"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+```
+
+- [ ] **Step 2: Run, expect PASS**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_dispatches_abi_event_match -v`
+Expected: PASS. (The implementation work was finished in Task 4.4; this test is a regression seal.)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/unit/test_chain_runner.py
+git commit -m "test(runner): end-to-end ABI-event dispatch with populated registry"
+```
+
+### Task 4.7: Chunk 4 close-out
+
+- [ ] **Step 1: Run the full test suite**
+
+Run: `pytest tests/ -v`
+Expected: all M1 + chunk-1 + chunk-2 + chunk-3 + chunk-4 tests pass.
+
+- [ ] **Step 2: Lint / type check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+---
+

@@ -43,6 +43,7 @@ class SnapshotChain:
     rpc_ws: str | None
     confirmations: int
     poll_interval_ms: int
+    commitment: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
             rpc_ws=c.rpc_ws,
             confirmations=c.confirmations,
             poll_interval_ms=c.poll_interval_ms,
+            commitment=c.commitment,
         )
         for c in chains_rows
     ]

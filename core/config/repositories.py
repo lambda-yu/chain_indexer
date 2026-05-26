@@ -36,11 +36,12 @@ class ChainRepo:
         confirmations: int,
         poll_interval_ms: int,
         enabled: bool,
+        commitment: str | None = None,
     ) -> Chain:
         c = Chain(
             id=id, kind=kind, rpc_http=rpc_http, rpc_ws=rpc_ws,
             confirmations=confirmations, poll_interval_ms=poll_interval_ms,
-            enabled=enabled,
+            enabled=enabled, commitment=commitment,
         )
         self.s.add(c)
         await self.s.flush()

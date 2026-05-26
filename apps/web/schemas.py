@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.matcher.filters import FilterError
 from core.matcher.filters import validate as _validate_filter_keys
@@ -23,20 +23,30 @@ class ChainCreate(BaseModel):
     kind: Literal["evm", "solana"]
     rpc_http: str = Field(min_length=1)
     rpc_ws: str | None = None
-    confirmations: int = Field(ge=0, le=10_000)
-    poll_interval_ms: int = Field(ge=100, le=60_000)
+    confirmations: int = Field(ge=0, le=10_000, default=0)
+    poll_interval_ms: int = Field(ge=100, le=60_000, default=3000)
+    commitment: Literal["confirmed", "finalized"] | None = None
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def _check_kind_fields(self) -> ChainCreate:
+        if self.kind == "solana" and self.commitment is None:
+            raise ValueError("Solana chains must specify commitment")
+        if self.kind == "evm" and self.commitment is not None:
+            raise ValueError("EVM chains must not specify commitment")
+        return self
 
 
 class ChainOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    kind: str  # serialized enum value
+    kind: str
     rpc_http: str
     rpc_ws: str | None
     confirmations: int
     poll_interval_ms: int
+    commitment: str | None
     enabled: bool
 
 

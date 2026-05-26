@@ -30,6 +30,7 @@ async def create_chain(
         confirmations=payload.confirmations,
         poll_interval_ms=payload.poll_interval_ms,
         enabled=payload.enabled,
+        commitment=payload.commitment,
     )
     await bump_and_publish(session, bus, entity="chain", entity_id=row.id, action="create")
     return ChainOut.model_validate(row)

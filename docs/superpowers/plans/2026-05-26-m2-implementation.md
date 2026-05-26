@@ -5165,3 +5165,781 @@ git commit -m "feat(notifier): add RedisStreamsChannel with MAXLEN trim + retry"
 ```
 
 ---
+
+## Chunk 8: `WebSocketChannel` + `/ws` server
+
+Closes spec §4.5. Two loosely coupled pieces ship in this chunk and communicate via Redis Pub/Sub:
+
+1. **`WebSocketChannel`** (`core/notifier/websocket.py`) — a `Channel` subclass with `type = "ws"` (matches `ChannelType.ws` in the DB enum, same alignment story as chunk 7's `mq`). `send(payload)` calls `redis.publish(<fanout_channel>, json.dumps(payload))`. Retries on `RedisError` via the shared `retry.py` helper, 3 attempts. Reuses the worker's `RedisBus` connection (`bus=bus` kwarg from chunk 7's `_make_channel_factory`).
+2. **`/ws?channel_id=<uuid>` server** (`apps/web/routers/ws.py`) — a FastAPI WebSocket route that resolves `channel_id` → `config["ws_fanout_channel"]` via `ChannelRepo`, subscribes to that Redis pubsub channel, and proxies every received message to the connected WS client through a bounded `asyncio.Queue(maxsize=256)`. Slow consumers drop messages and log a rate-limited warning. Multiple clients per `channel_id` are allowed: each opens its own Redis pubsub subscription, and Redis fans out at the broker level.
+
+The channel and the server **do not share in-process state** — they only share a Redis pubsub channel name (`ws_fanout_channel` in the channel's config blob, used as the publish target by `WebSocketChannel.send` and as the subscribe target by the `/ws` handler). This decoupling matters because the worker process and the web process are independent: the worker `XADD`s nothing for `ws`-type subscriptions; it just publishes, and the web process is the sole subscriber.
+
+**Why Redis Pub/Sub and not Streams for the WS fanout path:**
+Pub/Sub is at-most-once: messages with no live subscriber are dropped at the broker, and there is no replay. This is intentional per spec §2 (no auth / no backfill among non-goals): WS clients are observability listeners, not source-of-truth consumers. A bound `RedisStreamsChannel` can be added to the same subscription if the user needs at-least-once for that flow — the two channel types compose by subscription configuration, not by code coupling.
+
+**Why one Redis subscription per WS client** (rather than one shared subscription per `channel_id` with in-process tee'ing):
+The shared-subscription approach is more efficient on Redis (one network subscribe per `channel_id` regardless of client count) but adds a per-process registry that must be reference-counted and cleaned up on the last disconnect. With per-client subscriptions, each WS handler owns its own pubsub generator: setup and teardown are tied to the WS connection lifecycle (no shared state, no race conditions). The cost is one extra Redis subscription per client, which is acceptable at M2 scale (no thundering-herd numbers are expected; spec §2 explicitly limits "production scale" to "10s of chains, 100s of subscriptions"). Per-client subscriptions is the simpler design and we choose it knowingly.
+
+**Spec §4.5 scope:**
+- New `core/notifier/websocket.py` with `class WebSocketChannel(Channel)`, `type = "ws"`.
+- Constructor: `__init__(self, *, config: dict[str, Any], bus: RedisBus, base_delay: float = 1.0)`. Reads `config["ws_fanout_channel"]` (required, `KeyError` on missing). `start()` / `stop()` are no-ops — like `RedisStreamsChannel`, this channel does not own the Redis connection.
+- `send(payload)`: `retry_with_backoff(partial(bus.client.publish, ws_fanout_channel, body), max_attempts=3, base_delay=...)` where `body = json.dumps(payload, separators=(",", ":"))`.
+- New `apps/web/routers/ws.py` with a single WebSocket endpoint:
+  ```python
+  @router.websocket("/ws")
+  async def ws_endpoint(websocket: WebSocket, channel_id: str, ...) -> None: ...
+  ```
+- `apps/web/main.py` includes the new WS router.
+- Back-pressure: per-client `asyncio.Queue(maxsize=256)`; when full, the producer coroutine **drops** the message and increments a per-client warn-throttle counter. A throttle-aware logger emits at most one warning per client per 60 s window. The constant `_QUEUE_SIZE = 256` and `_WARN_WINDOW_S = 60.0` live as module constants in `ws.py` so they're trivially patchable from tests.
+
+**Modified files this chunk:**
+- `core/notifier/websocket.py` — **new**: `WebSocketChannel`.
+- `apps/web/routers/ws.py` — **new**: `/ws` endpoint.
+- `apps/web/main.py:99-105` — add `from apps.web.routers import ws as ws_router` and `app.include_router(ws_router.router)`.
+- `apps/worker/main.py` — add side-effect import `from core.notifier.websocket import WebSocketChannel  # noqa: F401` so the worker also registers the `ws` channel type at process start. (The web process technically doesn't need the channel class itself — only the worker publishes — but importing it in both places keeps `CHANNEL_REGISTRY` symmetric and makes the registration-side-effect test cover the worker entrypoint.)
+- `tests/unit/test_websocket_channel.py` — **new**: unit tests for the channel class.
+- `tests/unit/test_web_ws.py` — **new**: unit tests for the `/ws` route with a fake bus.
+- `tests/unit/test_channel_registry.py` — append registration-side-effect test for `"ws"`.
+- `tests/integration/test_ws_fanout.py` — **new**: testcontainers Redis + in-process FastAPI `/ws` + worker's `WebSocketChannel.send` → real broker → live client roundtrip.
+
+**Out of scope this chunk:**
+- WebSocket authentication — spec §2 explicit non-goal.
+- Reconnect / backfill — at-most-once, no replay. If at-least-once is needed, bind the subscription to a `RedisStreamsChannel` (chunk 7) as well.
+- Multi-process WS coordination — every `/ws` connection serves itself from the same Redis pubsub stream; horizontal scale-out works because Redis pubsub fans out across all subscribers regardless of process boundary.
+- Channel config JSON-schema validation — same out-of-scope line as chunks 6 and 7.
+
+**Note on FastAPI WebSocket test client:** Starlette's `TestClient.websocket_connect("/ws?channel_id=...")` is a synchronous context manager that opens a real ASGI WS connection. Unlike the HTTP variant of `TestClient`, the WS test session runs the ASGI app on a **separate thread with its own asyncio loop** (the "portal" loop), while the test body keeps running in the pytest-asyncio loop (or in the test thread directly for sync test bodies). This has two consequences the chunk's tests must work around:
+
+1. **Cross-loop `asyncio.Queue` is unsafe.** A queue created inside the WS route (portal loop) cannot be `await q.put(...)`'d from the test body (different loop). The `_FakeBus` in Task 8.4 captures the route's loop at `subscribe()` time and exposes a SYNC `feed_threadsafe(...)` method that uses `loop.call_soon_threadsafe(queue.put_nowait, payload)` to schedule the put on the correct loop. The route-side queue (`asyncio.Queue(maxsize=_QUEUE_SIZE)` in `ws.py`) is created and consumed entirely in the portal loop, so it's safe there.
+2. **`WebSocketTestSession.receive_text()` takes no `timeout` kwarg.** It is a blocking call that reads from a thread-internal buffer; pytest's default test timeout (set via `pytest.ini` if configured) bounds runaway tests. The unit-level WS tests rely on deterministic feed-then-receive ordering rather than a per-call timeout.
+
+The unit-level WS tests in this chunk **monkeypatch `_resolve_fanout_channel`** so the route never touches the DB on the WS path. This sidesteps a related cross-loop hazard (the `db` fixture's async engine is bound to the pytest-asyncio loop, and the route would call `db.session()` on the portal loop). DB-side resolver logic is covered by separate non-WS unit tests that call `_resolve_fanout_channel(...)` directly in the pytest-asyncio loop, where the engine is at home. The integration test (Task 8.6) uses the same monkeypatch strategy and focuses on the real Redis ↔ WS roundtrip. (`tests/unit/test_web_chains.py` shows the non-WS TestClient pattern; the WS variant is a documented subset of the same API.)
+
+### Task 8.1: Red — `WebSocketChannel` unit tests
+
+Mirrors the structure of `tests/unit/test_redis_streams_channel.py` from chunk 7: same `AsyncMock(spec=RedisBus)` + plain `AsyncMock()` client + side_effect-driven retry tests, same docstring rationale for why we avoid `spec=Redis`. Five behaviours: (a) basic publish; (b) JSON-encodes payload; (c) transient `RedisError` retried; (d) persistent error → `RetryExhausted`; (e) missing `ws_fanout_channel` config raises at construction.
+
+**Files:**
+- Create: `tests/unit/test_websocket_channel.py`
+
+- [ ] **Step 1: Write the failing test file**
+
+```python
+# tests/unit/test_websocket_channel.py
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock
+
+import pytest
+from redis.exceptions import RedisError
+
+from core.bus.redis_bus import RedisBus
+from core.notifier.retry import RetryExhausted
+from core.notifier.websocket import WebSocketChannel
+
+
+def _fake_bus_with_client(client: AsyncMock) -> AsyncMock:
+    """Same helper as in test_redis_streams_channel.py. Uses plain AsyncMock()
+    for the client because `redis.asyncio.Redis.publish` is not declared as
+    `async def` (same gotcha as `.xadd`)."""
+    bus = AsyncMock(spec=RedisBus)
+    bus.client = client
+    return bus
+
+
+@pytest.mark.asyncio
+async def test_publish_sends_json_payload_to_configured_fanout_channel() -> None:
+    client = AsyncMock()
+    bus = _fake_bus_with_client(client)
+    ch = WebSocketChannel(config={"ws_fanout_channel": "fanout-x"}, bus=bus)
+    await ch.start()
+    try:
+        await ch.send({"k": 1, "subscription_id": "s1"})
+    finally:
+        await ch.stop()
+
+    client.publish.assert_awaited_once()
+    args, _kwargs = client.publish.call_args
+    assert args[0] == "fanout-x"
+    assert json.loads(args[1]) == {"k": 1, "subscription_id": "s1"}
+
+
+@pytest.mark.asyncio
+async def test_transient_redis_error_is_retried_then_succeeds() -> None:
+    client = AsyncMock()
+    client.publish.side_effect = [RedisError("temporary"), 1]
+    bus = _fake_bus_with_client(client)
+    ch = WebSocketChannel(config={"ws_fanout_channel": "fanout-x"}, bus=bus, base_delay=0.0)
+    await ch.start()
+    try:
+        await ch.send({"k": 1})
+    finally:
+        await ch.stop()
+    assert client.publish.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_persistent_redis_error_raises_retry_exhausted() -> None:
+    client = AsyncMock()
+    client.publish.side_effect = RedisError("hard down")
+    bus = _fake_bus_with_client(client)
+    ch = WebSocketChannel(config={"ws_fanout_channel": "fanout-x"}, bus=bus, base_delay=0.0)
+    await ch.start()
+    try:
+        with pytest.raises(RetryExhausted):
+            await ch.send({"k": 1})
+    finally:
+        await ch.stop()
+    assert client.publish.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_missing_fanout_channel_config_raises_at_construction() -> None:
+    client = AsyncMock()
+    bus = _fake_bus_with_client(client)
+    with pytest.raises(KeyError):
+        WebSocketChannel(config={}, bus=bus)
+
+
+def test_type_attribute_matches_db_enum_ws_slot() -> None:
+    # Confirms the auto-registration key matches `ChannelType.ws` in the DB.
+    assert WebSocketChannel.type == "ws"
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_websocket_channel.py -v`
+Expected: 5 FAILs with `ModuleNotFoundError: No module named 'core.notifier.websocket'`.
+
+### Task 8.2: Green — implement `WebSocketChannel`
+
+**Files:**
+- Create: `core/notifier/websocket.py`
+
+- [ ] **Step 1: Write the minimal implementation**
+
+```python
+# core/notifier/websocket.py
+from __future__ import annotations
+
+import json
+from functools import partial
+from typing import Any
+
+import structlog
+from redis.exceptions import RedisError
+
+from core.bus.redis_bus import RedisBus
+from core.notifier.channel import Channel
+from core.notifier.retry import retry_with_backoff
+
+log = structlog.get_logger(__name__)
+
+
+class WebSocketChannel(Channel):
+    """Redis Pub/Sub-backed notification driver for WebSocket fan-out.
+
+    Publishes payloads to a Redis pubsub channel; the `/ws?channel_id=` server
+    in `apps/web/routers/ws.py` subscribes to the same channel and proxies
+    messages to connected WebSocket clients. At-most-once semantics — messages
+    with no live subscriber are dropped at the broker.
+    """
+
+    type = "ws"
+
+    def __init__(
+        self,
+        *,
+        config: dict[str, Any],
+        bus: RedisBus,
+        base_delay: float = 1.0,
+    ) -> None:
+        self._fanout_channel: str = config["ws_fanout_channel"]
+        self._bus = bus
+        self._base_delay = base_delay
+
+    async def start(self) -> None:
+        # The bus is started/stopped by the worker; nothing to do here.
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def send(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, separators=(",", ":"))
+        await retry_with_backoff(
+            partial(self._publish_once, body=body),
+            max_attempts=3,
+            base_delay=self._base_delay,
+        )
+
+    async def _publish_once(self, *, body: str) -> None:
+        client = self._bus.client
+        try:
+            await client.publish(self._fanout_channel, body)
+        except RedisError:
+            raise
+```
+
+- [ ] **Step 2: Re-run the unit tests**
+
+Run: `pytest tests/unit/test_websocket_channel.py -v`
+Expected: all 5 PASS.
+
+- [ ] **Step 3: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+### Task 8.3: Wire the WS channel into the worker's registry side-effect imports
+
+Same pattern as Task 7.4. Without the side-effect import, the `"ws"` key never lands in `CHANNEL_REGISTRY` and the worker would `KeyError` at first reconcile for a `ws`-type subscription.
+
+**Files:**
+- Modify: `apps/worker/main.py` — add side-effect import.
+- Modify: `tests/unit/test_channel_registry.py` — add registration test.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/unit/test_channel_registry.py`:
+
+```python
+def test_ws_channel_is_registered_via_worker_import() -> None:
+    """Importing `apps.worker.main` should register the `ws` channel type
+    because the worker's side-effect imports include `core.notifier.websocket`."""
+    import apps.worker.main  # noqa: F401 — side-effect: triggers channel registration
+
+    from core.notifier.channel import CHANNEL_REGISTRY
+    assert "ws" in CHANNEL_REGISTRY
+```
+
+- [ ] **Step 2: Run the test to confirm it fails**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_ws_channel_is_registered_via_worker_import -v`
+Expected: FAIL — `"ws" not in CHANNEL_REGISTRY`.
+
+- [ ] **Step 3: Add the side-effect import to `apps/worker/main.py`**
+
+Below the existing redis_streams side-effect import added in chunk 7 Task 7.4 Step 3, add:
+
+```python
+from core.notifier.websocket import WebSocketChannel  # noqa: F401 — side-effect: register ws
+```
+
+- [ ] **Step 4: Re-run the test**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_ws_channel_is_registered_via_worker_import -v`
+Expected: PASS.
+
+- [ ] **Step 5: Run the full channel-registry suite**
+
+Run: `pytest tests/unit/test_channel_registry.py -v`
+Expected: all tests still pass (chunks 6, 7's tests + the new one).
+
+### Task 8.4: Red — `/ws` route unit tests with a fake bus
+
+Six behaviours under test, split into two layers:
+
+**Route-level tests** (sync `def`, `_resolve_fanout_channel` monkeypatched so the route never touches the DB on the WS path; the `_FakeBus` is cross-loop-safe — see preamble note):
+(a) Connection that resolves a valid `channel_id` to a `ws_fanout_channel` receives every message fed via `bus.feed_threadsafe(...)`.
+(b) Connection with an unresolvable `channel_id` is closed immediately with code 1008 (policy violation).
+(c) Slow-consumer scenario: with `_QUEUE_SIZE` patched to 4 and 20 messages fed without immediate draining, the route does not crash and the first messages received are valid JSON in monotonic order. (Exact drop count is not asserted because the consumer task drains concurrently — a focused drop-path test with caplog can be added later if needed.)
+
+**Resolver-direct tests** (async `def` with `db` fixture, no WS at all — runs entirely in the pytest-asyncio loop so the engine sits at home):
+(d) `_resolve_fanout_channel` returns the `ws_fanout_channel` config value for a `ws`-type channel row.
+(e) `_resolve_fanout_channel` returns `None` for an unknown `channel_id`.
+(f) `_resolve_fanout_channel` returns `None` for a non-`ws`-type channel row (e.g. an HTTP channel).
+
+**Files:**
+- Create: `tests/unit/test_web_ws.py`
+
+- [ ] **Step 1: Write the failing test file**
+
+```python
+# tests/unit/test_web_ws.py
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from fastapi.testclient import TestClient
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from apps.web.routers import ws as ws_module
+from core.config.db import Database
+from core.config.models import Base, ChannelType
+from core.config.repositories import ChannelRepo
+
+
+class _FakeBus:
+    """Cross-loop-safe RedisBus stand-in. The test body runs in
+    pytest-asyncio's loop (or the test thread for sync tests); the FastAPI
+    route runs in Starlette TestClient's portal loop. `feed_threadsafe()`
+    is a SYNC method that schedules `queue.put_nowait(payload)` on the
+    portal loop via `loop.call_soon_threadsafe(...)`, so the queue and the
+    feeder live in the same loop where the queue was created."""
+
+    def __init__(self) -> None:
+        self._queues: dict[str, asyncio.Queue[dict[str, Any] | None]] = {}
+        self._loops: dict[str, asyncio.AbstractEventLoop] = {}
+
+    async def ping(self) -> bool:
+        return True
+
+    async def subscribe(
+        self, channel: str, *, ready: asyncio.Event | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._queues[channel] = q
+        self._loops[channel] = loop
+        if ready is not None:
+            ready.set()
+        try:
+            while True:
+                msg = await q.get()
+                if msg is None:  # sentinel: close the generator
+                    return
+                yield msg
+        finally:
+            self._queues.pop(channel, None)
+            self._loops.pop(channel, None)
+
+    def feed_threadsafe(self, channel: str, payload: dict[str, Any]) -> None:
+        # Poll briefly for the subscribe() generator to attach in the
+        # portal loop. The route schedules `producer_task` after `accept()`,
+        # so the queue usually exists within a few ms of websocket_connect().
+        for _ in range(200):  # ~2s budget
+            if channel in self._loops and channel in self._queues:
+                break
+            time.sleep(0.01)
+        else:
+            raise RuntimeError(f"no subscriber registered for {channel}")
+        loop = self._loops[channel]
+        queue = self._queues[channel]
+        loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+    def stop_threadsafe(self, channel: str) -> None:
+        loop = self._loops.get(channel)
+        q = self._queues.get(channel)
+        if loop is None or q is None:
+            return
+        loop.call_soon_threadsafe(q.put_nowait, None)
+
+
+@pytest_asyncio.fixture
+async def db() -> AsyncIterator[Database]:
+    d = Database("sqlite+aiosqlite:///:memory:")
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield d
+    await d.disconnect()
+
+
+def _client(db: Database, bus: _FakeBus) -> TestClient:
+    app = create_app(lifespan=None)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_bus] = lambda: bus
+    return TestClient(app)
+
+
+def _stub_resolver(mapping: dict[str, str | None]):
+    """Return an async resolver that maps `channel_id` to a fanout name or
+    `None`. Used to bypass the DB lookup in unit tests."""
+    async def _resolver(channel_id: str, _db: Database) -> str | None:
+        return mapping.get(channel_id)
+    return _resolver
+
+
+# -- Route-level tests (sync; resolver monkeypatched; DB unused by route) -----
+
+def test_ws_client_receives_messages_from_fanout_channel(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        ws_module,
+        "_resolve_fanout_channel",
+        _stub_resolver({"valid": "fanout-recv"}),
+    )
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        with c.websocket_connect("/ws?channel_id=valid") as ws:
+            bus.feed_threadsafe("fanout-recv", {"hello": "world"})
+            text = ws.receive_text()
+    assert json.loads(text) == {"hello": "world"}
+
+
+def test_unknown_channel_id_closes_with_policy_violation(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    monkeypatch.setattr(
+        ws_module, "_resolve_fanout_channel", _stub_resolver({})
+    )
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with c.websocket_connect("/ws?channel_id=missing") as ws:
+                ws.receive_text()
+    assert exc_info.value.code == 1008  # policy violation
+
+
+def test_slow_consumer_does_not_crash_when_queue_is_full(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `_QUEUE_SIZE=4` and 20 messages fed without immediate draining,
+    the producer's `put_nowait` raises `QueueFull` and the route's drop
+    branch is exercised. We assert: (a) no exception leaks; (b) the first 4
+    messages received are valid JSON in monotonic order. Exact drop count
+    is not asserted because the consumer task drains concurrently with the
+    producer in the portal loop — when a drop occurs is a function of
+    portal-loop scheduling, not test input."""
+    monkeypatch.setattr(ws_module, "_QUEUE_SIZE", 4)
+    monkeypatch.setattr(
+        ws_module,
+        "_resolve_fanout_channel",
+        _stub_resolver({"X": "fanout-drop"}),
+    )
+
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        with c.websocket_connect("/ws?channel_id=X") as ws:
+            for i in range(20):
+                bus.feed_threadsafe("fanout-drop", {"i": i})
+            received: list[dict[str, Any]] = []
+            for _ in range(4):
+                received.append(json.loads(ws.receive_text()))
+            bus.stop_threadsafe("fanout-drop")
+    assert len(received) == 4
+    nums = [m["i"] for m in received]
+    assert nums == sorted(nums)  # FIFO order until drop kicks in
+
+
+# -- Resolver-direct tests (async; DB used; no WS) ----------------------------
+
+@pytest.mark.asyncio
+async def test_resolver_returns_fanout_for_ws_channel(db: Database) -> None:
+    async with db.session() as s:
+        row = await ChannelRepo(s).create(
+            name="wsx",
+            type=ChannelType.ws,
+            config={"ws_fanout_channel": "fanout-direct"},
+        )
+        await s.commit()
+        channel_id = row.id
+    result = await ws_module._resolve_fanout_channel(channel_id, db)
+    assert result == "fanout-direct"
+
+
+@pytest.mark.asyncio
+async def test_resolver_returns_none_for_unknown_channel(db: Database) -> None:
+    result = await ws_module._resolve_fanout_channel(
+        "00000000-0000-0000-0000-000000000000", db
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_returns_none_for_non_ws_type(db: Database) -> None:
+    async with db.session() as s:
+        row = await ChannelRepo(s).create(
+            name="webhook",
+            type=ChannelType.http,
+            config={"url": "http://example.com/hook"},
+        )
+        await s.commit()
+        channel_id = row.id
+    result = await ws_module._resolve_fanout_channel(channel_id, db)
+    assert result is None
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_web_ws.py -v`
+Expected: 6 FAILs with `ModuleNotFoundError: No module named 'apps.web.routers.ws'`.
+
+### Task 8.5: Green — implement `/ws` route
+
+**Files:**
+- Create: `apps/web/routers/ws.py`
+- Modify: `apps/web/main.py:99-105` — include the new router.
+
+- [ ] **Step 1: Write the minimal `/ws` handler**
+
+```python
+# apps/web/routers/ws.py
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any
+
+import structlog
+from fastapi import APIRouter, Depends, WebSocket, status
+
+from apps.web.deps import get_bus, get_db
+from core.bus.redis_bus import RedisBus
+from core.config.db import Database
+from core.config.models import ChannelType
+from core.config.repositories import ChannelRepo
+
+log = structlog.get_logger(__name__)
+router = APIRouter(tags=["ws"])
+
+# Tunable knobs (patched in tests; documented in the chunk preamble).
+_QUEUE_SIZE = 256
+_WARN_WINDOW_S = 60.0
+
+
+async def _resolve_fanout_channel(
+    channel_id: str,
+    db: Database,
+) -> str | None:
+    """Look up the `ws_fanout_channel` config value for `channel_id`. Returns
+    None if the row is missing OR the row's type is not `ws`."""
+    async with db.session() as s:
+        row = await ChannelRepo(s).get(channel_id)
+    if row is None or row.type != ChannelType.ws:
+        return None
+    fanout: str | None = row.config.get("ws_fanout_channel")
+    return fanout
+
+
+@router.websocket("/ws")
+async def ws_endpoint(
+    websocket: WebSocket,
+    channel_id: str,
+    db: Database = Depends(get_db),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> None:
+    # `get_db` is a plain `def` returning `Database` (not an async generator),
+    # so it unwinds cleanly on WS close and `app.dependency_overrides[get_db]`
+    # works for unit tests. We avoid `Depends(get_session)` (which IS an
+    # async generator) because async-gen Depends in WS routes don't unwind
+    # cleanly on early disconnect.
+    fanout = await _resolve_fanout_channel(channel_id, db)
+    if fanout is None:
+        # Accept-then-close pattern: starlette requires accept() before close().
+        await websocket.accept()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await websocket.accept()
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_QUEUE_SIZE)
+    last_warn_at = 0.0
+
+    async def _producer() -> None:
+        nonlocal last_warn_at
+        ready = asyncio.Event()
+        gen = bus.subscribe(fanout, ready=ready)
+        try:
+            async for msg in gen:
+                body = json.dumps(msg, separators=(",", ":"))
+                try:
+                    queue.put_nowait(body)
+                except asyncio.QueueFull:
+                    now = time.monotonic()
+                    if now - last_warn_at >= _WARN_WINDOW_S:
+                        log.warning(
+                            "ws.slow_consumer_dropping_messages",
+                            channel_id=channel_id,
+                            fanout=fanout,
+                        )
+                        last_warn_at = now
+        finally:
+            await gen.aclose()  # type: ignore[attr-defined]
+
+    async def _consumer() -> None:
+        while True:
+            body = await queue.get()
+            await websocket.send_text(body)
+
+    producer_task = asyncio.create_task(_producer(), name=f"ws.producer:{channel_id}")
+    consumer_task = asyncio.create_task(_consumer(), name=f"ws.consumer:{channel_id}")
+    try:
+        # Either side exiting (client disconnect, broker close) ends the
+        # session. We propagate by cancelling the other coroutine.
+        done, pending = await asyncio.wait(
+            {producer_task, consumer_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        for t in done | pending:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                # WebSocketDisconnect on consumer-side is expected (client gone).
+                # Anything else is a programmer error and worth a log line so
+                # operators see a footprint when a WS session dies non-cleanly.
+                log.warning(
+                    "ws.session_ended_with_exception",
+                    channel_id=channel_id,
+                    task=t.get_name(),
+                    exc=repr(exc),
+                )
+    finally:
+        try:
+            await websocket.close()
+        except RuntimeError:
+            # Already closed by the client; ignore.
+            pass
+```
+
+Wire-up in `apps/web/main.py`. Insert below the existing router imports:
+
+```python
+    from apps.web.routers import ws as ws_router  # noqa: E402
+
+    app.include_router(ws_router.router)
+```
+
+- [ ] **Step 2: Re-run the route tests**
+
+Run: `pytest tests/unit/test_web_ws.py -v`
+Expected: all 6 PASS (3 route tests + 3 resolver-direct tests). The slow-consumer test may flake if portal-loop scheduling shifts; if it does, the fix is to lower the feed count or insert a `time.sleep(0)` between feeds — but on a quiet CI host it should be deterministic because the fake's `feed_threadsafe` schedules a sync `put_nowait` per call.
+
+- [ ] **Step 3: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean. The `Depends(get_db)` / `Depends(get_bus)` pattern is intentional — see comment in the handler.
+
+### Task 8.6: Integration test — full WS fanout via testcontainers Redis
+
+End-to-end proof: spin up real Redis, build a `WebSocketChannel` against it, build the FastAPI app against it, connect a WS client, send via the channel, receive via the WS client. This is the test that catches Redis-API-shape mismatches that the mocked unit tests can't. The IT monkeypatches `_resolve_fanout_channel` so the test focuses on the Redis ↔ WS roundtrip; DB-side resolver logic is already covered by the resolver-direct unit tests in Task 8.4.
+
+**Files:**
+- Create: `tests/integration/test_ws_fanout.py`
+
+- [ ] **Step 1: Write the integration test**
+
+```python
+# tests/integration/test_ws_fanout.py
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
+import pytest
+import pytest_asyncio
+from fastapi.testclient import TestClient
+from testcontainers.redis import RedisContainer  # type: ignore[import-untyped]
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from apps.web.routers import ws as ws_module
+from core.bus.redis_bus import RedisBus
+from core.config.db import Database
+from core.notifier.websocket import WebSocketChannel
+
+pytestmark = pytest.mark.integration
+
+
+@pytest_asyncio.fixture
+async def real_redis() -> AsyncIterator[RedisBus]:
+    with RedisContainer("redis:7-alpine") as rc:
+        url = f"redis://{rc.get_container_host_ip()}:{rc.get_exposed_port(6379)}/0"
+        bus = RedisBus(url)
+        await bus.connect()
+        try:
+            yield bus
+        finally:
+            await bus.disconnect()
+
+
+@pytest_asyncio.fixture
+async def db() -> AsyncIterator[Database]:
+    # The route reads `db` via `Depends(get_db)` but the resolver is
+    # monkeypatched below, so the DB sits idle. An in-memory engine is
+    # cheap and keeps the dependency override type-honest.
+    d = Database("sqlite+aiosqlite:///:memory:")
+    await d.connect()
+    yield d
+    await d.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_fanout(
+    real_redis: RedisBus, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _resolver(_channel_id: str, _db: Database) -> str | None:
+        return "fanout-it"
+    monkeypatch.setattr(ws_module, "_resolve_fanout_channel", _resolver)
+
+    app = create_app(lifespan=None)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_bus] = lambda: real_redis
+
+    ch = WebSocketChannel(config={"ws_fanout_channel": "fanout-it"}, bus=real_redis)
+    await ch.start()
+    try:
+        with TestClient(app) as c, c.websocket_connect("/ws?channel_id=any") as ws:
+            # Redis Pub/Sub is at-most-once: if we publish before the
+            # /ws handler's `bus.subscribe(...)` has attached, the message
+            # is dropped at the broker. A small fixed delay matches the
+            # existing test_bus.py pattern; if this flakes, raise to 0.5s
+            # and add a single retry of `ch.send(...)` — at-most-once
+            # semantics make retry an acceptable TEST pattern, NOT a code
+            # change in the route or channel.
+            await asyncio.sleep(0.2)
+            await ch.send({"e2e": True, "n": 1})
+            text = ws.receive_text()
+    finally:
+        await ch.stop()
+
+    assert json.loads(text) == {"e2e": True, "n": 1}
+```
+
+- [ ] **Step 2: Run the integration test**
+
+Run: `pytest tests/integration/test_ws_fanout.py -v -m integration`
+Expected: PASS. First run pulls `redis:7-alpine`; subsequent runs are 1-2s.
+
+If the test is flaky due to the at-most-once nature of pubsub (subscribe-vs-publish race), bump the `asyncio.sleep(0.2)` to `0.5` and add a single retry of `ch.send(...)` followed by `ws.receive_text()`. Document the retry in the test docstring — at-most-once semantics make this an acceptable test pattern, NOT a code change.
+
+### Task 8.7: Close-out
+
+- [ ] **Step 1: Run all unit tests**
+
+Run: `pytest tests/unit/ -v`
+Expected: clean. New count vs chunk 7: +5 (WS channel) +6 (WS route + resolver) +1 (registration test) = +12 tests.
+
+- [ ] **Step 2: Run all integration tests**
+
+Run: `pytest tests/integration/ -v -m integration`
+Expected: chunks 1-7 IT + the new `test_ws_fanout.py` PASS.
+
+- [ ] **Step 3: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add core/notifier/websocket.py \
+        apps/web/routers/ws.py \
+        apps/web/main.py \
+        apps/worker/main.py \
+        tests/unit/test_websocket_channel.py \
+        tests/unit/test_web_ws.py \
+        tests/unit/test_channel_registry.py \
+        tests/integration/test_ws_fanout.py
+git commit -m "feat(notifier): WebSocketChannel + /ws fanout server with back-pressure"
+```
+
+---

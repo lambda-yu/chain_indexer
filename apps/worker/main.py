@@ -68,7 +68,12 @@ class _CheckpointAdapter:
 class _Worker:
     """Holds the shared DB / bus / watcher and a map of chain_id → (runner, task)."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        ready_event: asyncio.Event | None = None,
+    ) -> None:
         self._settings = settings
         self._db = Database(settings.database.url, echo=settings.database.echo)
         self._bus = RedisBus(url=settings.redis.url)
@@ -77,6 +82,7 @@ class _Worker:
         self._watcher: ConfigWatcher | None = None
         self._runners: dict[str, tuple[ChainRunner, asyncio.Task[None]]] = {}
         self._stop = asyncio.Event()
+        self._ready = ready_event
 
     async def start(self) -> None:
         await self._db.connect()
@@ -91,12 +97,19 @@ class _Worker:
         await self._watcher.start()
 
     async def run(self) -> None:
-        """Main loop: dequeue snapshots, reconcile runners, exit on _stop."""
+        """Main loop: dequeue snapshots, reconcile runners, exit on _stop.
+        Sets `_ready` after the first reconcile completes (i.e. all enabled
+        chains have started)."""
+        first_reconcile_done = False
         while not self._stop.is_set():
             snap = await self._dequeue_snapshot_or_stop()
             if snap is None:
                 return
             await self._reconcile(snap)
+            if not first_reconcile_done:
+                first_reconcile_done = True
+                if self._ready is not None:
+                    self._ready.set()
 
     async def _dequeue_snapshot_or_stop(self) -> ConfigSnapshot | None:
         get_task = asyncio.create_task(self._snap_queue.get())
@@ -174,17 +187,24 @@ class _Worker:
         log.info("worker.shutdown_complete")
 
 
-async def run_worker(settings: Settings, stop_event: asyncio.Event) -> None:
+async def run_worker(
+    settings: Settings,
+    stop_event: asyncio.Event,
+    *,
+    ready_event: asyncio.Event | None = None,
+) -> None:
     """Public coroutine that boots a `_Worker` and runs until `stop_event` is set.
+
+    `ready_event` (optional) is set after `_Worker.start()` succeeds AND the
+    first reconcile completes (i.e. all enabled chains have started). Tests
+    use this to avoid timing-based sleeps; production callers (`_amain`)
+    ignore it.
 
     Does NOT install signal handlers — the caller is responsible for triggering
     `stop_event` (E2E tests do this directly; the CLI entry point does it from
     SIGTERM/SIGINT handlers via `_amain` below).
-
-    If `worker.start()` fails partway through, `shutdown()` is called to
-    release any resources that were already acquired (DB pool, Redis pool).
     """
-    worker = _Worker(settings)
+    worker = _Worker(settings, ready_event=ready_event)
     try:
         await worker.start()
     except BaseException:

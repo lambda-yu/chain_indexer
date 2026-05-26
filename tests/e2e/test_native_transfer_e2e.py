@@ -150,10 +150,20 @@ async def test_native_transfer_anvil_to_webhook(
     # 2) Start the worker in-process. It will load the seeded config on boot
     # via the Redis `config_changed` pub/sub path (publishes happened above).
     stop_event = asyncio.Event()
-    worker_task = asyncio.create_task(run_worker(settings, stop_event))
+    ready_event = asyncio.Event()
+    worker_task = asyncio.create_task(
+        run_worker(settings, stop_event, ready_event=ready_event)
+    )
 
-    # Give the worker a moment to load config and connect to Anvil.
-    await asyncio.sleep(1.0)
+    # Wait for the worker to load config and start the chain runner.
+    # Deterministic replacement for the legacy `await asyncio.sleep(1.0)`.
+    try:
+        await asyncio.wait_for(ready_event.wait(), timeout=10.0)
+    except TimeoutError:
+        stop_event.set()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+        pytest.fail("worker did not signal ready within 10s")
 
     # 3) Submit N native transfers on Anvil.
     w3 = AsyncWeb3(AsyncHTTPProvider(anvil.rpc_url))

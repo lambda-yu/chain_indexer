@@ -10,7 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from core.matcher.filters import FilterError, validate as _validate_filter_keys
+from core.matcher.filters import FilterError
+from core.matcher.filters import validate as _validate_filter_keys
 
 ArgFilterValue = str | int | bool | list[str | int | bool]
 

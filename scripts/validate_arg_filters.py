@@ -10,7 +10,8 @@ from sqlalchemy import select
 from apps.web.schemas import ArgFilterValue
 from core.config.db import Database
 from core.config.models import Subscription
-from core.matcher.filters import FilterError, validate as _validate_filter_keys
+from core.matcher.filters import FilterError
+from core.matcher.filters import validate as _validate_filter_keys
 
 _VALUE_SHAPE = TypeAdapter(dict[str, ArgFilterValue])
 

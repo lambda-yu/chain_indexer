@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from functools import partial
-from typing import Any
+from typing import Any, ClassVar
 
 from core.bus.redis_bus import RedisBus
 from core.notifier.channel import Channel
@@ -16,6 +16,14 @@ class RedisStreamsChannel(Channel):
     """
 
     type = "mq"
+    config_schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "required": ["stream"],
+        "properties": {
+            "stream": {"type": "string"},
+            "maxlen": {"type": "integer"},
+        },
+    }
 
     def __init__(
         self,

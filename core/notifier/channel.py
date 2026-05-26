@@ -16,6 +16,7 @@ class Channel(ABC):
     """
 
     type: ClassVar[str]
+    config_schema: ClassVar[dict[str, Any]]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -24,6 +25,10 @@ class Channel(ABC):
             raise TypeError(
                 f"{cls.__name__} must declare a `type` class attribute "
                 f"(non-empty str). Got {t!r}."
+            )
+        if not hasattr(cls, "config_schema") or not isinstance(cls.config_schema, dict):
+            raise TypeError(
+                f"{cls.__name__} must declare a `config_schema` class attribute (dict)."
             )
         register_channel(cls)
 

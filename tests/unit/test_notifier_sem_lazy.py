@@ -9,6 +9,7 @@ from core.parser.event import Event
 
 class _StubChannel(Channel):
     type = "stub-sem"
+    config_schema: dict = {}
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.sent: list[dict[str, Any]] = []

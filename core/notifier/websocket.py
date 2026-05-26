@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from functools import partial
-from typing import Any
+from typing import Any, ClassVar
 
 from core.bus.redis_bus import RedisBus
 from core.notifier.channel import Channel
@@ -13,6 +13,13 @@ class WebSocketChannel(Channel):
     """Redis Pub/Sub-backed notification driver for WebSocket fan-out."""
 
     type = "ws"
+    config_schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "required": ["ws_fanout_channel"],
+        "properties": {
+            "ws_fanout_channel": {"type": "string"},
+        },
+    }
 
     def __init__(
         self,

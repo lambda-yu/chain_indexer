@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 from functools import partial
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import structlog
@@ -26,6 +26,17 @@ class HttpChannel(Channel):
     """
 
     type = "http"
+    config_schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+            "url": {"type": "string"},
+            "method": {"type": "string"},
+            "headers": {"type": "object"},
+            "hmac_secret": {"type": "string"},
+            "timeout_seconds": {"type": "number"},
+        },
+    }
 
     def __init__(self, *, config: dict[str, Any], bus: object = None, base_delay: float = 1.0) -> None:
         del bus

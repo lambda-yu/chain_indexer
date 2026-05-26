@@ -57,6 +57,7 @@ def _ch(id_: str = "c1") -> SnapshotChannel:
 
 class _CollectingChannel(Channel):
     type = "collect-runner"
+    config_schema: dict = {}
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []

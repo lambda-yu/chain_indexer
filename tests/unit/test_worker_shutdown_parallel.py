@@ -44,7 +44,7 @@ async def test_shutdown_stops_runners_in_parallel(tmp_path: Any) -> None:
 
         t = asyncio.create_task(_idle(), name=f"fake-runner-{i}")
         runners[f"chain-{i}"] = (r, t)
-    w._runners = runners  # type: ignore[assignment]
+    w._runners = runners
 
     # Patch out bus/db disconnect so we don't need real connections.
     async def _noop() -> None:
@@ -83,7 +83,7 @@ async def test_shutdown_disconnects_bus_after_runners_finish(tmp_path: Any) -> N
     async def _idle() -> None:
         await asyncio.Event().wait()
     t = asyncio.create_task(_idle(), name="ordered-runner")
-    w._runners = {"c1": (_OrderedRunner(), t)}  # type: ignore[assignment]
+    w._runners = {"c1": (_OrderedRunner(), t)}  # type: ignore[dict-item]
 
     async def _bus_disc() -> None:
         events.append("bus-disconnected")

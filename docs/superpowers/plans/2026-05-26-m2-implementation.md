@@ -3537,3 +3537,719 @@ Expected: clean.
 
 ---
 
+## Chunk 5: `AbiCallParser`
+
+Closes spec §3 and §4.2's "ABI call" gap. Chunks 2 and 4 already shipped the `AbiRegistry` decoder cache and the topic0 lookup; chunk 5 adds the **selector** lookup and the call-side parser. The shape mirrors chunk 4 but on the `block.txs` axis instead of `block.logs`, with one important contract difference: **unknown selectors are skipped, not downgraded** (spec §4.2: "asserts unknown-selector skip (NOT downgrade — call parser is opt-in per subscription)").
+
+**Spec §3, §4.2, §6 scope:**
+- Add `AbiRegistry.lookup_function_by_selector(selector) → (fn_name, CallDecoder) | None` backed by a `_selector_index: dict[selector, (abi_id, fn_name)]` built at refresh time (same collision rule as chunk 4: first-write-wins + warning log).
+- Implement `AbiCallParser` (`core/parser/abi_call.py`) that walks `block.txs`, extracts the first 4 bytes of `tx.input` as the selector, looks it up in the registry, and emits `Event(kind="call", name=<fn_name>, args=<decoded>, contract=tx.to_addr.lower())` for matches.
+- **Skip rules (no event emitted):** tx with `status != 1` (failed); `input` shorter than 10 chars (`"0x" + 4 bytes`); unknown selector (per spec §4.2); decode failure on a known selector (log warning + skip — the spec's "downgrade" path applies only to events, not calls).
+- Extend `ChainRunner` so that when `abi_registry` is supplied it appends **both** `AbiEventParser` (chunk 4) **and** `AbiCallParser` to the pipeline.
+
+**Interaction with chunk 4 (`AbiEventParser`):**
+A single ERC-20 `transfer(...)` tx produces both a `kind="event"` (from `AbiEventParser` decoding the emitted `Transfer` log) and a `kind="call"` (from `AbiCallParser` decoding the calldata) — plus the `kind="token_transfer"` from chunk 3. All three flow downstream; the matcher routes by `match_kind`. There is no de-dup — that's by design (a sub keyed on `call` matches the calldata; one keyed on `event` matches the receipt log; one keyed on `token_transfer` matches the standardised ERC-20 shape).
+
+**Interaction with chunk 4's `_Worker._registry`:**
+Zero changes needed. The worker already builds the registry, calls `refresh(snap)` at the top of `_reconcile`, and passes the registry to every `ChainRunner`. As soon as `ChainRunner.__init__` extends the parser list to also append `AbiCallParser`, the call-side path lights up using the same registry instance.
+
+**New files this chunk:**
+- `core/parser/abi_call.py`
+- `tests/unit/test_abi_call_parser.py`
+
+**Modified files this chunk:**
+- `core/abi/registry.py` — `_selector_index` build + `lookup_function_by_selector`.
+- `tests/unit/test_abi_registry.py` — `lookup_function_by_selector` tests.
+- `apps/worker/chain_runner.py` — append `AbiCallParser` to the parser list alongside `AbiEventParser`.
+- `tests/unit/test_chain_runner.py` — extend with one ABI-call dispatch test.
+
+**Out of scope this chunk:**
+- Anchor IDL call decoding (spec §2 explicitly defers; the design notes "AnchorIdlEventParser handles 80%+ of observability use cases").
+- Internal calls / sub-calls — M2 parses the top-level `tx.input` only. Tracing internal calls would require `trace_block` RPC, which is non-standard and out of scope.
+- Multicall / batched call decoding — a `multicall(bytes[])` tx surfaces as `name="multicall"` with the raw bytes array in `args["data"]`; subscribers needing per-inner-call routing roll their own filter.
+
+### Task 5.1: `AbiRegistry.lookup_function_by_selector`
+
+Parallel to chunk 4's topic0 path: build a `selector → (abi_id, fn_name)` index at refresh time, expose a `lookup_function_by_selector` method that reuses the per-`(abi_id, selector)` decoder cache from `get_call_decoder`.
+
+**Files:**
+- Modify: `core/abi/registry.py`
+- Test: extend `tests/unit/test_abi_registry.py`
+
+- [ ] **Step 1: Append the failing tests**
+
+```python
+# tests/unit/test_abi_registry.py — append (at end of file)
+
+# `_FN_TRANSFER` was already added in Task 2.7. We re-use it here.
+
+_FN_APPROVE = {
+    "type": "function", "name": "approve",
+    "inputs": [
+        {"name": "spender", "type": "address"},
+        {"name": "value",   "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+}
+
+
+def test_lookup_function_by_selector_returns_decoder_for_known_selector() -> None:
+    snap = _snap_with(SnapshotAbi(
+        id="a1", name="erc20", kind="evm_abi",
+        body=[_FN_TRANSFER, _FN_APPROVE],
+    ))
+    r = AbiRegistry()
+    r.refresh(snap)
+    sel = function_selector(_FN_TRANSFER)
+    result = r.lookup_function_by_selector(sel)
+    assert result is not None
+    name, decoder = result
+    assert name == "transfer"
+    args = decoder(
+        "0xa9059cbb"
+        "000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "00000000000000000000000000000000000000000000000000000000000003e7"
+    )
+    assert args["to"] == "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert args["value"] == "999"
+
+
+def test_lookup_function_by_selector_returns_none_for_unknown() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_FN_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    assert r.lookup_function_by_selector("0xdeadbeef") is None
+
+
+def test_lookup_function_picks_first_abi_on_selector_collision(caplog) -> None:
+    """Two ABIs both declare `transfer(address,uint256)` → same 4-byte
+    selector. First-write-wins with a warning log; stability across
+    repeated lookups."""
+    snap = _snap_with(
+        SnapshotAbi(id="a1", name="erc20a", kind="evm_abi", body=[_FN_TRANSFER]),
+        SnapshotAbi(id="a2", name="erc20b", kind="evm_abi", body=[_FN_TRANSFER]),
+    )
+    r = AbiRegistry()
+    with caplog.at_level("WARNING"):
+        r.refresh(snap)
+    sel = function_selector(_FN_TRANSFER)
+    first = r.lookup_function_by_selector(sel)
+    assert first is not None
+    # Stability: looking up twice returns the same decoder identity.
+    assert r.lookup_function_by_selector(sel) is first
+
+
+def test_selector_index_rebuilt_on_abi_removal() -> None:
+    """After an ABI is removed, its functions should no longer be looked-up-able."""
+    snap_with = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_FN_TRANSFER]))
+    snap_without = _snap_with()
+    r = AbiRegistry()
+    r.refresh(snap_with)
+    sel = function_selector(_FN_TRANSFER)
+    assert r.lookup_function_by_selector(sel) is not None
+    r.refresh(snap_without)
+    assert r.lookup_function_by_selector(sel) is None
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_registry.py -k lookup_function_by_selector -v`
+Expected: `AttributeError: 'AbiRegistry' object has no attribute 'lookup_function_by_selector'`.
+
+- [ ] **Step 3: Add `_selector_index` build + `lookup_function_by_selector`**
+
+Edit `core/abi/registry.py`. In `__init__`, add the new instance attribute alongside `_topic0_index` (added in chunk 4):
+
+```python
+        self._selector_index: dict[str, tuple[str, str]] = {}  # selector → (abi_id, fn_name)
+```
+
+In `refresh()`, after the existing `self._rebuild_topic0_index()` call, add the symmetric call:
+
+```python
+        self._rebuild_topic0_index()
+        self._rebuild_selector_index()
+```
+
+Add the new index-building method next to `_rebuild_topic0_index` for cohesion:
+
+```python
+    def _rebuild_selector_index(self) -> None:
+        idx: dict[str, tuple[str, str]] = {}
+        for abi_id, abi in self._abis.items():
+            body = abi.body if isinstance(abi.body, list) else [abi.body]
+            for entry in body:
+                if entry.get("type") != "function":
+                    continue
+                try:
+                    sel = function_selector(entry).lower()
+                except Exception:  # noqa: BLE001 — malformed ABI entry, skip
+                    log.warning(
+                        "abi_registry.selector_compute_failed",
+                        abi_id=abi_id,
+                        function=entry.get("name"),
+                    )
+                    continue
+                if sel in idx:
+                    log.warning(
+                        "abi_registry.selector_collision",
+                        selector=sel,
+                        first=idx[sel],
+                        second=(abi_id, entry.get("name")),
+                    )
+                    continue  # first-write-wins
+                idx[sel] = (abi_id, entry.get("name", ""))
+        self._selector_index = idx
+```
+
+Add the `lookup_function_by_selector` method next to `lookup_event_by_topic0`:
+
+```python
+    def lookup_function_by_selector(
+        self, selector: str
+    ) -> tuple[str, CallDecoder] | None:
+        """Resolve a tx's 4-byte calldata selector to a `(fn_name, decoder)` pair.
+
+        Returns None if no known ABI declares a function with this selector.
+        The decoder return value reuses the per-`(abi_id, selector)` cache
+        from `get_call_decoder`, so repeated calls return the same callable.
+        """
+        entry = self._selector_index.get(selector.lower())
+        if entry is None:
+            return None
+        abi_id, fn_name = entry
+        decoder = self.get_call_decoder(abi_id, selector)
+        return fn_name, decoder
+```
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_registry.py -v`
+Expected: all existing tests + 4 new tests pass (13 total: 5 from Task 2.5 + 4 from Task 2.7 + 4 from Task 4.2 + 4 from Task 5.1 minus any overlap — adjust based on actual count, but the new 4 must pass).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/abi/registry.py tests/unit/test_abi_registry.py
+git commit -m "feat(abi): selector index + lookup_function_by_selector with collision handling"
+```
+
+### Task 5.2: `AbiCallParser` (match + skip-unknown)
+
+The parser walks `block.txs` and emits one `kind="call"` Event per tx whose selector resolves to a known function. Unknown selectors are skipped silently (per spec §4.2). Decode failures on a known selector are logged + skipped (no downgrade path for calls).
+
+**Files:**
+- Create: `core/parser/abi_call.py`
+- Test: `tests/unit/test_abi_call_parser.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_abi_call_parser.py
+from __future__ import annotations
+
+from core.abi.decoder import function_selector
+from core.abi.registry import AbiRegistry
+from core.chains.types import Block, BlockHeader, Tx
+from core.config.snapshot import ConfigSnapshot, SnapshotAbi
+from core.parser.abi_call import AbiCallParser
+
+
+_FN_TRANSFER = {
+    "type": "function", "name": "transfer",
+    "inputs": [
+        {"name": "to",    "type": "address"},
+        {"name": "value", "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+}
+_FN_APPROVE = {
+    "type": "function", "name": "approve",
+    "inputs": [
+        {"name": "spender", "type": "address"},
+        {"name": "value",   "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+}
+_TRANSFER_SEL = function_selector(_FN_TRANSFER)   # "0xa9059cbb"
+_APPROVE_SEL = function_selector(_FN_APPROVE)     # "0x095ea7b3"
+_TO = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _registry_with(*entries: dict) -> AbiRegistry:
+    snap = ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=list(entries))],
+    )
+    r = AbiRegistry()
+    r.refresh(snap)
+    return r
+
+
+def _block(txs: list[Tx]) -> Block:
+    return Block(
+        header=BlockHeader(number=42, hash="0xh42", parent_hash="0xh41", timestamp=1700000000),
+        txs=txs,
+        logs=[],
+    )
+
+
+def _transfer_calldata(value: int = 999) -> str:
+    return (
+        _TRANSFER_SEL
+        + "0" * 24 + _TO
+        + format(value, "064x")
+    )
+
+
+def test_emits_call_kind_for_known_selector_with_decoded_args() -> None:
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    tx = Tx(
+        hash="0xt1", index=0, from_addr="0xf00", to_addr="0xCAFE",
+        value=0, input=_transfer_calldata(value=999), status=1,
+    )
+    events = list(p.parse(_block([tx])))
+    assert len(events) == 1
+    e = events[0]
+    assert e.kind == "call"
+    assert e.name == "transfer"
+    assert e.contract == "0xcafe"  # lowercased
+    assert e.args == {
+        "to":    "0x" + _TO,
+        "value": "999",
+    }
+    assert e.chain_id == "eth-mainnet"
+    assert e.block_number == 42
+    assert e.tx_hash == "0xt1"
+    assert e.tx_index == 0
+    assert e.log_index is None  # calls have no log_index
+
+
+def test_skips_tx_with_unknown_selector_no_downgrade() -> None:
+    """Per spec §4.2: unknown selector → skip, NOT downgrade.
+    A subscriber asked for kind=call with a specific ABI; if the tx isn't
+    against that ABI we don't manufacture noise."""
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    unknown = "0xdeadbeef" + "00" * 32
+    tx = Tx(hash="0xt2", index=0, from_addr="0xf", to_addr="0xc",
+            value=0, input=unknown, status=1)
+    assert list(p.parse(_block([tx]))) == []
+
+
+def test_skips_tx_with_empty_or_short_input() -> None:
+    """A native-only tx (input=='0x') or a tx with <4 bytes of calldata is
+    not a contract call. Skip without warning."""
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    txs = [
+        Tx(hash="0xt3", index=0, from_addr="0xf", to_addr="0xc", value=1, input="0x", status=1),
+        Tx(hash="0xt4", index=1, from_addr="0xf", to_addr="0xc", value=0, input="0xa905", status=1),  # 2 bytes
+        Tx(hash="0xt5", index=2, from_addr="0xf", to_addr="0xc", value=0, input="", status=1),
+    ]
+    assert list(p.parse(_block(txs))) == []
+
+
+def test_skips_failed_tx() -> None:
+    """A failed tx (status=0) didn't execute the contract's state-changing
+    code path. Match NativeTransferParser's convention: don't emit events
+    for failed txs."""
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    tx = Tx(hash="0xt6", index=0, from_addr="0xf", to_addr="0xc",
+            value=0, input=_transfer_calldata(), status=0)
+    assert list(p.parse(_block([tx]))) == []
+
+
+def test_skips_contract_creation_tx() -> None:
+    """A contract-creation tx has `to_addr=None`; its `input` is initcode,
+    not calldata. The first 4 bytes are arbitrary bytecode and may
+    coincidentally collide with a known selector — emitting a call event
+    in that case would be a false positive. Skip without warning."""
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    # Initcode that happens to start with the transfer selector's bytes:
+    initcode = _transfer_calldata(value=999)
+    tx = Tx(hash="0xt8", index=0, from_addr="0xf", to_addr=None,
+            value=0, input=initcode, status=1)
+    assert list(p.parse(_block([tx]))) == []
+
+
+def test_skips_known_selector_on_decode_failure(caplog) -> None:
+    """Calldata that has the right selector but malformed args (e.g.
+    truncated) is logged + skipped — not emitted as a half-decoded call.
+    The spec's `kind="event"` downgrade applies only to events; calls
+    are opt-in per subscription so silence-on-failure is the safer default."""
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    # Right selector, but truncated args (only 16 bytes of address, no value).
+    bad = _TRANSFER_SEL + "00" * 16
+    tx = Tx(hash="0xt7", index=0, from_addr="0xf", to_addr="0xc",
+            value=0, input=bad, status=1)
+    with caplog.at_level("WARNING"):
+        events = list(p.parse(_block([tx])))
+    assert events == []
+    assert any("abi_call_parser.decode_failed" in r.message for r in caplog.records)
+
+
+def test_emits_one_event_per_matching_tx() -> None:
+    """Block with three txs: one transfer, one approve, one unknown.
+    Parser emits two events (transfer + approve)."""
+    reg = _registry_with(_FN_TRANSFER, _FN_APPROVE)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    txs = [
+        Tx(hash="0xtA", index=0, from_addr="0xf", to_addr="0xC1",
+           value=0, input=_transfer_calldata(value=100), status=1),
+        Tx(hash="0xtB", index=1, from_addr="0xf", to_addr="0xC2",
+           value=0,
+           input=_APPROVE_SEL + "0" * 24 + _TO + format(7, "064x"),
+           status=1),
+        Tx(hash="0xtC", index=2, from_addr="0xf", to_addr="0xC3",
+           value=0, input="0xdead" + "beef" * 16, status=1),  # unknown
+    ]
+    events = list(p.parse(_block(txs)))
+    assert [e.name for e in events] == ["transfer", "approve"]
+    assert [e.kind for e in events] == ["call", "call"]
+    assert [e.tx_index for e in events] == [0, 1]
+
+
+def test_preserves_raw_input_for_debugging() -> None:
+    """The matched-call Event carries the original input bytes in `raw` so
+    downstream tooling can recover the exact calldata without re-encoding."""
+    reg = _registry_with(_FN_TRANSFER)
+    p = AbiCallParser(chain_id="eth-mainnet", registry=reg)
+    calldata = _transfer_calldata(value=42)
+    tx = Tx(hash="0xt9", index=0, from_addr="0xf", to_addr="0xc",
+            value=0, input=calldata, status=1)
+    events = list(p.parse(_block([tx])))
+    assert len(events) == 1
+    assert events[0].raw["input"] == calldata
+    assert events[0].raw["tx_hash"] == "0xt9"
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_call_parser.py -v`
+Expected: `ImportError: cannot import name 'AbiCallParser'`.
+
+- [ ] **Step 3: Implement `core/parser/abi_call.py`**
+
+```python
+# core/parser/abi_call.py
+"""ABI-driven call parser.
+
+Per spec §4.2 / §3:
+- Walks `block.txs`; for each tx whose `input` starts with a known 4-byte
+  selector, emits an `Event(kind="call", name=<fn_name>, args=<decoded>)`.
+- **Skip rules (no event emitted):**
+  - `tx.status != 1` — failed tx (matches NativeTransferParser convention).
+  - `tx.input` is empty / shorter than 10 chars (`"0x" + 4 bytes`) — not a
+    contract call.
+  - Selector is unknown to the registry — per spec §4.2, call parsing is
+    opt-in per subscription; we don't manufacture noise for unrelated txs.
+  - Decoder raises `DecodeFailed` — log warning + skip (no downgrade path
+    for calls; the spec §6 downgrade applies only to events).
+
+The parser does NOT pre-bind to specific ABI IDs — it consults the shared
+`AbiRegistry` on every tx, so newly-added ABIs become observable on the
+very next block without rebuilding the pipeline.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import structlog
+
+from core.abi.errors import DecodeFailed
+from core.abi.registry import AbiRegistry
+from core.chains.types import Block, Tx
+from core.parser.event import Event
+
+log = structlog.get_logger(__name__)
+
+_SELECTOR_HEX_LEN = 10  # "0x" + 8 hex chars = 4 bytes
+
+
+class AbiCallParser:
+    def __init__(self, *, chain_id: str, registry: AbiRegistry) -> None:
+        self._chain_id = chain_id
+        self._registry = registry
+
+    def parse(self, block: Block) -> Iterable[Event]:
+        h = block.header
+        for tx in block.txs:
+            ev = self._handle_tx(tx, h.number, h.hash, h.timestamp)
+            if ev is not None:
+                yield ev
+
+    def _handle_tx(
+        self,
+        tx: Tx,
+        block_number: int,
+        block_hash: str,
+        block_ts: int,
+    ) -> Event | None:
+        if tx.status != 1:
+            return None
+        if tx.to_addr is None:
+            return None  # contract-creation tx — calldata is initcode, not a call
+        inp = tx.input or ""
+        if len(inp) < _SELECTOR_HEX_LEN:
+            return None
+        selector = inp[:_SELECTOR_HEX_LEN].lower()
+
+        lookup = self._registry.lookup_function_by_selector(selector)
+        if lookup is None:
+            return None  # spec §4.2: unknown selector → skip, NOT downgrade
+
+        fn_name, decoder = lookup
+        try:
+            args = decoder(inp)
+        except DecodeFailed as exc:
+            log.warning(
+                "abi_call_parser.decode_failed",
+                selector=selector,
+                function=fn_name,
+                tx_hash=tx.hash,
+                error=str(exc),
+            )
+            return None
+
+        return Event(
+            chain_id=self._chain_id,
+            block_number=block_number,
+            block_hash=block_hash,
+            block_timestamp=block_ts,
+            tx_hash=tx.hash,
+            tx_index=tx.index,
+            log_index=None,
+            kind="call",
+            contract=tx.to_addr.lower(),
+            name=fn_name,
+            args=args,
+            raw={
+                "tx_hash": tx.hash,
+                "input": inp,
+            },
+        )
+```
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_call_parser.py -v`
+Expected: 8 PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/parser/abi_call.py tests/unit/test_abi_call_parser.py
+git commit -m "feat(parser): AbiCallParser with skip-on-unknown-selector semantics"
+```
+
+### Task 5.3: Wire `AbiCallParser` into `ChainRunner`
+
+When `abi_registry` is supplied, `ChainRunner` now appends **both** `AbiEventParser` (chunk 4) and `AbiCallParser` (this chunk) to the pipeline.
+
+**Files:**
+- Modify: `apps/worker/chain_runner.py`
+
+- [ ] **Step 1: Append the failing test**
+
+Append to `tests/unit/test_chain_runner.py`:
+
+```python
+# tests/unit/test_chain_runner.py — append
+def test_chain_runner_pipeline_includes_abi_call_parser_when_registry_given() -> None:
+    """Construction-time wiring check: passing `abi_registry=` adds **both**
+    AbiEventParser and AbiCallParser to the pipeline. Without it, the pipeline
+    stays at native + erc20."""
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    chain = _chain()
+    runner_with = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+        abi_registry=reg,
+    )
+    types_with = [type(p).__name__ for p in runner_with._pipeline._parsers]
+    assert "AbiEventParser" in types_with
+    assert "AbiCallParser" in types_with
+
+    runner_without = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
+    assert "AbiCallParser" not in types_without
+    assert "AbiEventParser" not in types_without
+    # Sanity: native + erc20 still there in both.
+    assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
+    assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_pipeline_includes_abi_call_parser_when_registry_given -v`
+Expected: FAIL — `assert "AbiCallParser" in types_with` fails (only AbiEventParser was added by chunk 4).
+
+- [ ] **Step 3: Append `AbiCallParser` to the registry-conditional branch**
+
+Edit `apps/worker/chain_runner.py`. Add import near the other parser imports:
+
+```python
+from core.parser.abi_call import AbiCallParser
+```
+
+Then extend the conditional parser-list build (added in Task 4.4) to append both parsers:
+
+```python
+        parsers: list[Parser] = [
+            NativeTransferParser(chain_id=self._chain.id),
+            Erc20TransferParser(chain_id=self._chain.id),
+        ]
+        if abi_registry is not None:
+            parsers.append(AbiEventParser(chain_id=self._chain.id, registry=abi_registry))
+            parsers.append(AbiCallParser(chain_id=self._chain.id, registry=abi_registry))
+        self._pipeline = ParserPipeline(parsers)
+```
+
+Order matters only for stable test output — the matcher keys on `(chain_id, kind)`, so routing is order-independent. Keeping `AbiEventParser` before `AbiCallParser` matches the spec §5 data-flow order (logs before calls).
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_chain_runner.py -v`
+Expected: all existing tests still pass + new wiring test passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add apps/worker/chain_runner.py tests/unit/test_chain_runner.py
+git commit -m "feat(runner): append AbiCallParser alongside AbiEventParser when registry present"
+```
+
+### Task 5.4: End-to-end `AbiCallParser` dispatch through `ChainRunner`
+
+A high-level test: feed a block containing an ERC-20 `transfer(...)` tx into a `ChainRunner` constructed with a populated `AbiRegistry` and a subscription `match_kind="call"`, `match_name="transfer"`. The notifier should receive a payload with `kind="call"`, `name="transfer"`, and decoded args.
+
+**Files:**
+- Test: extend `tests/unit/test_chain_runner.py`
+
+- [ ] **Step 1: Append the test**
+
+```python
+# tests/unit/test_chain_runner.py — append
+def _block_with_erc20_transfer_call(n: int, *, to_hex: str, value: int) -> Block:
+    """Build a block whose single tx is a well-formed ERC-20 `transfer(to, value)`
+    call to contract address `0xtoken`. Calldata: selector + 32-byte address +
+    32-byte uint256."""
+    pad24 = "0" * 24
+    sel = "a9059cbb"  # transfer(address,uint256) — see chunk 2 test for derivation
+    calldata = "0x" + sel + pad24 + to_hex + format(value, "064x")
+    return Block(
+        header=_hdr(n, parent=f"0xh{n-1}" if n > 0 else "0x0"),
+        txs=[
+            Tx(hash=f"0xt{n}", index=0, from_addr="0xf0", to_addr="0xtoken",
+               value=0, input=calldata, status=1),
+        ],
+        logs=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_abi_call_match() -> None:
+    """ChainRunner with an AbiRegistry containing ERC-20 `transfer` fires a
+    `kind="call", name="transfer"` dispatch for the subscription."""
+    _FN_TRANSFER = {
+        "type": "function", "name": "transfer",
+        "inputs": [
+            {"name": "to",    "type": "address"},
+            {"name": "value", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    }
+    chain = _chain()
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_FN_TRANSFER])],
+    ))
+    to_hex = "bbbb" + "00" * 18
+    blocks = [_block_with_erc20_transfer_call(n, to_hex=to_hex, value=n * 100)
+              for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="call", match_name="transfer")],
+        channels=[_ch("c1")],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_FN_TRANSFER])],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+        abi_registry=reg,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        # Same confirmation arithmetic as chunk 3 / 4 dispatch tests.
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"call"}
+        names = {c["event"]["name"] for c in coll.calls}
+        assert names == {"transfer"}
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        # block 1 → 100, block 2 → 200
+        assert values == {"100", "200"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+```
+
+- [ ] **Step 2: Run, expect PASS**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_dispatches_abi_call_match -v`
+Expected: PASS. (Implementation work finished in Task 5.3; this test is a regression seal.)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/unit/test_chain_runner.py
+git commit -m "test(runner): end-to-end ABI-call dispatch with populated registry"
+```
+
+### Task 5.5: Chunk 5 close-out
+
+- [ ] **Step 1: Run the full test suite**
+
+Run: `pytest tests/ -v`
+Expected: all M1 + chunks 1-5 tests pass.
+
+- [ ] **Step 2: Lint / type check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+---
+

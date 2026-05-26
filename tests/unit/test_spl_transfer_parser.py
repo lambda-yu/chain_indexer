@@ -124,3 +124,49 @@ def test_skips_non_token_program() -> None:
     )
     p = SplTransferParser(chain_id="sol")
     assert list(p.parse(_block([_tx([ix])]))) == []
+
+
+def _transfer_with_fee_data(amount: int, fee: int) -> str:
+    payload = bytes([26, 1]) + struct.pack("<Q", amount) + bytes([6]) + struct.pack("<Q", fee)
+    return base58.b58encode(payload).decode()
+
+
+def test_transfer_checked_with_fee_disc_26_1() -> None:
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SOURCE", MINT, "DEST", "OWNER"],
+        data_b58=_transfer_with_fee_data(500_000, 1_000),
+        stack_depth=1,
+    )
+    p = SplTransferParser(chain_id="sol")
+    events = list(p.parse(_block([_tx([ix])])))
+    assert len(events) == 1
+    assert events[0].args["value"] == "500000"
+    assert events[0].args["fee"] == "1000"
+    assert events[0].args["mint"] == MINT
+
+
+def test_disc_26_sub_0_is_skipped() -> None:
+    payload = bytes([26, 0]) + b"\x00" * 17
+    data_b58 = base58.b58encode(payload).decode()
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SOURCE", MINT, "DEST", "OWNER"],
+        data_b58=data_b58,
+        stack_depth=1,
+    )
+    p = SplTransferParser(chain_id="sol")
+    assert list(p.parse(_block([_tx([ix])]))) == []
+
+
+def test_transfer_with_fee_truncated_data_skipped() -> None:
+    payload = bytes([26, 1]) + b"\x00" * 5
+    data_b58 = base58.b58encode(payload).decode()
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SOURCE", MINT, "DEST", "OWNER"],
+        data_b58=data_b58,
+        stack_depth=1,
+    )
+    p = SplTransferParser(chain_id="sol")
+    assert list(p.parse(_block([_tx([ix])]))) == []

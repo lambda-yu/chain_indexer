@@ -14,6 +14,8 @@ _TOKEN_PROGRAMS = {SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID}
 
 _TRANSFER_DISC = 3
 _TRANSFER_CHECKED_DISC = 12
+_TRANSFER_FEE_EXT_OUTER = 26
+_TRANSFER_FEE_EXT_SUB = 1
 
 
 class SplTransferParser:
@@ -36,7 +38,15 @@ class SplTransferParser:
             result = self._decode(ix, tx)
             if result is None:
                 continue
-            from_addr, to_addr, amount, mint = result
+            from_addr, to_addr, amount, mint, fee = result
+            args: dict[str, str] = {
+                "from": from_addr,
+                "to": to_addr,
+                "value": str(amount),
+                "mint": mint,
+            }
+            if fee is not None:
+                args["fee"] = str(fee)
             yield Event(
                 chain_id=self._chain_id,
                 block_number=block.slot,
@@ -48,19 +58,14 @@ class SplTransferParser:
                 kind="token_transfer",
                 contract=mint,
                 name="Transfer",
-                args={
-                    "from": from_addr,
-                    "to": to_addr,
-                    "value": str(amount),
-                    "mint": mint,
-                },
+                args=args,
                 raw={"signature": tx.signature},
             )
 
     @staticmethod
     def _decode(
         ix: SolanaInstruction, tx: SolanaTransaction,
-    ) -> tuple[str, str, int, str] | None:
+    ) -> tuple[str, str, int, str, int | None] | None:
         try:
             data = base58.b58decode(ix.data_b58)
         except Exception:  # noqa: BLE001
@@ -78,7 +83,7 @@ class SplTransferParser:
             mint = _resolve_mint_from_balances(source, tx)
             if mint is None:
                 return None
-            return source, dest, amount, mint
+            return source, dest, amount, mint, None
 
         if disc == _TRANSFER_CHECKED_DISC and len(data) >= 9:
             amount = struct.unpack("<Q", data[1:9])[0]
@@ -87,7 +92,19 @@ class SplTransferParser:
             source = ix.accounts[0]
             mint = ix.accounts[1]
             dest = ix.accounts[2]
-            return source, dest, amount, mint
+            return source, dest, amount, mint, None
+
+        if disc == _TRANSFER_FEE_EXT_OUTER and len(data) >= 19:
+            if data[1] != _TRANSFER_FEE_EXT_SUB:
+                return None
+            amount = struct.unpack("<Q", data[2:10])[0]
+            fee: int = struct.unpack("<Q", data[11:19])[0]
+            if len(ix.accounts) < 4:
+                return None
+            source = ix.accounts[0]
+            mint = ix.accounts[1]
+            dest = ix.accounts[2]
+            return source, dest, amount, mint, fee
 
         return None
 

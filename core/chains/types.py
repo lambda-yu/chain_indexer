@@ -36,3 +36,44 @@ class Block:
     header: BlockHeader
     txs: list[Tx] = field(default_factory=list)
     logs: list[Log] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SolanaTokenBalance:
+    account_index: int
+    mint: str
+    owner: str | None
+    amount: int
+    decimals: int
+
+
+@dataclass(frozen=True)
+class SolanaInstruction:
+    program_id: str
+    accounts: list[str]
+    data_b58: str
+    stack_depth: int
+
+
+@dataclass(frozen=True)
+class SolanaTransaction:
+    signature: str
+    slot: int
+    success: bool
+    fee: int
+    account_keys: list[str]
+    pre_balances: list[int]
+    post_balances: list[int]
+    pre_token_balances: list[SolanaTokenBalance]
+    post_token_balances: list[SolanaTokenBalance]
+    log_messages: list[str]
+    instructions: list[SolanaInstruction]
+
+
+@dataclass(frozen=True)
+class SolanaBlock:
+    slot: int
+    block_hash: str
+    parent_slot: int
+    block_time: int | None
+    transactions: list[SolanaTransaction]

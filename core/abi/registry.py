@@ -179,7 +179,7 @@ class AbiRegistry:
                 continue
             for ev in body.get("events", []):
                 name = ev.get("name", "")
-                struct = build_anchor_event_struct(ev)
+                struct = build_anchor_event_struct(ev, types_section=body.get("types", []))
                 if struct is None:
                     log.info("abi_registry.idl_event_unsupported_types", abi_id=abi_id, event_name=name)
                     continue

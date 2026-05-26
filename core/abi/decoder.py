@@ -162,7 +162,7 @@ def decode_function_call(fn_abi: dict[str, Any], calldata: str) -> dict[str, Any
 
 
 # ---------------------------------------------------------------------------
-# Anchor IDL helpers (Solana — chunk 13)
+# Anchor IDL helpers (Solana)
 # ---------------------------------------------------------------------------
 
 _ANCHOR_SCALAR_MAP: dict[str, construct.Construct[Any, Any]] = {
@@ -183,6 +183,60 @@ _ANCHOR_SCALAR_MAP: dict[str, construct.Construct[Any, Any]] = {
     "publicKey": construct.Bytes(32),
 }
 
+_MAX_TYPE_DEPTH = 8
+
+
+def _resolve_type(
+    type_spec: Any,
+    types_section: list[dict[str, Any]],
+    seen: frozenset[str] = frozenset(),
+    depth: int = 0,
+) -> construct.Construct[Any, Any] | None:
+    if depth >= _MAX_TYPE_DEPTH:
+        return None
+    if isinstance(type_spec, str):
+        return _ANCHOR_SCALAR_MAP.get(type_spec)
+    if not isinstance(type_spec, dict):
+        return None
+
+    if "defined" in type_spec:
+        name = type_spec["defined"]
+        if name in seen:
+            return None
+        for t in types_section:
+            if t.get("name") == name:
+                kind_obj = t.get("type", {})
+                if kind_obj.get("kind") != "struct":
+                    return None
+                fields: list[Any] = []
+                for f in kind_obj.get("fields", []):
+                    resolved = _resolve_type(
+                        f.get("type"), types_section, seen | {name}, depth + 1,
+                    )
+                    if resolved is None:
+                        return None
+                    fields.append(f["name"] / resolved)
+                return borsh_construct.CStruct(*fields)
+        return None
+
+    if "vec" in type_spec:
+        inner = _resolve_type(type_spec["vec"], types_section, seen, depth + 1)
+        return borsh_construct.Vec(inner) if inner is not None else None
+
+    if "option" in type_spec:
+        inner = _resolve_type(type_spec["option"], types_section, seen, depth + 1)
+        return borsh_construct.Option(inner) if inner is not None else None
+
+    if "array" in type_spec:
+        arr = type_spec["array"]
+        if isinstance(arr, list) and len(arr) == 2:
+            inner = _resolve_type(arr[0], types_section, seen, depth + 1)
+            if inner is not None:
+                return construct.Array(arr[1], inner)
+        return None
+
+    return None
+
 
 def anchor_event_discriminator(event_name: str) -> bytes:
     return hashlib.sha256(f"event:{event_name}".encode()).digest()[:8]
@@ -190,18 +244,31 @@ def anchor_event_discriminator(event_name: str) -> bytes:
 
 def build_anchor_event_struct(
     idl_event: dict[str, Any],
+    types_section: list[dict[str, Any]] | None = None,
 ) -> construct.Construct[Any, Any] | None:
+    ts = types_section or []
     fields_spec: list[Any] = []
     for field in idl_event.get("fields", []):
-        ft = field.get("type")
-        if isinstance(ft, str) and ft in _ANCHOR_SCALAR_MAP:
-            fields_spec.append(field["name"] / _ANCHOR_SCALAR_MAP[ft])
-        else:
+        resolved = _resolve_type(field.get("type"), ts)
+        if resolved is None:
             return None
+        fields_spec.append(field["name"] / resolved)
     return borsh_construct.CStruct(*fields_spec)
 
 
-def decode_anchor_event(
+def _normalize_borsh_value(v: Any) -> Any:
+    if isinstance(v, bytes) and len(v) == 32:
+        return _base58.b58encode(v).decode()
+    if isinstance(v, int):
+        return str(v) if abs(v) > 2**53 else v
+    if isinstance(v, list):
+        return [_normalize_borsh_value(item) for item in v]
+    if hasattr(v, "items"):
+        return {k: _normalize_borsh_value(val) for k, val in v.items() if k != "_io"}
+    return v
+
+
+def decode_anchor_borsh(
     struct: construct.Construct[Any, Any],
     body_bytes: bytes,
 ) -> dict[str, Any]:
@@ -211,10 +278,11 @@ def decode_anchor_event(
         raise DecodeFailed(f"borsh decode failed: {exc}") from exc
     out: dict[str, Any] = {}
     for k, v in parsed.items():
-        if isinstance(v, bytes) and len(v) == 32:
-            out[k] = _base58.b58encode(v).decode()
-        elif isinstance(v, int):
-            out[k] = str(v) if abs(v) > 2**53 else v
-        else:
-            out[k] = v
+        if k == "_io":
+            continue
+        out[k] = _normalize_borsh_value(v)
     return out
+
+
+# Backward compat alias
+decode_anchor_event = decode_anchor_borsh

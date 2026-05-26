@@ -372,7 +372,7 @@ def test_chain_runner_pipeline_includes_abi_event_parser_when_registry_given() -
     )
     types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
     assert "AbiEventParser" not in types_without
-    assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
+    assert "EvmNativeTransferParser" in types_with and "EvmNativeTransferParser" in types_without
     assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without
 
 
@@ -453,5 +453,5 @@ def test_chain_runner_pipeline_includes_abi_call_parser_when_registry_given() ->
     types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
     assert "AbiCallParser" not in types_without
     assert "AbiEventParser" not in types_without
-    assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
+    assert "EvmNativeTransferParser" in types_with and "EvmNativeTransferParser" in types_without
     assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without

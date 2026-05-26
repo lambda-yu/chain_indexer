@@ -6,7 +6,7 @@ from core.chains.types import Block
 from core.parser.event import Event
 
 
-class NativeTransferParser:
+class EvmNativeTransferParser:
     """Emit a native_transfer Event for each tx with value > 0 (EVM only).
 
     Skips contract creations (to_addr is None) and reverted txs (status == 0).

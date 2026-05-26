@@ -7,11 +7,7 @@ from core.chains.types import Block
 from core.parser.event import Event
 
 
-class Parser(Protocol):
-    """A parser consumes a confirmed Block and yields Events.
-
-    Implementations should be stateless and side-effect free; the same Block
-    may be re-parsed during reorg replay.
-    """
+class EvmParser(Protocol):
+    """An EVM parser consumes a confirmed Block and yields Events."""
 
     def parse(self, block: Block) -> Iterable[Event]: ...

@@ -2,8 +2,8 @@ from collections.abc import Iterable
 
 from core.chains.types import Block, BlockHeader, Tx
 from core.parser.event import Event
-from core.parser.native import NativeTransferParser
-from core.parser.pipeline import ParserPipeline
+from core.parser.native import EvmNativeTransferParser
+from core.parser.pipeline import EvmParserPipeline
 
 
 class _FakeParser:
@@ -33,7 +33,7 @@ def test_pipeline_runs_all_parsers_in_order() -> None:
         txs=[],
         logs=[],
     )
-    pipe = ParserPipeline(parsers=[_FakeParser("a"), _FakeParser("b")])
+    pipe = EvmParserPipeline(parsers=[_FakeParser("a"), _FakeParser("b")])
     out = list(pipe.run(blk))
     assert [e.name for e in out] == ["a", "b"]
 
@@ -53,7 +53,7 @@ def test_pipeline_isolates_parser_exceptions() -> None:
             raise RuntimeError("boom")
             yield  # pragma: no cover
 
-    pipe = ParserPipeline(parsers=[_Bad(), NativeTransferParser(chain_id="x")])
+    pipe = EvmParserPipeline(parsers=[_Bad(), EvmNativeTransferParser(chain_id="x")])
     out = list(pipe.run(blk))
     assert len(out) == 1
     assert out[0].kind == "native_transfer"

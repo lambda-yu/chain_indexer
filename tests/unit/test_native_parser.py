@@ -1,5 +1,5 @@
 from core.chains.types import Block, BlockHeader, Tx
-from core.parser.native import NativeTransferParser
+from core.parser.native import EvmNativeTransferParser
 
 
 def _block_with(txs: list[Tx]) -> Block:
@@ -11,7 +11,7 @@ def _block_with(txs: list[Tx]) -> Block:
 
 
 def test_emits_one_event_per_value_carrying_tx() -> None:
-    p = NativeTransferParser(chain_id="eth-mainnet")
+    p = EvmNativeTransferParser(chain_id="eth-mainnet")
     blk = _block_with(
         [
             Tx(
@@ -57,7 +57,7 @@ def test_emits_one_event_per_value_carrying_tx() -> None:
 
 def test_skips_contract_creation_txs() -> None:
     """Contract creation has to_addr=None; native transfer requires a recipient."""
-    p = NativeTransferParser(chain_id="eth-mainnet")
+    p = EvmNativeTransferParser(chain_id="eth-mainnet")
     blk = _block_with(
         [
             Tx(
@@ -76,7 +76,7 @@ def test_skips_contract_creation_txs() -> None:
 
 def test_skips_failed_txs() -> None:
     """status=0 means the tx reverted; no value actually moved."""
-    p = NativeTransferParser(chain_id="eth-mainnet")
+    p = EvmNativeTransferParser(chain_id="eth-mainnet")
     blk = _block_with(
         [
             Tx(

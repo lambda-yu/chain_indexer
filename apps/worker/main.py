@@ -203,6 +203,15 @@ async def run_worker(settings: Settings, stop_event: asyncio.Event) -> None:
 
 
 async def _amain() -> None:
+    """POSIX-targeted CLI entry. Installs SIGTERM/SIGINT handlers and runs
+    until either signal sets `stop_event`.
+
+    Windows note: `loop.add_signal_handler` raises `NotImplementedError` on
+    the Proactor event loop. Windows users should embed `run_worker(settings,
+    stop_event)` directly into their own process supervisor and drive
+    `stop_event` from whatever signal mechanism their OS provides (e.g. a
+    SetConsoleCtrlHandler shim). Embedding callers don't need this CLI.
+    """
     settings = load_settings()
     configure_logging(level=settings.logging.level, format=settings.logging.format)
 
@@ -214,7 +223,17 @@ async def _amain() -> None:
         stop_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _request_shutdown, sig)
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig)
+        except NotImplementedError:
+            # Windows Proactor loop: signal handlers unsupported. Surface the
+            # advice and bail; embedding callers should use run_worker() directly.
+            log.error(
+                "worker.signal_handler_unsupported",
+                signal=sig.name,
+                hint="run_worker(settings, stop_event) directly on Windows",
+            )
+            raise
 
     await run_worker(settings, stop_event)
 

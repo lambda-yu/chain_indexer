@@ -12,6 +12,7 @@ from apps.worker.config_watcher import ConfigWatcher
 from core.abi.registry import AbiRegistry
 from core.bus.redis_bus import RedisBus
 from core.chains.evm import EvmAdapter
+from core.chains.solana import SolanaAdapter
 from core.config.db import Database
 from core.config.repositories import CheckpointRepo
 from core.config.snapshot import ConfigSnapshot, SnapshotChain, SnapshotChannel, load_snapshot
@@ -25,17 +26,24 @@ from core.settings import Settings, load_settings
 log = structlog.get_logger(__name__)
 
 
-def _default_adapter_factory(cfg: SnapshotChain) -> EvmAdapter:
-    if cfg.kind != "evm":
-        # Chunk 10 (Solana) extends this branch. M1 hard-fails so misconfigs are loud.
-        raise NotImplementedError(f"chain kind {cfg.kind!r} not supported yet")
-    return EvmAdapter(
-        chain_id=cfg.id,
-        rpc_http=cfg.rpc_http,
-        rpc_ws=cfg.rpc_ws,
-        confirmations=cfg.confirmations,
-        poll_interval_ms=cfg.poll_interval_ms,
-    )
+def _default_adapter_factory(cfg: SnapshotChain) -> EvmAdapter | SolanaAdapter:
+    if cfg.kind == "evm":
+        return EvmAdapter(
+            chain_id=cfg.id,
+            rpc_http=cfg.rpc_http,
+            rpc_ws=cfg.rpc_ws,
+            confirmations=cfg.confirmations,
+            poll_interval_ms=cfg.poll_interval_ms,
+        )
+    if cfg.kind == "solana":
+        assert cfg.commitment is not None, "Solana chain must have commitment set"
+        return SolanaAdapter(
+            chain_id=cfg.id,
+            rpc_http=cfg.rpc_http,
+            commitment=cfg.commitment,
+            poll_interval_ms=cfg.poll_interval_ms,
+        )
+    raise NotImplementedError(f"chain kind {cfg.kind!r} not supported")
 
 
 def _make_channel_factory(bus: RedisBus) -> Callable[[SnapshotChannel], Channel]:
@@ -149,7 +157,7 @@ class _Worker:
             else:
                 runner = ChainRunner(
                     chain=cfg,
-                    adapter_factory=_default_adapter_factory,
+                    adapter_factory=_default_adapter_factory,  # type: ignore[arg-type]
                     channel_factory=_make_channel_factory(self._bus),
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,

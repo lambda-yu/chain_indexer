@@ -18,6 +18,7 @@ from core.config.snapshot import ConfigSnapshot, SnapshotChain, SnapshotChannel,
 from core.logging import configure_logging
 from core.notifier.channel import CHANNEL_REGISTRY, Channel
 from core.notifier.http import HttpChannel  # noqa: F401 — side-effect: register http
+from core.notifier.redis_streams import RedisStreamsChannel  # noqa: F401 — side-effect: register mq
 from core.settings import Settings, load_settings
 
 log = structlog.get_logger(__name__)

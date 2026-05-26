@@ -51,11 +51,13 @@ class EvmAdapter:
         rpc_http: str,
         rpc_ws: str | None,
         confirmations: int,
+        poll_interval_ms: int = 1000,
     ) -> None:
         self.chain_id = chain_id
         self.confirmations = confirmations
         self._rpc_http = rpc_http
         self._rpc_ws = rpc_ws
+        self._poll_interval_s = poll_interval_ms / 1000.0
         self._w3: AsyncWeb3[Any] | None = None
 
     async def connect(self) -> None:
@@ -153,7 +155,7 @@ class EvmAdapter:
                     timestamp=int(raw["timestamp"]),
                 )
                 last = n
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(self._poll_interval_s)
 
     async def _subscribe_heads_ws(self) -> AsyncIterator[BlockHeader]:
         """WS subscription via web3.py v7 handler + queue bridge.

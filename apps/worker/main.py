@@ -23,16 +23,14 @@ log = structlog.get_logger(__name__)
 
 def _default_adapter_factory(cfg: SnapshotChain) -> EvmAdapter:
     if cfg.kind != "evm":
-        # M3 (Solana) will branch on `cfg.kind` here; M1 hard-fails so misconfigs are loud.
-        raise NotImplementedError(f"chain kind {cfg.kind!r} not supported in M1")
-    # NOTE: `poll_interval_ms` from SnapshotChain is NOT wired through — Chunk 3's
-    # EvmAdapter hard-codes a 1s HTTP poll fallback. Plumbing the per-chain value
-    # is a follow-up (tracked as an M2 task; not blocking).
+        # Chunk 10 (Solana) extends this branch. M1 hard-fails so misconfigs are loud.
+        raise NotImplementedError(f"chain kind {cfg.kind!r} not supported yet")
     return EvmAdapter(
         chain_id=cfg.id,
         rpc_http=cfg.rpc_http,
         rpc_ws=cfg.rpc_ws,
         confirmations=cfg.confirmations,
+        poll_interval_ms=cfg.poll_interval_ms,
     )
 
 

@@ -139,3 +139,67 @@ def test_decoder_cache_is_reused_for_same_abi_id_and_key() -> None:
     d1 = r.get_event_decoder("a1", t0)
     d2 = r.get_event_decoder("a1", t0)
     assert d1 is d2
+
+
+_SECOND_EVENT = {
+    "type": "event", "name": "Approval",
+    "inputs": [
+        {"name": "owner",   "type": "address", "indexed": True},
+        {"name": "spender", "type": "address", "indexed": True},
+        {"name": "value",   "type": "uint256", "indexed": False},
+    ],
+}
+
+
+def test_lookup_event_by_topic0_returns_decoder_for_known_topic() -> None:
+    snap = _snap_with(SnapshotAbi(
+        id="a1", name="erc20", kind="evm_abi",
+        body=[_ERC20_TRANSFER, _SECOND_EVENT],
+    ))
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    result = r.lookup_event_by_topic0(t0)
+    assert result is not None
+    name, decoder = result
+    assert name == "Transfer"
+    args = decoder(
+        topics=[
+            t0,
+            "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ],
+        data="0x000000000000000000000000000000000000000000000000000000000000007b",
+    )
+    assert args["value"] == "123"
+
+
+def test_lookup_event_by_topic0_returns_none_for_unknown() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    assert r.lookup_event_by_topic0("0xdead" + "00" * 30) is None
+
+
+def test_lookup_event_picks_first_abi_on_topic0_collision() -> None:
+    snap = _snap_with(
+        SnapshotAbi(id="a1", name="erc20a", kind="evm_abi", body=[_ERC20_TRANSFER]),
+        SnapshotAbi(id="a2", name="erc20b", kind="evm_abi", body=[_ERC20_TRANSFER]),
+    )
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    result = r.lookup_event_by_topic0(t0)
+    assert result is not None
+    assert r.lookup_event_by_topic0(t0) is result
+
+
+def test_topic0_index_rebuilt_on_abi_removal() -> None:
+    snap_with = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    snap_without = _snap_with()
+    r = AbiRegistry()
+    r.refresh(snap_with)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    assert r.lookup_event_by_topic0(t0) is not None
+    r.refresh(snap_without)
+    assert r.lookup_event_by_topic0(t0) is None

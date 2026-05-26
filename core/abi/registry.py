@@ -44,6 +44,8 @@ class AbiRegistry:
         self._abis: dict[str, SnapshotAbi] = {}
         self._hashes: dict[str, str] = {}
         self._decoders: dict[tuple[str, str], Any] = {}
+        self._topic0_index: dict[str, tuple[str, str]] = {}  # topic0 → (abi_id, event_name)
+        self._topic0_cache: dict[str, tuple[str, Any]] = {}
 
     def refresh(self, snap: ConfigSnapshot) -> None:
         new_abis: dict[str, SnapshotAbi] = {a.id: a for a in snap.abis}
@@ -58,6 +60,8 @@ class AbiRegistry:
         # Record fresh state.
         self._abis = new_abis
         self._hashes = {aid: _hash_body(a.body) for aid, a in new_abis.items()}
+        self._rebuild_topic0_index()
+        self._topic0_cache.clear()
         log.info("abi_registry.refreshed", count=len(new_abis))
 
     def _evict(self, abi_id: str) -> None:
@@ -65,6 +69,49 @@ class AbiRegistry:
             if key[0] == abi_id:
                 self._decoders.pop(key, None)
         self._hashes.pop(abi_id, None)
+
+    def _rebuild_topic0_index(self) -> None:
+        idx: dict[str, tuple[str, str]] = {}
+        for abi_id, abi in self._abis.items():
+            body = abi.body if isinstance(abi.body, list) else [abi.body]
+            for entry in body:
+                if entry.get("type") != "event":
+                    continue
+                try:
+                    t0 = event_topic0(entry).lower()
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "abi_registry.topic0_compute_failed",
+                        abi_id=abi_id,
+                        event=entry.get("name"),
+                    )
+                    continue
+                if t0 in idx:
+                    log.warning(
+                        "abi_registry.topic0_collision",
+                        topic0=t0,
+                        first=idx[t0],
+                        second=(abi_id, entry.get("name")),
+                    )
+                    continue
+                idx[t0] = (abi_id, entry.get("name", ""))
+        self._topic0_index = idx
+
+    def lookup_event_by_topic0(
+        self, topic0: str,
+    ) -> tuple[str, EventDecoder] | None:
+        key = topic0.lower()
+        cached = self._topic0_cache.get(key)
+        if cached is not None:
+            return cached
+        entry = self._topic0_index.get(key)
+        if entry is None:
+            return None
+        abi_id, event_name = entry
+        decoder = self.get_event_decoder(abi_id, topic0)
+        result = (event_name, decoder)
+        self._topic0_cache[key] = result
+        return result
 
     def get_body(self, abi_id: str) -> dict[str, Any] | list[Any]:
         a = self._abis.get(abi_id)

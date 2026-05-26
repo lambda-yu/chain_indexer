@@ -46,6 +46,8 @@ class AbiRegistry:
         self._decoders: dict[tuple[str, str], Any] = {}
         self._topic0_index: dict[str, tuple[str, str]] = {}  # topic0 → (abi_id, event_name)
         self._topic0_cache: dict[str, tuple[str, Any]] = {}
+        self._selector_index: dict[str, tuple[str, str]] = {}  # selector → (abi_id, fn_name)
+        self._selector_cache: dict[str, tuple[str, Any]] = {}
 
     def refresh(self, snap: ConfigSnapshot) -> None:
         new_abis: dict[str, SnapshotAbi] = {a.id: a for a in snap.abis}
@@ -62,6 +64,8 @@ class AbiRegistry:
         self._hashes = {aid: _hash_body(a.body) for aid, a in new_abis.items()}
         self._rebuild_topic0_index()
         self._topic0_cache.clear()
+        self._rebuild_selector_index()
+        self._selector_cache.clear()
         log.info("abi_registry.refreshed", count=len(new_abis))
 
     def _evict(self, abi_id: str) -> None:
@@ -111,6 +115,49 @@ class AbiRegistry:
         decoder = self.get_event_decoder(abi_id, topic0)
         result = (event_name, decoder)
         self._topic0_cache[key] = result
+        return result
+
+    def _rebuild_selector_index(self) -> None:
+        idx: dict[str, tuple[str, str]] = {}
+        for abi_id, abi in self._abis.items():
+            body = abi.body if isinstance(abi.body, list) else [abi.body]
+            for entry in body:
+                if entry.get("type") != "function":
+                    continue
+                try:
+                    sel = function_selector(entry).lower()
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "abi_registry.selector_compute_failed",
+                        abi_id=abi_id,
+                        function=entry.get("name"),
+                    )
+                    continue
+                if sel in idx:
+                    log.warning(
+                        "abi_registry.selector_collision",
+                        selector=sel,
+                        first=idx[sel],
+                        second=(abi_id, entry.get("name")),
+                    )
+                    continue
+                idx[sel] = (abi_id, entry.get("name", ""))
+        self._selector_index = idx
+
+    def lookup_function_by_selector(
+        self, selector: str,
+    ) -> tuple[str, CallDecoder] | None:
+        key = selector.lower()
+        cached = self._selector_cache.get(key)
+        if cached is not None:
+            return cached
+        entry = self._selector_index.get(key)
+        if entry is None:
+            return None
+        abi_id, fn_name = entry
+        decoder = self.get_call_decoder(abi_id, selector)
+        result = (fn_name, decoder)
+        self._selector_cache[key] = result
         return result
 
     def get_body(self, abi_id: str) -> dict[str, Any] | list[Any]:

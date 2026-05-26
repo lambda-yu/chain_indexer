@@ -203,3 +203,65 @@ def test_topic0_index_rebuilt_on_abi_removal() -> None:
     assert r.lookup_event_by_topic0(t0) is not None
     r.refresh(snap_without)
     assert r.lookup_event_by_topic0(t0) is None
+
+
+_FN_APPROVE = {
+    "type": "function", "name": "approve",
+    "inputs": [
+        {"name": "spender", "type": "address"},
+        {"name": "value",   "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+}
+
+
+def test_lookup_function_by_selector_returns_decoder_for_known_selector() -> None:
+    snap = _snap_with(SnapshotAbi(
+        id="a1", name="erc20", kind="evm_abi",
+        body=[_FN_TRANSFER, _FN_APPROVE],
+    ))
+    r = AbiRegistry()
+    r.refresh(snap)
+    sel = function_selector(_FN_TRANSFER)
+    result = r.lookup_function_by_selector(sel)
+    assert result is not None
+    name, decoder = result
+    assert name == "transfer"
+    args = decoder(
+        "0xa9059cbb"
+        "000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "00000000000000000000000000000000000000000000000000000000000003e7"
+    )
+    assert args["to"] == "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert args["value"] == "999"
+
+
+def test_lookup_function_by_selector_returns_none_for_unknown() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_FN_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    assert r.lookup_function_by_selector("0xdeadbeef") is None
+
+
+def test_lookup_function_picks_first_abi_on_selector_collision() -> None:
+    snap = _snap_with(
+        SnapshotAbi(id="a1", name="erc20a", kind="evm_abi", body=[_FN_TRANSFER]),
+        SnapshotAbi(id="a2", name="erc20b", kind="evm_abi", body=[_FN_TRANSFER]),
+    )
+    r = AbiRegistry()
+    r.refresh(snap)
+    sel = function_selector(_FN_TRANSFER)
+    first = r.lookup_function_by_selector(sel)
+    assert first is not None
+    assert r.lookup_function_by_selector(sel) is first
+
+
+def test_selector_index_rebuilt_on_abi_removal() -> None:
+    snap_with = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_FN_TRANSFER]))
+    snap_without = _snap_with()
+    r = AbiRegistry()
+    r.refresh(snap_with)
+    sel = function_selector(_FN_TRANSFER)
+    assert r.lookup_function_by_selector(sel) is not None
+    r.refresh(snap_without)
+    assert r.lookup_function_by_selector(sel) is None

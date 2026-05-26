@@ -4597,10 +4597,10 @@ Option 3 is the design. Concretely:
 - `HttpChannel.__init__` is widened to accept `bus` and ignore it.
 - The worker's module-level `_default_channel_factory` is replaced with a `_make_channel_factory(bus)` closure built once at `_Worker.start()` time.
 
-The reason to plumb `bus` to **every** channel uniformly (rather than special-casing `cfg.type == "redis_streams"` inside the factory) is that chunk 8 adds a second bus-consuming channel, and a uniform interface keeps the factory dispatch a single line: `cls(config=cfg.config, bus=bus)`. No `isinstance` chains, no class-level "wants_bus" flags.
+The reason to plumb `bus` to **every** channel uniformly (rather than special-casing `cfg.type == "mq"` inside the factory) is that chunk 8 adds a second bus-consuming channel, and a uniform interface keeps the factory dispatch a single line: `cls(config=cfg.config, bus=bus)`. No `isinstance` chains, no class-level "wants_bus" flags.
 
 **Spec §4.4 scope:**
-- New `core/notifier/redis_streams.py` with `class RedisStreamsChannel(Channel)`, `type = "redis_streams"`.
+- New `core/notifier/redis_streams.py` with `class RedisStreamsChannel(Channel)`, `type = "mq"`. The `"mq"` string matches M1's existing `ChannelType` enum slot (`core/config/models.py:48-51` defines `ChannelType: mq | http | ws`); the runtime registry uses the same enum value as the DB column. M2 commits to one MQ driver per process — if M3 adds Kafka/RabbitMQ, the design choice between "extend the enum" vs "driver-select via config" gets revisited then.
 - Constructor: `__init__(self, *, config: dict[str, Any], bus: RedisBus, base_delay: float = 1.0)`. Reads `config["stream"]` (required) and `config.get("maxlen")` (optional `int | None`). Raises `KeyError` if `stream` is missing — channel-config validation is M3+ territory and a missing `stream` is a programmer error, not a runtime fallback.
 - `send(payload)`: serialize `payload` as JSON, `XADD <stream> [MAXLEN ~ N] * data <json>`. Wraps the `xadd` call in `retry_with_backoff(max_attempts=3, base_delay=…)` (matches `HttpChannel` policy).
 - `start()` / `stop()`: no-ops. The channel does not own the Redis connection.
@@ -4897,11 +4897,11 @@ async def test_missing_stream_config_raises_at_construction() -> None:
         RedisStreamsChannel(config={"maxlen": 100}, bus=bus)
 
 
-def test_type_attribute_is_redis_streams() -> None:
-    # Confirms the auto-registration key is correct (chunk 6's __init_subclass__
-    # will already have registered the class on import, but the explicit assertion
-    # documents the public contract).
-    assert RedisStreamsChannel.type == "redis_streams"
+def test_type_attribute_matches_db_enum_mq_slot() -> None:
+    # Confirms the auto-registration key is the `"mq"` string that matches
+    # `ChannelType.mq` in the DB enum, so that `CHANNEL_REGISTRY[snap.type]`
+    # resolves when the worker dequeues a snapshot row with `type = ChannelType.mq`.
+    assert RedisStreamsChannel.type == "mq"
 ```
 
 - [ ] **Step 2: Run the new tests to confirm they fail**
@@ -4943,7 +4943,7 @@ class RedisStreamsChannel(Channel):
     failed `XADD` and is therefore covered by the standard retry policy.
     """
 
-    type = "redis_streams"
+    type = "mq"  # matches ChannelType.mq in the DB enum
 
     def __init__(
         self,
@@ -4998,7 +4998,7 @@ Expected: clean.
 
 ### Task 7.4: Wire the new channel into the worker's registry side-effect imports
 
-The class auto-registers via chunk 6's `__init_subclass__` hook, but that only fires once the module is imported. The worker entrypoint needs to import `core.notifier.redis_streams` so the class definition runs before any snapshot reconciliation attempts a `CHANNEL_REGISTRY["redis_streams"]` lookup.
+The class auto-registers via chunk 6's `__init_subclass__` hook, but that only fires once the module is imported. The worker entrypoint needs to import `core.notifier.redis_streams` so the class definition runs before any snapshot reconciliation attempts a `CHANNEL_REGISTRY["mq"]` lookup.
 
 **Files:**
 - Modify: `apps/worker/main.py` — add the side-effect import.
@@ -5008,22 +5008,22 @@ The class auto-registers via chunk 6's `__init_subclass__` hook, but that only f
 Add to `tests/unit/test_channel_registry.py`:
 
 ```python
-def test_redis_streams_channel_is_registered_via_worker_import() -> None:
-    """Importing `apps.worker.main` should register the redis_streams channel
-    type because the worker's side-effect imports include it. This guards
-    against forgetting the import line after adding a new channel."""
+def test_mq_channel_is_registered_via_worker_import() -> None:
+    """Importing `apps.worker.main` should register the `mq` channel type
+    because the worker's side-effect imports include `core.notifier.redis_streams`.
+    This guards against forgetting the import line after adding a new channel."""
     import apps.worker.main  # noqa: F401 — side-effect: triggers channel registration
 
     from core.notifier.channel import CHANNEL_REGISTRY
-    assert "redis_streams" in CHANNEL_REGISTRY
+    assert "mq" in CHANNEL_REGISTRY
 ```
 
 (No `importlib.reload` — Python caches modules in `sys.modules`, so a plain `import` is enough. Reload would not re-execute downstream class statements anyway, so it doesn't defend against test pollution.)
 
 - [ ] **Step 2: Run the test to confirm it fails**
 
-Run: `pytest tests/unit/test_channel_registry.py::test_redis_streams_channel_is_registered_via_worker_import -v`
-Expected: FAIL — `"redis_streams" not in CHANNEL_REGISTRY` because nothing imports the module yet.
+Run: `pytest tests/unit/test_channel_registry.py::test_mq_channel_is_registered_via_worker_import -v`
+Expected: FAIL — `"mq" not in CHANNEL_REGISTRY` because nothing imports the module yet.
 
 - [ ] **Step 3: Add the side-effect import to `apps/worker/main.py`**
 
@@ -5035,13 +5035,13 @@ from core.notifier.redis_streams import RedisStreamsChannel  # noqa: F401 — si
 
 - [ ] **Step 4: Re-run the test**
 
-Run: `pytest tests/unit/test_channel_registry.py::test_redis_streams_channel_is_registered_via_worker_import -v`
+Run: `pytest tests/unit/test_channel_registry.py::test_mq_channel_is_registered_via_worker_import -v`
 Expected: PASS.
 
 - [ ] **Step 5: Run the full channel-registry test file**
 
 Run: `pytest tests/unit/test_channel_registry.py -v`
-Expected: all tests still pass. The reload in the new test is scoped to `apps.worker.main`; chunk 6's tests don't touch this module.
+Expected: all tests still pass — the new test is independent of chunk 6's tests; nothing else is touched.
 
 ### Task 7.5: Integration test — round-trip via testcontainers Redis
 

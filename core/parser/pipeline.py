@@ -4,8 +4,8 @@ from collections.abc import Iterable, Sequence
 
 import structlog
 
-from core.chains.types import Block
-from core.parser.base import EvmParser
+from core.chains.types import Block, SolanaBlock
+from core.parser.base import EvmParser, SolanaParser
 from core.parser.event import Event
 
 log = structlog.get_logger(__name__)
@@ -31,4 +31,22 @@ class EvmParserPipeline:
                     parser=type(p).__name__,
                     block_number=block.header.number,
                     block_hash=block.header.hash,
+                )
+
+
+class SolanaParserPipeline:
+
+    def __init__(self, parsers: Sequence[SolanaParser]) -> None:
+        self._parsers = list(parsers)
+
+    def run(self, block: SolanaBlock) -> Iterable[Event]:
+        for p in self._parsers:
+            try:
+                yield from p.parse(block)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "parser.exception",
+                    parser=type(p).__name__,
+                    slot=block.slot,
+                    block_hash=block.block_hash,
                 )

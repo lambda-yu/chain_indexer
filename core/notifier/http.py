@@ -40,6 +40,7 @@ class HttpChannel(Channel):
 
     def __init__(self, *, config: dict[str, Any], bus: object = None, base_delay: float = 1.0) -> None:
         del bus
+        self._config = config
         self._url: str = config["url"]
         self._method: str = config.get("method", "POST").upper()
         self._headers: dict[str, str] = dict(config.get("headers", {}))
@@ -65,10 +66,12 @@ class HttpChannel(Channel):
             sig = hmac.new(self._hmac_secret.encode(), body, hashlib.sha256).hexdigest()
             headers["X-Signature"] = f"sha256={sig}"
 
+        max_attempts, base_delay, factor = self._retry_config
         await retry_with_backoff(
             partial(self._post_once, body=body, headers=headers),
-            max_attempts=3,
-            base_delay=self._base_delay,
+            max_attempts=max_attempts,
+            base_delay=base_delay,
+            factor=factor,
         )
 
     async def _post_once(self, *, body: bytes, headers: dict[str, str]) -> None:

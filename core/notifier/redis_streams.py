@@ -34,6 +34,7 @@ class RedisStreamsChannel(Channel):
     ) -> None:
         self._stream: str = config["stream"]
         self._maxlen: int | None = config.get("maxlen")
+        self._config = config
         self._bus = bus
         self._base_delay = base_delay
 
@@ -45,10 +46,12 @@ class RedisStreamsChannel(Channel):
 
     async def send(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"))
+        max_attempts, base_delay, factor = self._retry_config
         await retry_with_backoff(
             partial(self._xadd_once, body=body),
-            max_attempts=3,
-            base_delay=self._base_delay,
+            max_attempts=max_attempts,
+            base_delay=base_delay,
+            factor=factor,
         )
 
     async def _xadd_once(self, *, body: str) -> None:

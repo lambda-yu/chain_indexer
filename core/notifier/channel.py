@@ -41,6 +41,16 @@ class Channel(ABC):
     @abstractmethod
     async def send(self, payload: dict[str, Any]) -> None: ...
 
+    @property
+    def _retry_config(self) -> tuple[int, float, float]:
+        cfg = getattr(self, "_config", None) or {}
+        retry = cfg.get("retry", {}) if isinstance(cfg, dict) else {}
+        return (
+            retry.get("max_attempts", 3),
+            retry.get("base_delay", 1.0),
+            retry.get("backoff_factor", 4.0),
+        )
+
 
 CHANNEL_REGISTRY: dict[str, type[Channel]] = {}
 

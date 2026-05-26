@@ -29,6 +29,7 @@ class WebSocketChannel(Channel):
         base_delay: float = 1.0,
     ) -> None:
         self._fanout_channel: str = config["ws_fanout_channel"]
+        self._config = config
         self._bus = bus
         self._base_delay = base_delay
 
@@ -40,10 +41,12 @@ class WebSocketChannel(Channel):
 
     async def send(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"))
+        max_attempts, base_delay, factor = self._retry_config
         await retry_with_backoff(
             partial(self._publish_once, body=body),
-            max_attempts=3,
-            base_delay=self._base_delay,
+            max_attempts=max_attempts,
+            base_delay=base_delay,
+            factor=factor,
         )
 
     async def _publish_once(self, *, body: str) -> None:

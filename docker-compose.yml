@@ -1,0 +1,65 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 3
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: indexer
+      POSTGRES_DB: chain_indexer
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indexer"]
+      interval: 5s
+      retries: 3
+
+  migrate:
+    build: .
+    command: uv run alembic upgrade head
+    environment:
+      CHAIN_INDEXER_DATABASE__URL: postgresql+asyncpg://indexer:indexer@db:5432/chain_indexer
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: .
+    command: uv run uvicorn apps.web.main:create_app --factory --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      CHAIN_INDEXER_DATABASE__URL: postgresql+asyncpg://indexer:indexer@db:5432/chain_indexer
+      CHAIN_INDEXER_REDIS__URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: uv run python -m apps.worker.main
+    environment:
+      CHAIN_INDEXER_DATABASE__URL: postgresql+asyncpg://indexer:indexer@db:5432/chain_indexer
+      CHAIN_INDEXER_REDIS__URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
+  pg-data:

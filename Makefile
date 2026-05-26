@@ -1,4 +1,4 @@
-.PHONY: install lint format typecheck test test-unit test-integration test-e2e migrate web worker
+.PHONY: install lint format typecheck test test-unit test-integration test-e2e migrate web worker up down logs
 
 install:
 	pip install -e ".[dev,postgres]"
@@ -29,7 +29,16 @@ migrate:
 	alembic upgrade head
 
 web:
-	uvicorn apps.web.main:app --reload --port 8000
+	uvicorn apps.web.main:create_app --factory --reload --port 8000
 
 worker:
 	python -m apps.worker.main
+
+up:
+	docker compose up -d --build
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f web worker

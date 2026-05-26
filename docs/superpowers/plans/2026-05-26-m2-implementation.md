@@ -8616,3 +8616,1363 @@ git status   # confirm nothing left uncommitted
 ```
 
 ---
+## Chunk 11: `SolNativeTransferParser` + parser-pipeline split
+
+Splits the M1 parser API into chain-segmented Protocols and gives the runner a Solana code path:
+
+1. **Rename the EVM-side trio** — `Parser` → `EvmParser`, `ParserPipeline` → `EvmParserPipeline`, `NativeTransferParser` → `EvmNativeTransferParser`. Pure rename; no behavior change. Done in one task to keep the diff atomic.
+2. **`SolanaParser` Protocol** — consumes a `SolanaBlock`, yields `Event`. The same `Event` dataclass M1 uses; the chain difference is on the input side, not the output side.
+3. **`SolanaParserPipeline`** — `run(block: SolanaBlock) -> Iterable[Event]`. Same exception-isolation semantics as `EvmParserPipeline` (one bad parser doesn't poison the rest).
+4. **`SolNativeTransferParser`** — parses System Program (`11111111111111111111111111111111`) `Transfer` instructions (discriminator `2u32 LE`) at `stack_depth == 1`. Emits `Event(kind="native_transfer", args={"from": ..., "to": ..., "value": str(lamports)}, contract=None)`. Same shape EVM `EvmNativeTransferParser` emits so the matcher's `arg_filters` pattern is chain-agnostic.
+5. **`ChainRunner` branches on `cfg.kind`** — EVM path is unchanged (`ConfirmationBuffer`, `EvmParserPipeline`, `_process_confirmed_block(number)`). Solana path skips the buffer (commitment level handles finality, per spec §4.6), constructs `SolanaParserPipeline`, and processes confirmed slots directly via `_process_confirmed_slot(slot)`.
+6. **End-to-end integration** — `ChainRunner` + `SolanaAdapter` against `solana-test-validator`, submitting a real lamport transfer via `solders` and asserting the resulting `Event` reaches a mocked `Notifier`.
+
+The runner-branching task is the big one (~250 lines). Everything else is small.
+
+**Modified files this chunk:**
+- `core/parser/base.py` — rename `Parser` → `EvmParser`; append `SolanaParser` Protocol below.
+- `core/parser/pipeline.py` — rename `ParserPipeline` → `EvmParserPipeline`; append `SolanaParserPipeline` class.
+- `core/parser/native.py` — rename class `NativeTransferParser` → `EvmNativeTransferParser` (file name unchanged; one-line class rename only — keeps git blame linear).
+- `core/parser/sol_native.py` — **new**: `SolNativeTransferParser`.
+- `apps/worker/chain_runner.py` — branch on `self._chain.kind` for pipeline construction and head-processing path; widen `_adapter` type to `ChainAdapter | SolanaChainAdapter`.
+- `tests/unit/test_native_parser.py` — rename references to `EvmNativeTransferParser`.
+- `tests/unit/test_pipeline.py` — rename references to `EvmParserPipeline` and `EvmNativeTransferParser`.
+- `tests/unit/test_sol_native_parser.py` — **new**.
+- `tests/unit/test_solana_parser_pipeline.py` — **new**.
+- `tests/unit/test_chain_runner.py` — extend with `test_chain_runner_solana_branch` (constructs the runner with a fake Solana adapter; asserts the buffer is bypassed and pipeline produces events).
+- `tests/integration/test_chain_runner_solana.py` — **new**.
+
+**Out of scope this chunk:**
+- SPL token transfer parser (`SplTransferParser`) — chunk 12.
+- Anchor IDL event parser — chunk 13.
+- `ChainRunner` reorg-replay for Solana — spec §4.6 explicitly says commitment level handles finality; no Solana reorg path exists.
+- Matcher case-folding of base58 addresses (M1 `.lower()`s `event.contract`). `SolNativeTransferParser` sets `contract=None`, so the issue doesn't surface yet; chunk 12's SPL parser (which DOES set `contract` to a base58 mint) is where it'd bite. Flagged as M2 follow-up #11; deliberately left for chunk 12.
+- Adapter-side `chain_runner.py` checkpoint format change (still `(int, str)` for slot/blockhash on Solana — the existing `CheckpointRepo` accepts arbitrary strings for `last_block_hash`, and `int(slot)` fits `last_block`).
+
+**Naming pin:** The renamed Protocol is `EvmParser`, NOT `EVMParser`. The Solana counterpart is `SolanaParser`, NOT `SolParser`. The concrete class for system transfers is `SolNativeTransferParser` (matches `EvmNativeTransferParser` length and reads cleanly in registry imports). `SOLANA_SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"` is the canonical constant — define it once in `core/parser/sol_native.py` and re-export from `core/parser/__init__.py` if any other module needs it.
+
+**Spec §4.6 reminder:** Solana has NO `ConfirmationBuffer`. The runner's `_handle_head` for Solana yields one confirmed slot per polled `BlockHeader` from `SolanaAdapter.subscribe_heads()` (the adapter already filters out unchanged slots). Missed slots — `fetch_block(slot)` returning `None` — are skipped without raising. Checkpoint persistence still happens per processed slot.
+
+### Task 11.1: Rename EVM-side Parser / Pipeline / NativeTransferParser
+
+**Files:**
+- Modify: `core/parser/base.py` — class rename.
+- Modify: `core/parser/pipeline.py` — class rename + type annotation update.
+- Modify: `core/parser/native.py` — class rename.
+- Modify: `apps/worker/chain_runner.py:20-21,75` — imports + construction.
+- Modify: `tests/unit/test_native_parser.py` — all references.
+- Modify: `tests/unit/test_pipeline.py` — all references.
+
+- [ ] **Step 1: Rename `Parser` → `EvmParser`**
+
+`core/parser/base.py`:
+
+```python
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Protocol
+
+from core.chains.types import Block
+from core.parser.event import Event
+
+
+class EvmParser(Protocol):
+    """An EVM parser consumes a confirmed Block and yields Events.
+
+    Implementations should be stateless and side-effect free; the same Block
+    may be re-parsed during reorg replay (per spec §4.5 confirmation buffer).
+
+    See ``SolanaParser`` (defined in Task 11.2 below) for the Solana
+    counterpart — divergent because the input dataclass differs.
+    """
+
+    def parse(self, block: Block) -> Iterable[Event]: ...
+```
+
+- [ ] **Step 2: Rename `ParserPipeline` → `EvmParserPipeline`**
+
+`core/parser/pipeline.py`:
+
+```python
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+
+import structlog
+
+from core.chains.types import Block
+from core.parser.base import EvmParser
+from core.parser.event import Event
+
+log = structlog.get_logger(__name__)
+
+
+class EvmParserPipeline:
+    """Run a sequence of EVM parsers over a Block and yield all produced events.
+
+    Any parser that raises is logged and skipped (spec §9 "Matcher exception per
+    event" applies equally to parsers — pipeline keeps running).
+    """
+
+    def __init__(self, parsers: Sequence[EvmParser]) -> None:
+        self._parsers = list(parsers)
+
+    def run(self, block: Block) -> Iterable[Event]:
+        for p in self._parsers:
+            try:
+                yield from p.parse(block)
+            except Exception:  # noqa: BLE001 — isolate parser failures
+                log.exception(
+                    "parser.exception",
+                    parser=type(p).__name__,
+                    block_number=block.header.number,
+                    block_hash=block.header.hash,
+                )
+```
+
+- [ ] **Step 3: Rename `NativeTransferParser` → `EvmNativeTransferParser`**
+
+`core/parser/native.py` — single-line class rename (the docstring already mentions "EVM" in the first line; no body change):
+
+```python
+class EvmNativeTransferParser:
+    """Emit a native_transfer Event for each tx with value > 0 (EVM).
+    ...
+    """
+```
+
+- [ ] **Step 4: Update `apps/worker/chain_runner.py` imports + construction**
+
+Replace the two parser imports and the `_pipeline` line:
+
+```python
+from core.parser.native import EvmNativeTransferParser
+from core.parser.pipeline import EvmParserPipeline
+```
+
+And inside `__init__` (currently `chain_runner.py:75`):
+
+```python
+self._pipeline = EvmParserPipeline([EvmNativeTransferParser(chain_id=self._chain.id)])
+```
+
+(Task 11.5 widens this to `EvmParserPipeline | SolanaParserPipeline` by deferring construction to `start()` — for now, keep it on `__init__` so existing tests don't move.)
+
+- [ ] **Step 5: Update the test files**
+
+`tests/unit/test_native_parser.py` — replace all three `NativeTransferParser` references at lines 2, 14, 60, 79 with `EvmNativeTransferParser`.
+
+`tests/unit/test_pipeline.py` — replace lines 5, 6, 36, 56:
+- `from core.parser.native import NativeTransferParser` → `from core.parser.native import EvmNativeTransferParser`
+- `from core.parser.pipeline import ParserPipeline` → `from core.parser.pipeline import EvmParserPipeline`
+- `ParserPipeline(parsers=[...])` → `EvmParserPipeline(parsers=[...])` (both occurrences)
+- `NativeTransferParser(chain_id="x")` → `EvmNativeTransferParser(chain_id="x")`
+
+- [ ] **Step 6: Run the full unit suite to confirm rename is clean**
+
+```bash
+pytest tests/unit/test_native_parser.py tests/unit/test_pipeline.py tests/unit/test_chain_runner.py -v
+```
+
+Expected: every test still passes. If any test fails with `ImportError` or `NameError`, the rename missed a call-site — grep for the old name:
+
+```bash
+rg -n '\bParser\b|\bParserPipeline\b|\bNativeTransferParser\b' core/ apps/ tests/
+```
+
+(should only return `EvmParser`, `EvmParserPipeline`, `EvmNativeTransferParser`, plus the chunk-12-and-later `SolanaParser`/`SolanaParserPipeline` which don't exist yet.)
+
+- [ ] **Step 7: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add core/parser/base.py core/parser/pipeline.py core/parser/native.py \
+        apps/worker/chain_runner.py \
+        tests/unit/test_native_parser.py tests/unit/test_pipeline.py
+git commit -m "refactor(parser): rename Parser/ParserPipeline/NativeTransferParser to Evm* prefix"
+```
+
+### Task 11.2: `SolanaParser` Protocol + `SolanaParserPipeline`
+
+**Files:**
+- Modify: `core/parser/base.py` — append `SolanaParser` Protocol below `EvmParser`.
+- Modify: `core/parser/pipeline.py` — append `SolanaParserPipeline` below `EvmParserPipeline`.
+- Create: `tests/unit/test_solana_parser_pipeline.py`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_solana_parser_pipeline.py
+"""SolanaParserPipeline mirrors EvmParserPipeline:
+- yields all events from all parsers in order
+- isolates per-parser exceptions (one bad parser ≠ dead pipeline)
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import pytest
+
+from core.chains.types import SolanaBlock
+from core.parser.event import Event
+from core.parser.pipeline import SolanaParserPipeline
+
+
+def _block() -> SolanaBlock:
+    return SolanaBlock(
+        slot=42, block_hash="H42", parent_slot=41,
+        block_time=1_700_000_000, transactions=[],
+    )
+
+
+class _Fake:
+    """Yields one event named after `tag` for any SolanaBlock."""
+    def __init__(self, tag: str) -> None:
+        self._tag = tag
+
+    def parse(self, block: SolanaBlock) -> Iterable[Event]:
+        yield Event(
+            chain_id="sol", block_number=block.slot, block_hash=block.block_hash,
+            block_timestamp=block.block_time or 0,
+            tx_hash=f"sig-{self._tag}", tx_index=None, log_index=None,
+            kind="native_transfer", contract=None, name=self._tag,
+            args={}, raw={},
+        )
+
+
+class _Broken:
+    def parse(self, block: SolanaBlock) -> Iterable[Event]:  # noqa: ARG002
+        raise RuntimeError("synthetic parser failure")
+        yield  # pragma: no cover  -- generator marker
+
+
+def test_solana_pipeline_yields_in_parser_order() -> None:
+    pipe = SolanaParserPipeline(parsers=[_Fake("a"), _Fake("b")])
+    events = list(pipe.run(_block()))
+    assert [e.name for e in events] == ["a", "b"]
+
+
+def test_solana_pipeline_isolates_broken_parser() -> None:
+    pipe = SolanaParserPipeline(parsers=[_Broken(), _Fake("good")])
+    events = list(pipe.run(_block()))
+    assert [e.name for e in events] == ["good"]
+```
+
+- [ ] **Step 2: Run the test, expect FAIL with `ImportError`**
+
+Run: `pytest tests/unit/test_solana_parser_pipeline.py -v`
+Expected: `ImportError: cannot import name 'SolanaParserPipeline' from 'core.parser.pipeline'`.
+
+- [ ] **Step 3: Add `SolanaParser` Protocol**
+
+Append to `core/parser/base.py`:
+
+```python
+from core.chains.types import SolanaBlock  # add to the existing imports at the top
+
+
+class SolanaParser(Protocol):
+    """A Solana parser consumes a confirmed SolanaBlock and yields Events.
+
+    Same statelessness / side-effect-free contract as ``EvmParser``. The
+    block input differs because Solana's data model is not an EVM lookalike
+    (slots vs blocks, instructions vs txs, log_messages array vs structured
+    receipts).
+    """
+
+    def parse(self, block: SolanaBlock) -> Iterable[Event]: ...
+```
+
+- [ ] **Step 4: Add `SolanaParserPipeline`**
+
+Append to `core/parser/pipeline.py`:
+
+```python
+from core.chains.types import SolanaBlock  # add to the existing imports
+from core.parser.base import SolanaParser   # extend the existing import line
+
+
+class SolanaParserPipeline:
+    """Run a sequence of Solana parsers over a SolanaBlock and yield events.
+
+    Mirrors ``EvmParserPipeline`` exactly; the only difference is the input
+    dataclass. Same per-parser isolation policy.
+    """
+
+    def __init__(self, parsers: Sequence[SolanaParser]) -> None:
+        self._parsers = list(parsers)
+
+    def run(self, block: SolanaBlock) -> Iterable[Event]:
+        for p in self._parsers:
+            try:
+                yield from p.parse(block)
+            except Exception:  # noqa: BLE001 — isolate parser failures
+                log.exception(
+                    "parser.exception",
+                    parser=type(p).__name__,
+                    slot=block.slot,
+                    block_hash=block.block_hash,
+                )
+```
+
+- [ ] **Step 5: Re-run the test**
+
+Run: `pytest tests/unit/test_solana_parser_pipeline.py -v`
+Expected: 2 PASS.
+
+- [ ] **Step 6: Lint / typecheck + the older pipeline test (regression)**
+
+Run: `pytest tests/unit/test_pipeline.py tests/unit/test_solana_parser_pipeline.py -v && make lint typecheck`
+Expected: 2 new + N original PASS; lint/typecheck clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core/parser/base.py core/parser/pipeline.py tests/unit/test_solana_parser_pipeline.py
+git commit -m "feat(parser): SolanaParser Protocol + SolanaParserPipeline"
+```
+
+### Task 11.3: `SolNativeTransferParser` (Red → Green)
+
+Parses System Program (`11111111111111111111111111111111`) `Transfer` instructions at the **top level only** (`stack_depth == 1`). Skips failed transactions (`tx.success is False`). Emits one `Event` per matching instruction.
+
+**System Program Transfer instruction encoding** (per Solana program docs):
+- Program ID: `11111111111111111111111111111111` (32 zero bytes, base58-encoded — the "all 1s" string is the canonical form).
+- Data: 12 bytes — `[u32 LE discriminator = 2] + [u64 LE lamports]`.
+- Accounts: `[funding_account (signer, writable), recipient (writable)]`.
+
+`SolanaInstruction.data_b58` is the base58 encoding of those 12 bytes. The parser:
+1. Base58-decodes `data_b58`.
+2. Confirms length == 12 and the first 4 bytes are `b"\x02\x00\x00\x00"`.
+3. Reads the u64 LE lamport amount from bytes 4..12.
+4. Looks up `ix.accounts[0]` and `ix.accounts[1]` (the `SolanaInstruction.accounts` field is already resolved to base58 pubkeys by `SolanaAdapter._decode_instruction`).
+5. Emits `Event(kind="native_transfer", args={"from": ..., "to": ..., "value": str(lamports)})`.
+
+Other System Program instructions (CreateAccount discriminator 0, Assign discriminator 1, etc.) are ignored.
+
+**Files:**
+- Modify: `pyproject.toml` — add `base58` to `[project].dependencies`.
+- Create: `core/parser/sol_native.py`.
+- Create: `tests/unit/test_sol_native_parser.py`.
+
+**Dependency note:** `solders` is a PyO3 binding that bundles its base58 logic in Rust — it does **not** install the PyPI `base58` package transitively. We need it explicitly for the parser to decode `SolanaInstruction.data_b58` payloads.
+
+- [ ] **Step 1: Add `base58` to `pyproject.toml`**
+
+Edit `pyproject.toml`'s `[project].dependencies` list:
+
+```toml
+# pyproject.toml — under [project].dependencies
+"base58>=2.1,<3",
+```
+
+Then refresh the venv:
+
+```bash
+uv sync   # or `pip install -e .` depending on your toolchain
+python -c "import base58; print(base58.__version__)"
+```
+
+Expected: prints `2.x.y` without ImportError. Commit this on its own so the green dep change isn't tangled with the red parser commit:
+
+```bash
+git add pyproject.toml uv.lock  # uv.lock if present
+git commit -m "build(deps): add base58 (Solana System Program Transfer decoding)"
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+```python
+# tests/unit/test_sol_native_parser.py
+"""SolNativeTransferParser:
+- decodes System Program Transfer (discriminator 2, u64 LE lamports)
+- ignores other System Program ops (CreateAccount disc 0, Assign disc 1)
+- ignores instructions at stack_depth > 1 (inner CPI)
+- skips transactions with success == False
+- emits Event with chain_id, from/to/value, kind=native_transfer
+"""
+from __future__ import annotations
+
+import base58
+
+from core.chains.types import (
+    SolanaBlock,
+    SolanaInstruction,
+    SolanaTransaction,
+)
+from core.parser.sol_native import (
+    SOLANA_SYSTEM_PROGRAM_ID,
+    SolNativeTransferParser,
+)
+
+
+def _transfer_data(lamports: int) -> str:
+    """Encode the 12-byte System Program Transfer payload as base58."""
+    import struct
+    payload = b"\x02\x00\x00\x00" + struct.pack("<Q", lamports)
+    return base58.b58encode(payload).decode()
+
+
+def _ix(
+    program_id: str = SOLANA_SYSTEM_PROGRAM_ID,
+    accounts: list[str] | None = None,
+    data_b58: str = "",
+    stack_depth: int = 1,
+) -> SolanaInstruction:
+    return SolanaInstruction(
+        program_id=program_id,
+        accounts=accounts or ["FROM", "TO"],
+        data_b58=data_b58,
+        stack_depth=stack_depth,
+    )
+
+
+def _tx(
+    signature: str = "SIG",
+    success: bool = True,
+    instructions: list[SolanaInstruction] | None = None,
+) -> SolanaTransaction:
+    return SolanaTransaction(
+        signature=signature,
+        slot=100,
+        success=success,
+        fee=5000,
+        account_keys=["FROM", "TO"],
+        pre_balances=[10**9, 0],
+        post_balances=[10**9 - 5000 - 1_000, 1_000],
+        pre_token_balances=[],
+        post_token_balances=[],
+        log_messages=[],
+        instructions=instructions or [],
+    )
+
+
+def _block(txs: list[SolanaTransaction]) -> SolanaBlock:
+    return SolanaBlock(
+        slot=100, block_hash="H100", parent_slot=99,
+        block_time=1_700_000_000, transactions=txs,
+    )
+
+
+def test_emits_native_transfer_for_system_program_transfer() -> None:
+    ix = _ix(data_b58=_transfer_data(1_000))
+    block = _block([_tx(instructions=[ix])])
+    p = SolNativeTransferParser(chain_id="sol-mainnet")
+    [event] = list(p.parse(block))
+    assert event.chain_id == "sol-mainnet"
+    assert event.kind == "native_transfer"
+    assert event.contract is None
+    assert event.args == {"from": "FROM", "to": "TO", "value": "1000"}
+    assert event.block_number == 100
+    assert event.block_hash == "H100"
+    assert event.block_timestamp == 1_700_000_000
+    assert event.tx_hash == "SIG"
+
+
+def test_ignores_non_transfer_system_ops() -> None:
+    # CreateAccount has discriminator 0 (4 bytes of zeros) — must be ignored.
+    create_acct_data = base58.b58encode(b"\x00\x00\x00\x00" + b"\x00" * 8).decode()
+    ix = _ix(data_b58=create_acct_data)
+    block = _block([_tx(instructions=[ix])])
+    p = SolNativeTransferParser(chain_id="sol")
+    assert list(p.parse(block)) == []
+
+
+def test_ignores_non_system_programs() -> None:
+    ix = _ix(program_id="SomeOtherProgramId11111111111111111111111", data_b58=_transfer_data(500))
+    block = _block([_tx(instructions=[ix])])
+    p = SolNativeTransferParser(chain_id="sol")
+    assert list(p.parse(block)) == []
+
+
+def test_ignores_inner_cpi_transfers() -> None:
+    # Top-level transfers from a user wallet are stack_depth=1.
+    # Transfers inside a CPI (e.g., a vault program forwarding lamports) are
+    # stack_depth >= 2 — out of scope for "user-issued transfer" semantics.
+    ix = _ix(data_b58=_transfer_data(1_000), stack_depth=2)
+    block = _block([_tx(instructions=[ix])])
+    p = SolNativeTransferParser(chain_id="sol")
+    assert list(p.parse(block)) == []
+
+
+def test_skips_failed_transactions() -> None:
+    ix = _ix(data_b58=_transfer_data(1_000))
+    block = _block([_tx(success=False, instructions=[ix])])
+    p = SolNativeTransferParser(chain_id="sol")
+    assert list(p.parse(block)) == []
+
+
+def test_emits_multiple_when_one_tx_has_multiple_transfers() -> None:
+    ix1 = _ix(data_b58=_transfer_data(100))
+    ix2 = _ix(data_b58=_transfer_data(200))
+    block = _block([_tx(instructions=[ix1, ix2])])
+    p = SolNativeTransferParser(chain_id="sol")
+    events = list(p.parse(block))
+    assert [e.args["value"] for e in events] == ["100", "200"]
+
+
+def test_ignores_malformed_transfer_payload() -> None:
+    # Length != 12 -> ignore silently rather than crash the pipeline.
+    short = base58.b58encode(b"\x02\x00\x00\x00").decode()
+    block = _block([_tx(instructions=[_ix(data_b58=short)])])
+    p = SolNativeTransferParser(chain_id="sol")
+    assert list(p.parse(block)) == []
+```
+
+- [ ] **Step 3: Run the tests, expect FAIL on import**
+
+Run: `pytest tests/unit/test_sol_native_parser.py -v`
+Expected: `ImportError: cannot import name 'SolNativeTransferParser' from 'core.parser.sol_native'`.
+
+(If the failure is instead `ModuleNotFoundError: No module named 'base58'`, Step 1 was skipped — go back and add the dep before continuing.)
+
+- [ ] **Step 4: Implement `SolNativeTransferParser`**
+
+```python
+# core/parser/sol_native.py
+"""SolNativeTransferParser: parses Solana System Program Transfer instructions.
+
+Per spec §4.6, this is the Solana counterpart to ``EvmNativeTransferParser``.
+The emitted Event shape is identical so the matcher's ``arg_filters`` pattern
+(``{"to": "<addr>"}``) is chain-agnostic.
+
+Scope:
+- Top-level instructions only (stack_depth == 1). Inner CPI transfers are
+  not "user-issued" and are out of scope here — chunk 13's AnchorIdlEventParser
+  is the right tool when a program wraps lamport movement in custom events.
+- Successful transactions only.
+- Malformed payloads are silently ignored (length != 12 or discriminator != 2).
+  The pipeline's per-parser exception isolation would catch a raise, but we
+  prefer not to spam logs on every non-Transfer System op the validator emits.
+"""
+from __future__ import annotations
+
+import struct
+from collections.abc import Iterable
+
+import base58
+import structlog
+
+from core.chains.types import SolanaBlock
+from core.parser.event import Event
+
+log = structlog.get_logger(__name__)
+
+
+SOLANA_SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
+_TRANSFER_DISCRIMINATOR = b"\x02\x00\x00\x00"  # u32 LE = 2
+
+
+class SolNativeTransferParser:
+    def __init__(self, chain_id: str) -> None:
+        self._chain_id = chain_id
+
+    def parse(self, block: SolanaBlock) -> Iterable[Event]:
+        for tx in block.transactions:
+            if not tx.success:
+                continue
+            for ix in tx.instructions:
+                if ix.program_id != SOLANA_SYSTEM_PROGRAM_ID:
+                    continue
+                if ix.stack_depth != 1:
+                    continue
+                lamports = _maybe_decode_transfer(ix.data_b58)
+                if lamports is None:
+                    continue
+                if len(ix.accounts) < 2:
+                    continue
+                yield Event(
+                    chain_id=self._chain_id,
+                    block_number=block.slot,
+                    block_hash=block.block_hash,
+                    block_timestamp=block.block_time or 0,
+                    tx_hash=tx.signature,
+                    tx_index=None,  # Solana txs aren't ordered by an index in the same way as EVM
+                    log_index=None,
+                    kind="native_transfer",
+                    contract=None,
+                    name=None,
+                    args={
+                        "from": ix.accounts[0],
+                        "to": ix.accounts[1],
+                        "value": str(lamports),
+                    },
+                    raw={"signature": tx.signature, "slot": block.slot},
+                )
+
+
+def _maybe_decode_transfer(data_b58: str) -> int | None:
+    """Return lamports if `data_b58` decodes to a System Program Transfer
+    payload, else None. Catches the malformed-base58 case too — base58
+    errors are not exceptional inside a busy block."""
+    try:
+        raw = base58.b58decode(data_b58)
+    except ValueError:
+        return None
+    if len(raw) != 12 or raw[:4] != _TRANSFER_DISCRIMINATOR:
+        return None
+    (lamports,) = struct.unpack("<Q", raw[4:12])
+    return int(lamports)
+```
+
+- [ ] **Step 5: Re-run the tests**
+
+Run: `pytest tests/unit/test_sol_native_parser.py -v`
+Expected: 7 PASS.
+
+- [ ] **Step 6: Lint / typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core/parser/sol_native.py tests/unit/test_sol_native_parser.py
+git commit -m "feat(parser): SolNativeTransferParser for System Program transfers"
+```
+
+### Task 11.4: `ChainRunner` branches on `chain.kind`
+
+The bulk of the chunk. The runner now drives two physically distinct chain protocols:
+- **EVM** — `ChainAdapter` (block-numbered), `ConfirmationBuffer`, `EvmParserPipeline`, ancestor pre-fetch, reorg replay.
+- **Solana** — `SolanaChainAdapter` (slot-numbered), NO buffer, `SolanaParserPipeline`, no ancestor pre-fetch, no reorg replay, missed-slot returns `None` from `fetch_block`.
+
+The split lives entirely inside `ChainRunner`. Callers (`apps/worker/main.py`'s `run_worker`) don't see the difference — they still construct one `ChainRunner` per chain regardless of kind.
+
+**Files:**
+- Modify: `apps/worker/chain_runner.py` — branch in `start`, `_handle_head`, and split `_process_confirmed_block` into EVM + Solana variants. Widen `_adapter` type.
+- Modify: `tests/unit/test_chain_runner.py` — add `test_chain_runner_solana_branch` (fake Solana adapter + fake Solana parser; assert the buffer is not consulted and events surface).
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/unit/test_chain_runner.py`:
+
+```python
+# tests/unit/test_chain_runner.py  --  APPEND
+
+import pytest
+
+from core.chains.types import (
+    SolanaBlock,
+    SolanaTransaction,
+)
+
+
+class _FakeSolanaAdapter:
+    """Yields one BlockHeader for slot 100 then stops."""
+
+    chain_id = "sol"
+    commitment = "confirmed"
+
+    def __init__(self) -> None:
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+        self._slot_pulled = False
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    async def get_latest_slot(self) -> int:
+        return 100
+
+    async def fetch_block(self, slot: int) -> SolanaBlock | None:
+        if slot != 100:
+            return None
+        return SolanaBlock(
+            slot=100, block_hash="H100", parent_slot=99,
+            block_time=1_700_000_000,
+            transactions=[
+                SolanaTransaction(
+                    signature="SIG", slot=100, success=True, fee=5000,
+                    account_keys=["A", "B"],
+                    pre_balances=[10**9, 0], post_balances=[10**9 - 5000, 0],
+                    pre_token_balances=[], post_token_balances=[],
+                    log_messages=[], instructions=[],  # parser is mocked, no real ix
+                ),
+            ],
+        )
+
+    def subscribe_heads(self):
+        from core.chains.types import BlockHeader
+
+        async def _gen():
+            if not self._slot_pulled:
+                self._slot_pulled = True
+                yield BlockHeader(number=100, hash="100", parent_hash="99", timestamp=0)
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_solana_branch_bypasses_buffer() -> None:
+    """Construct a ChainRunner for a Solana chain and confirm:
+    - it uses SolanaParserPipeline (not EvmParserPipeline)
+    - no ConfirmationBuffer is instantiated
+    - a fake Solana parser's emitted event reaches the (mocked) notifier
+    """
+    from collections.abc import Iterable
+
+    from apps.worker.chain_runner import ChainRunner
+    from core.config.snapshot import (
+        ConfigSnapshot,
+        SnapshotChain,
+        SnapshotChannel,
+    )
+    from core.parser.event import Event
+    from core.parser.pipeline import SolanaParserPipeline
+
+    chain = SnapshotChain(
+        id="sol", kind="solana", rpc_http="http://x", rpc_ws=None,
+        confirmations=0, commitment="confirmed", poll_interval_ms=400,
+    )
+
+    class _FakeSolParser:
+        def parse(self, block: SolanaBlock) -> Iterable[Event]:
+            yield Event(
+                chain_id="sol", block_number=block.slot, block_hash=block.block_hash,
+                block_timestamp=block.block_time or 0,
+                tx_hash="SIG", tx_index=None, log_index=None,
+                kind="native_transfer", contract=None, name=None,
+                args={"from": "A", "to": "B", "value": "1000"}, raw={},
+            )
+
+    dispatched: list[Event] = []
+
+    class _FakeCheckpointRepo:
+        def __init__(self) -> None:
+            self.saved: list[tuple[str, int, str]] = []
+
+        async def get(self, chain_id: str):
+            return None
+
+        async def save(self, chain_id: str, last_block: int, last_block_hash: str) -> None:
+            self.saved.append((chain_id, last_block, last_block_hash))
+
+    cp = _FakeCheckpointRepo()
+    fake_adapter = _FakeSolanaAdapter()
+
+    snap = ConfigSnapshot(version=1, chains=[chain], subscriptions=[], channels=[])
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: fake_adapter,
+        channel_factory=lambda _cfg: None,  # type: ignore[arg-type, return-value]
+        checkpoint_repo=cp,
+    )
+    # Inject the Solana parser before start() so the runner's auto-built
+    # pipeline picks it up (start() consults `chain.kind`).
+    runner._solana_parsers_override = [_FakeSolParser()]  # type: ignore[attr-defined]
+
+    # Mock the notifier so we don't actually open channels.
+    class _MockNotifier:
+        async def start(self, _channels): pass
+        async def stop(self): pass
+        async def dispatch(self, event: Event, _hits): dispatched.append(event)
+
+    await runner.start(snap)
+    runner._notifier = _MockNotifier()  # type: ignore[assignment]
+
+    # Run one iteration of the head loop manually.
+    headers = runner._adapter.subscribe_heads()  # type: ignore[union-attr]
+    async for h in headers:
+        await runner._handle_head(h)
+
+    assert fake_adapter.connect_calls == 1
+    assert isinstance(runner._pipeline, SolanaParserPipeline), (
+        "Solana chains must use SolanaParserPipeline, not EvmParserPipeline"
+    )
+    assert runner._buffer is None, "Solana runner must skip ConfirmationBuffer"
+    assert len(dispatched) == 0, (
+        "no subscriptions in the snapshot, so notifier.dispatch should not fire"
+    )
+    assert cp.saved == [("sol", 100, "H100")], (
+        "checkpoint must persist after processing the confirmed slot"
+    )
+
+    await runner.stop()
+    assert fake_adapter.disconnect_calls == 1
+```
+
+- [ ] **Step 2: Run, expect FAIL**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer -v`
+Expected: FAIL — current `ChainRunner.__init__` hard-builds `EvmParserPipeline([EvmNativeTransferParser(...)])` and instantiates `ConfirmationBuffer` in `start()` unconditionally. Either the `isinstance` check fails or `start()` errors because `cfg.confirmations=0` is fine but the buffer instantiation runs anyway.
+
+- [ ] **Step 3: Branch `ChainRunner.__init__` / `start` / `_handle_head` on `chain.kind`**
+
+Replace `apps/worker/chain_runner.py` body (changes are surgical; full diff below):
+
+```python
+# apps/worker/chain_runner.py  --  REPLACE the import block at the top:
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Iterable
+from typing import Protocol
+
+import structlog
+
+from core.chains.adapter import ChainAdapter, SolanaChainAdapter
+from core.chains.confirmation_buffer import ConfirmationBuffer, ReorgEvent
+from core.chains.types import BlockHeader, SolanaBlock
+from core.config.snapshot import (
+    ConfigSnapshot,
+    SnapshotChain,
+    SnapshotChannel,
+)
+from core.matcher.matcher import Matcher
+from core.notifier.channel import Channel
+from core.notifier.notifier import Notifier
+from core.parser.event import Event
+from core.parser.native import EvmNativeTransferParser
+from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
+from core.parser.sol_native import SolNativeTransferParser
+```
+
+Then replace `__init__`:
+
+```python
+AdapterFactory = Callable[[SnapshotChain], ChainAdapter | SolanaChainAdapter]
+
+
+class ChainRunner:
+    """Owns one chain's pipeline.
+
+    Two physical paths share this class:
+
+    - **EVM** — confirmation buffer + reorg replay (M1 path; unchanged).
+    - **Solana** — no buffer; commitment level (`confirmed`/`finalized`)
+      handles finality per spec §4.6. The adapter's polling loop already
+      filters duplicate slots, and missed-slot `fetch_block(slot)` returning
+      `None` is treated as "skip and advance".
+
+    The kind branch is on ``self._chain.kind``; callers (apps.worker.main)
+    don't see it.
+
+    Lifecycle is otherwise identical to M1:
+      1. ``start(snap)`` — construct adapter (and ``await adapter.connect()``),
+         optional confirmation buffer, parser pipeline, matcher, notifier;
+         seed ``resume_from`` from the persisted checkpoint.
+      2. ``run()`` — drive ``subscribe_heads()`` through the kind-appropriate
+         head handler.
+      3. ``apply_snapshot(snap)`` — rebuild matcher + notifier in place.
+      4. ``stop()`` — cancel listener, drain in-flight notifications (<=30s),
+         disconnect adapter.
+    """
+
+    DRAIN_TIMEOUT_S = 30.0
+
+    def __init__(
+        self,
+        *,
+        chain: SnapshotChain,
+        adapter_factory: AdapterFactory,
+        channel_factory: ChannelFactory,
+        checkpoint_repo: _CheckpointRepo,
+        notifier_max_concurrency: int = 50,
+    ) -> None:
+        self._chain = chain
+        self._adapter_factory = adapter_factory
+        self._channel_factory = channel_factory
+        self._cp = checkpoint_repo
+        self._notifier_max_concurrency = notifier_max_concurrency
+
+        self._adapter: ChainAdapter | SolanaChainAdapter | None = None
+        self._buffer: ConfirmationBuffer | None = None  # EVM only
+        # Pipeline is built in ``start()`` so it can read ``chain.kind``.
+        # ``_evm_parsers_override`` / ``_solana_parsers_override`` exist for
+        # unit tests; production code does NOT set them.
+        self._pipeline: EvmParserPipeline | SolanaParserPipeline | None = None
+        self._evm_parsers_override: list | None = None
+        self._solana_parsers_override: list | None = None
+        self._matcher: Matcher | None = None
+        self._notifier: Notifier | None = None
+        self._current_snap: ConfigSnapshot | None = None
+        self._buffer_tip_hash: str | None = None
+        self._stop = asyncio.Event()
+        self._snap_lock = asyncio.Lock()
+        self.resume_from: tuple[int, str] | None = None
+
+    async def start(self, snap: ConfigSnapshot) -> None:
+        self._adapter = self._adapter_factory(self._chain)
+        connect = getattr(self._adapter, "connect", None)
+        if callable(connect):
+            await connect()
+
+        if self._chain.kind == "evm":
+            self._buffer = ConfirmationBuffer(confirmations=self._chain.confirmations)
+            self._pipeline = EvmParserPipeline(
+                self._evm_parsers_override
+                or [EvmNativeTransferParser(chain_id=self._chain.id)]
+            )
+        elif self._chain.kind == "solana":
+            # No buffer for Solana — commitment handles finality (spec §4.6).
+            self._buffer = None
+            self._pipeline = SolanaParserPipeline(
+                self._solana_parsers_override
+                or [SolNativeTransferParser(chain_id=self._chain.id)]
+            )
+        else:
+            raise NotImplementedError(f"chain kind {self._chain.kind!r} not supported")
+
+        self.resume_from = await self._cp.get(self._chain.id)
+        if self.resume_from is not None:
+            log.info(
+                "chain_runner.resuming_from_checkpoint",
+                chain_id=self._chain.id,
+                last_block=self.resume_from[0],
+                last_block_hash=self.resume_from[1],
+            )
+        self._matcher = Matcher(snap)
+        self._notifier = Notifier(
+            channel_factory=self._channel_factory,
+            max_concurrency=self._notifier_max_concurrency,
+        )
+        await self._notifier.start(snap.channels)
+        self._current_snap = snap
+```
+
+`apply_snapshot` / `run` / `stop` stay byte-for-byte the same.
+
+Now `_handle_head` becomes a dispatcher; split off the EVM body and add a Solana body:
+
+```python
+    async def _handle_head(self, header: BlockHeader) -> None:
+        assert self._adapter is not None and self._pipeline is not None
+        assert self._matcher is not None and self._notifier is not None
+        matcher = self._matcher
+        notifier = self._notifier
+
+        if self._chain.kind == "evm":
+            await self._handle_head_evm(header, matcher=matcher, notifier=notifier)
+        elif self._chain.kind == "solana":
+            await self._handle_head_solana(header, matcher=matcher, notifier=notifier)
+        else:  # pragma: no cover -- start() already rejects
+            raise NotImplementedError(self._chain.kind)
+
+    async def _handle_head_evm(
+        self,
+        header: BlockHeader,
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        # Body identical to the previous _handle_head except for the rename of
+        # `_process_confirmed_block` → `_process_confirmed_evm_block`.
+        assert self._buffer is not None and self._adapter is not None
+
+        cache: dict[str, BlockHeader] = {}
+        if self._buffer_tip_hash is not None and self._buffer_tip_hash != header.parent_hash:
+            cache = await self._prefetch_ancestors_for(header)
+
+        def resolve_parent(n: int, h: str) -> BlockHeader:
+            try:
+                return cache[h]
+            except KeyError as e:
+                raise KeyError(f"ancestor {h} at height {n} not in prefetch cache") from e
+
+        result = self._buffer.handle_new_head(header, resolve_parent=resolve_parent)
+        self._buffer_tip_hash = header.hash
+
+        confirmed: list[BlockHeader]
+        if isinstance(result, ReorgEvent):
+            if result.deep:
+                log.error(
+                    "chain_runner.deep_reorg",
+                    chain_id=self._chain.id,
+                    divergent_oldest=result.divergent_oldest,
+                    new_head=result.new_head.number if result.new_head else None,
+                )
+            confirmed = result.confirmed
+        else:
+            confirmed = result
+
+        for h in confirmed:
+            await self._process_confirmed_evm_block(
+                h.number, matcher=matcher, notifier=notifier
+            )
+
+    async def _handle_head_solana(
+        self,
+        header: BlockHeader,
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        # No buffer. Each polled head is treated as one confirmed slot at the
+        # configured commitment. `header.number` is the slot integer (see
+        # SolanaAdapter._poll_heads).
+        await self._process_confirmed_solana_slot(
+            header.number, matcher=matcher, notifier=notifier
+        )
+
+    async def _process_confirmed_evm_block(
+        self,
+        number: int,
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        # Renamed from `_process_confirmed_block`. Body unchanged.
+        assert self._adapter is not None and self._pipeline is not None
+        block = await self._adapter.fetch_block(number)  # type: ignore[union-attr]
+        events = list(self._pipeline.run(block))  # type: ignore[arg-type]
+        for event in events:
+            hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
+            if not hits:
+                continue
+            await notifier.dispatch(event, hits)
+        await self._cp.save(self._chain.id, block.header.number, block.header.hash)
+
+    async def _process_confirmed_solana_slot(
+        self,
+        slot: int,
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        assert self._adapter is not None and self._pipeline is not None
+        block: SolanaBlock | None = await self._adapter.fetch_block(slot)  # type: ignore[union-attr, assignment]
+        if block is None:
+            # Missed slot — advance checkpoint to the slot anyway so we don't
+            # re-poll the same gap on restart. The empty string is fine for
+            # `last_block_hash` because the DDL is `Mapped[str]` with
+            # `nullable=False` (see `core/config/models.py:132`); NOT NULL
+            # rejects only `None`, not `""`.
+            log.info("chain_runner.solana_missed_slot", chain_id=self._chain.id, slot=slot)
+            await self._cp.save(self._chain.id, slot, "")
+            return
+        events: Iterable[Event] = self._pipeline.run(block)  # type: ignore[arg-type]
+        for event in events:
+            hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
+            if not hits:
+                continue
+            await notifier.dispatch(event, hits)
+        await self._cp.save(self._chain.id, block.slot, block.block_hash)
+```
+
+`_prefetch_ancestors_for` stays unchanged (it's EVM-only and is called only from `_handle_head_evm`).
+
+- [ ] **Step 4: Re-run the new test**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer -v`
+Expected: PASS.
+
+- [ ] **Step 5: Grep for pre-`start()` `_pipeline` access (regression guard)**
+
+The pipeline moved from `__init__` to `start()`, so any test that touches `runner._pipeline` before awaiting `runner.start(snap)` will now see `None` instead of an `EvmParserPipeline`. Confirm none exist:
+
+```bash
+rg -n "runner\._pipeline|self\._pipeline" tests/
+```
+
+Expected: every match is either inside `_handle_head_*` / `_process_confirmed_*` (where `start()` has already run) OR an assertion that *follows* a `runner.start(...)` call. If you find a pre-start access, fix that test before continuing — the M1 unit suite must stay green.
+
+- [ ] **Step 6: Re-run the full chain_runner unit suite for regression**
+
+Run: `pytest tests/unit/test_chain_runner.py -v`
+Expected: every previous EVM test still passes (the `_handle_head` / `_process_confirmed_block` rename is internal; the EVM path's behavior is byte-for-byte identical).
+
+- [ ] **Step 7: Re-run worker IT for regression**
+
+Run: `pytest tests/integration/test_worker_*.py -v`
+Expected: still green.
+
+- [ ] **Step 8: Lint / typecheck**
+
+Run: `make lint typecheck`
+Expected: clean. The `# type: ignore[union-attr]` annotations on `fetch_block` call sites are intentional — `ChainAdapter.fetch_block(int) -> Block` and `SolanaChainAdapter.fetch_block(int) -> SolanaBlock | None` have incompatible return types, and we've already narrowed by `chain.kind` at the call site.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add apps/worker/chain_runner.py tests/unit/test_chain_runner.py
+git commit -m "feat(runner): ChainRunner branches on chain.kind (EVM buffer / Solana direct)"
+```
+
+### Task 11.5: Integration test — ChainRunner + SolanaAdapter end-to-end
+
+Wires the runner to a real `solana-test-validator`, submits a known lamport transfer with `solders`, and asserts the resulting `Event` reaches a fake `Notifier`.
+
+The validator pre-funds the default identity (`~/.config/solana/id.json` if present; otherwise the validator auto-generates one and exposes it via the faucet at startup). For determinism, this test generates its own keypair, airdrops it via the faucet, then submits a transfer to a second keypair.
+
+**Files:**
+- Create: `tests/integration/test_chain_runner_solana.py`.
+
+- [ ] **Step 1: Write the IT**
+
+```python
+# tests/integration/test_chain_runner_solana.py
+"""End-to-end IT: ChainRunner + SolanaAdapter against solana-test-validator.
+
+Submits a 1_000_000 lamport (0.001 SOL) transfer from a freshly funded
+keypair to a second keypair, runs the chain runner for a few seconds,
+and asserts a `native_transfer` Event reaches the fake notifier.
+
+Reuses the session-scoped `solana_validator` fixture from
+tests/integration/conftest.py (chunk 10).
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+
+import httpx
+import pytest
+from solders.hash import Hash
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer
+from solders.transaction import Transaction
+from solders.message import Message
+
+from apps.worker.chain_runner import ChainRunner
+from core.chains.solana import SolanaAdapter
+from core.config.snapshot import (
+    ConfigSnapshot,
+    SnapshotChain,
+    SnapshotChannel,
+    SnapshotSubscription,
+)
+from core.parser.event import Event
+
+pytestmark = [pytest.mark.asyncio]
+
+
+async def _airdrop(rpc_url: str, recipient: Pubkey, lamports: int) -> None:
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "requestAirdrop",
+        "params": [str(recipient), lamports],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(rpc_url, json=body)
+    r.raise_for_status()
+    assert "result" in r.json(), r.text
+
+
+async def _latest_blockhash(rpc_url: str) -> str:
+    body = {"jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(rpc_url, json=body)
+    r.raise_for_status()
+    return r.json()["result"]["value"]["blockhash"]
+
+
+async def _send_raw_tx(rpc_url: str, signed_tx_b64: str) -> str:
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+        "params": [signed_tx_b64, {"encoding": "base64"}],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(rpc_url, json=body)
+    r.raise_for_status()
+    return r.json()["result"]
+
+
+async def _wait_for_signature(rpc_url: str, sig: str, *, timeout_s: float = 25.0) -> None:
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+        "params": [[sig], {"searchTransactionHistory": True}],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while asyncio.get_event_loop().time() < deadline:
+            r = await client.post(rpc_url, json=body)
+            statuses = r.json().get("result", {}).get("value", [None])[0]
+            if statuses and statuses.get("confirmationStatus") in ("confirmed", "finalized"):
+                return
+            await asyncio.sleep(0.5)
+    raise TimeoutError(f"signature {sig} did not confirm within {timeout_s}s")
+
+
+class _FakeNotifier:
+    def __init__(self) -> None:
+        self.dispatched: list[Event] = []
+
+    async def start(self, _channels): pass
+    async def stop(self): pass
+    async def dispatch(self, event: Event, _hits) -> None:
+        self.dispatched.append(event)
+
+
+class _FakeCheckpointRepo:
+    def __init__(self) -> None:
+        self.last: tuple[str, int, str] | None = None
+
+    async def get(self, chain_id: str): return None
+    async def save(self, chain_id: str, last_block: int, last_block_hash: str):
+        self.last = (chain_id, last_block, last_block_hash)
+
+
+async def test_chain_runner_solana_end_to_end(solana_validator) -> None:
+    sender = Keypair()
+    recipient = Keypair()
+
+    # Airdrop 0.5 SOL to the sender, wait for confirmation.
+    await _airdrop(solana_validator.rpc_url, sender.pubkey(), 500_000_000)
+    # Airdrops are usually fast on the local validator but not instant.
+    await asyncio.sleep(2.0)
+
+    # Build, sign, and send a 1_000_000 lamport transfer.
+    transfer_ix = transfer(
+        TransferParams(
+            from_pubkey=sender.pubkey(),
+            to_pubkey=recipient.pubkey(),
+            lamports=1_000_000,
+        ),
+    )
+    blockhash_str = await _latest_blockhash(solana_validator.rpc_url)
+    # solders' Message/Transaction require a typed Hash, not the raw base58 str.
+    recent_blockhash = Hash.from_string(blockhash_str)
+    msg = Message.new_with_blockhash([transfer_ix], sender.pubkey(), recent_blockhash)
+    tx = Transaction([sender], msg, recent_blockhash)
+    import base64
+    raw = base64.b64encode(bytes(tx)).decode()
+    sig = await _send_raw_tx(solana_validator.rpc_url, raw)
+    await _wait_for_signature(solana_validator.rpc_url, sig)
+
+    # Construct the ChainRunner aimed at the local validator.
+    chain = SnapshotChain(
+        id="sol-local",
+        kind="solana",
+        rpc_http=solana_validator.rpc_url,
+        rpc_ws=None,
+        confirmations=0,
+        commitment="confirmed",
+        poll_interval_ms=400,
+    )
+    sub = SnapshotSubscription(
+        id="sub1", name="watch-recipient", chain_id="sol-local",
+        address=None, abi_id=None,
+        match_kind="native_transfer", match_name=None,
+        arg_filters={"to": str(recipient.pubkey())},
+        enabled=True, channel_ids=["c1"],
+    )
+    channel = SnapshotChannel(id="c1", name="fake", type="http", config={"url": "http://x"})
+    snap = ConfigSnapshot(version=1, chains=[chain], subscriptions=[sub], channels=[channel])
+
+    adapter = SolanaAdapter(
+        chain_id="sol-local", rpc_url=solana_validator.rpc_url,
+        commitment="confirmed", poll_interval_ms=400,
+    )
+
+    notifier = _FakeNotifier()
+    cp = _FakeCheckpointRepo()
+
+    # The Notifier created inside `runner.start()` iterates `snap.channels` and
+    # calls `channel_factory(cfg)` for each — returning `None` would crash inside
+    # `Notifier.start()` when it tries to `await channel.connect()`. Provide a
+    # no-op Channel stub so `start()` succeeds; we then swap in `_FakeNotifier`
+    # before driving `run()` so dispatch goes to the test's list instead.
+    class _StubChannel:
+        async def connect(self) -> None: pass
+        async def disconnect(self) -> None: pass
+        async def send(self, _event: Event) -> None: pass
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: _StubChannel(),  # type: ignore[arg-type, return-value]
+        checkpoint_repo=cp,
+    )
+    await runner.start(snap)
+    # Stop the real Notifier started by `start()` so we don't leak its worker
+    # pool, then swap in the fake. Safe to do here: no head has been polled yet
+    # (run() hasn't been awaited).
+    await runner._notifier.stop()  # type: ignore[union-attr]
+    runner._notifier = notifier  # type: ignore[assignment]
+
+    # Drive the runner for up to 20 s, polling for at least one matching event.
+    async def _drive():
+        try:
+            await runner.run()
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(_drive())
+    deadline = asyncio.get_event_loop().time() + 20.0
+    while asyncio.get_event_loop().time() < deadline:
+        matches = [
+            e for e in notifier.dispatched
+            if e.args.get("to") == str(recipient.pubkey())
+        ]
+        if matches:
+            break
+        await asyncio.sleep(0.5)
+
+    await runner.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    matches = [
+        e for e in notifier.dispatched
+        if e.args.get("to") == str(recipient.pubkey())
+    ]
+    assert matches, (
+        f"no native_transfer event matched recipient={recipient.pubkey()!s} "
+        f"after airdrop+transfer; got {len(notifier.dispatched)} total events"
+    )
+    e = matches[0]
+    assert e.kind == "native_transfer"
+    assert e.args["from"] == str(sender.pubkey())
+    assert e.args["value"] == "1000000"
+    assert cp.last is not None  # checkpoint persisted
+```
+
+- [ ] **Step 2: Run the IT**
+
+```bash
+pytest tests/integration/test_chain_runner_solana.py -v
+```
+
+Expected on a host with `solana-test-validator` installed: 1 PASS in ~30 s (5–10 s validator boot + 2 s airdrop confirm + ≤20 s runner poll). On a host without the validator: SKIP (the `solana_validator` fixture skips at fixture-entry).
+
+If the IT fails with `BlockhashNotFound`, the airdrop hasn't confirmed yet — increase the `asyncio.sleep(2.0)` between airdrop and transfer to `4.0`. The validator's "default behaviour" is sub-second confirmation but cold-start hosts (especially CI) may need slack.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/integration/test_chain_runner_solana.py
+git commit -m "test(integration): end-to-end ChainRunner + SolanaAdapter native transfer"
+```
+
+### Task 11.6: Close-out
+
+- [ ] **Step 1: Full suite**
+
+```bash
+make test
+```
+
+Expected: every chunk 1–11 unit + IT test passes (Solana ITs SKIP without the validator installed).
+
+- [ ] **Step 2: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 3: Final commit (only if cleanup landed)**
+
+```bash
+git status
+```
+
+If `git status` is empty, this step is a no-op. No tag for chunk 11 — chunk 14 is the M2 close-out tag.
+
+---

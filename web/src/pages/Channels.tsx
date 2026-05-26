@@ -1,3 +1,66 @@
+import { useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { api } from '@/api/client'
+import { Plus, Trash2 } from 'lucide-react'
+
+interface Channel { id: string; name: string; type: string; config: Record<string, unknown> }
+
 export default function Channels() {
-  return <div><h2 className="text-2xl font-bold">Channels</h2><p className="text-gray-500 mt-2">Coming soon.</p></div>
+  const qc = useQueryClient()
+  const [showForm, setShowForm] = useState(false)
+  const { data: channels = [], isLoading } = useQuery<Channel[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
+  const delMut = useMutation({ mutationFn: (id: string) => api.del(`/channels/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['channels'] }) })
+
+  const typeBadge = (t: string) => ({ http: 'bg-green-100 text-green-700', mq: 'bg-yellow-100 text-yellow-700', ws: 'bg-indigo-100 text-indigo-700' }[t] ?? 'bg-gray-100')
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-2xl font-bold">Channels</h2>
+        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> Add Channel</button>
+      </div>
+      {isLoading ? <p className="text-gray-500">Loading...</p> : (
+        <table className="w-full text-sm border-collapse">
+          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">Name</th><th className="py-2 px-2">Type</th><th className="py-2 px-2">Config</th><th className="py-2 px-2"></th></tr></thead>
+          <tbody>{channels.map(c => (
+            <tr key={c.id} className="border-b hover:bg-gray-50">
+              <td className="py-2 px-2 font-medium">{c.name}</td>
+              <td className="py-2 px-2"><span className={`px-2 py-0.5 rounded text-xs font-medium ${typeBadge(c.type)}`}>{c.type}</span></td>
+              <td className="py-2 px-2 font-mono text-xs truncate max-w-64">{JSON.stringify(c.config)}</td>
+              <td className="py-2 px-2"><button onClick={() => delMut.mutate(c.id)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      )}
+      {showForm && <ChannelForm onClose={() => setShowForm(false)} />}
+    </div>
+  )
+}
+
+function ChannelForm({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient()
+  const [type, setType] = useState<'http'|'mq'|'ws'>('http')
+  const mut = useMutation({ mutationFn: (d: Record<string, unknown>) => api.post('/channels', d), onSuccess: () => { qc.invalidateQueries({ queryKey: ['channels'] }); onClose() } })
+  const submit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); const fd = new FormData(e.currentTarget)
+    let config: Record<string, unknown> = {}
+    if (type === 'http') config = { url: fd.get('url'), method: fd.get('method') || 'POST' }
+    else if (type === 'mq') config = { stream: fd.get('stream'), ...(fd.get('maxlen') ? { maxlen: Number(fd.get('maxlen')) } : {}) }
+    else config = { ws_fanout_channel: fd.get('ws_fanout_channel') }
+    mut.mutate({ name: fd.get('name'), type, config })
+  }
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+      <form onSubmit={submit} className="bg-white rounded-lg p-6 w-96 space-y-3">
+        <h3 className="text-lg font-bold">Add Channel</h3>
+        <input name="name" placeholder="Channel name" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <div className="flex gap-2">{(['http','mq','ws'] as const).map(t => <button key={t} type="button" onClick={() => setType(t)} className={`flex-1 py-1.5 rounded text-sm ${type===t?'bg-black text-white':'border'}`}>{t.toUpperCase()}</button>)}</div>
+        {type === 'http' && <><input name="url" placeholder="Webhook URL" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="method" placeholder="Method (POST)" defaultValue="POST" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
+        {type === 'mq' && <><input name="stream" placeholder="Redis stream name" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="maxlen" type="number" placeholder="Max length (optional)" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
+        {type === 'ws' && <input name="ws_fanout_channel" placeholder="Fanout channel name" required className="w-full border rounded px-3 py-1.5 text-sm" />}
+        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">Cancel</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">Create</button></div>
+        {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
+      </form>
+    </div>
+  )
 }

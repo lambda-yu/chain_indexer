@@ -107,6 +107,13 @@ def create_app(
     app.include_router(channels_router.router)
     app.include_router(subs_router.router)
     app.include_router(ws_router.router)
+
+    import pathlib
+    spa_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+    if spa_dir.is_dir():
+        from fastapi.staticfiles import StaticFiles
+        app.mount("/", StaticFiles(directory=str(spa_dir), html=True), name="spa")
+
     return app
 
 

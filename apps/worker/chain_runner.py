@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
 
 from core.abi.registry import AbiRegistry
-from core.chains.adapter import ChainAdapter
 from core.chains.confirmation_buffer import ConfirmationBuffer, ReorgEvent
 from core.chains.types import BlockHeader
 from core.config.snapshot import (
@@ -22,12 +21,13 @@ from core.parser.abi_call import AbiCallParser
 from core.parser.abi_event import AbiEventParser
 from core.parser.erc20 import Erc20TransferParser
 from core.parser.native import EvmNativeTransferParser
-from core.parser.pipeline import EvmParserPipeline
+from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
+from core.parser.sol_native import SolNativeTransferParser
 
 log = structlog.get_logger(__name__)
 
 
-AdapterFactory = Callable[[SnapshotChain], ChainAdapter]
+AdapterFactory = Callable[[SnapshotChain], Any]
 ChannelFactory = Callable[[SnapshotChannel], Channel]
 
 
@@ -37,24 +37,10 @@ class _CheckpointRepo(Protocol):
 
 
 class ChainRunner:
-    """Owns one chain's pipeline.
+    """Owns one chain's pipeline. Supports both EVM and Solana chains.
 
-    Lifecycle:
-      1. `start(snap)` — construct adapter (and `await adapter.connect()`),
-         confirmation buffer, parser, matcher, notifier; seed `resume_from`
-         from the persisted checkpoint.
-      2. `run()` — drive `subscribe_heads()` through the buffer, parse + match
-         + dispatch each confirmed block, save checkpoint per block.
-      3. `apply_snapshot(snap)` — rebuild matcher index + notifier channel set
-         in place (no listener restart).
-      4. `stop()` — cancel listener, drain in-flight notifications (<=30s),
-         disconnect adapter.
-
-    ConfirmationBuffer note (Chunk 4): `handle_new_head` is SYNC and takes a
-    SYNC `resolve_parent(n, h) -> BlockHeader`. ChainRunner pre-fetches
-    ancestors via async I/O *before* calling the buffer, then passes a cache
-    lookup as the sync resolver. Pre-fetch only runs when the new head's
-    `parent_hash` doesn't match our mirrored buffer tip.
+    EVM path: ConfirmationBuffer → EvmParserPipeline → Matcher → Notifier.
+    Solana path: direct slot processing → SolanaParserPipeline → Matcher → Notifier.
     """
 
     DRAIN_TIMEOUT_S = 30.0
@@ -74,32 +60,51 @@ class ChainRunner:
         self._channel_factory = channel_factory
         self._cp = checkpoint_repo
         self._notifier_max_concurrency = notifier_max_concurrency
+        self._abi_registry = abi_registry
 
-        self._adapter: ChainAdapter | None = None
+        self._adapter: Any = None
         self._buffer: ConfirmationBuffer | None = None
-        parsers: list[EvmNativeTransferParser | Erc20TransferParser | AbiEventParser | AbiCallParser] = [
-            EvmNativeTransferParser(chain_id=self._chain.id),
-            Erc20TransferParser(chain_id=self._chain.id),
-        ]
-        if abi_registry is not None:
-            parsers.append(AbiEventParser(chain_id=self._chain.id, registry=abi_registry))
-            parsers.append(AbiCallParser(chain_id=self._chain.id, registry=abi_registry))
-        self._pipeline = EvmParserPipeline(parsers)
+        self._evm_pipeline: EvmParserPipeline | None = None
+        self._solana_pipeline: SolanaParserPipeline | None = None
         self._matcher: Matcher | None = None
         self._notifier: Notifier | None = None
         self._current_snap: ConfigSnapshot | None = None
-        self._buffer_tip_hash: str | None = None  # mirrors buffer's rightmost header
+        self._buffer_tip_hash: str | None = None
         self._stop = asyncio.Event()
         self._snap_lock = asyncio.Lock()
         self.resume_from: tuple[int, str] | None = None
 
+        self._build_pipeline()
+
+    def _build_pipeline(self) -> None:
+        if self._chain.kind == "solana":
+            self._solana_pipeline = SolanaParserPipeline([
+                SolNativeTransferParser(chain_id=self._chain.id),
+            ])
+        else:
+            evm_parsers: list[Any] = [
+                EvmNativeTransferParser(chain_id=self._chain.id),
+                Erc20TransferParser(chain_id=self._chain.id),
+            ]
+            if self._abi_registry is not None:
+                evm_parsers.append(AbiEventParser(chain_id=self._chain.id, registry=self._abi_registry))
+                evm_parsers.append(AbiCallParser(chain_id=self._chain.id, registry=self._abi_registry))
+            self._evm_pipeline = EvmParserPipeline(evm_parsers)
+
+    @property
+    def _pipeline(self) -> EvmParserPipeline | SolanaParserPipeline:
+        if self._evm_pipeline is not None:
+            return self._evm_pipeline
+        assert self._solana_pipeline is not None
+        return self._solana_pipeline
+
     async def start(self, snap: ConfigSnapshot) -> None:
         self._adapter = self._adapter_factory(self._chain)
-        # EvmAdapter (Chunk 3) requires an explicit connect() before any RPC call.
         connect = getattr(self._adapter, "connect", None)
         if callable(connect):
             await connect()
-        self._buffer = ConfirmationBuffer(confirmations=self._chain.confirmations)
+        if self._chain.kind != "solana":
+            self._buffer = ConfirmationBuffer(confirmations=self._chain.confirmations)
         self.resume_from = await self._cp.get(self._chain.id)
         if self.resume_from is not None:
             log.info(
@@ -120,9 +125,6 @@ class ChainRunner:
         async with self._snap_lock:
             assert self._notifier is not None
             self._matcher = Matcher(snap)
-            # For M1 the cheap path is stop-then-start; HttpChannel instances
-            # are cheap. M4 (MQ) will need a diff to avoid bouncing live AMQP
-            # connections.
             await self._notifier.stop()
             self._notifier = Notifier(
                 channel_factory=self._channel_factory,
@@ -137,30 +139,37 @@ class ChainRunner:
             )
 
     async def run(self) -> None:
-        assert self._adapter is not None and self._buffer is not None
+        assert self._adapter is not None
         try:
-            async for header in self._adapter.subscribe_heads():
-                if self._stop.is_set():
-                    break
-                await self._handle_head(header)
+            if self._chain.kind == "solana":
+                await self._run_solana()
+            else:
+                await self._run_evm()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.exception("chain_runner.run_failed", chain_id=self._chain.id)
             raise
 
-    async def _handle_head(self, header: BlockHeader) -> None:
+    async def _run_evm(self) -> None:
+        assert self._buffer is not None
+        async for header in self._adapter.subscribe_heads():
+            if self._stop.is_set():
+                break
+            await self._handle_evm_head(header)
+
+    async def _run_solana(self) -> None:
+        async for slot in self._adapter.subscribe_heads():
+            if self._stop.is_set():
+                break
+            await self._process_solana_slot(slot)
+
+    async def _handle_evm_head(self, header: BlockHeader) -> None:
         assert self._buffer is not None and self._adapter is not None
-        # Capture matcher/notifier refs once per head so a concurrent
-        # apply_snapshot() swap doesn't drop events on a half-rebuilt notifier.
-        # Matches the documented contract: snapshot swaps don't replay history,
-        # and any block already in flight finishes under the snapshot it started.
         assert self._matcher is not None and self._notifier is not None
         matcher = self._matcher
         notifier = self._notifier
 
-        # Pre-fetch ancestors only when the head doesn't link cleanly. The
-        # buffer's sync resolver then becomes a pure dict lookup.
         cache: dict[str, BlockHeader] = {}
         if self._buffer_tip_hash is not None and self._buffer_tip_hash != header.parent_hash:
             cache = await self._prefetch_ancestors_for(header)
@@ -169,8 +178,6 @@ class ChainRunner:
             try:
                 return cache[h]
             except KeyError as e:
-                # Buffer treats a missing ancestor as a deep reorg (exhausts walk).
-                # We translate to KeyError for clarity in logs.
                 raise KeyError(f"ancestor {h} at height {n} not in prefetch cache") from e
 
         result = self._buffer.handle_new_head(header, resolve_parent=resolve_parent)
@@ -187,16 +194,12 @@ class ChainRunner:
                 )
             confirmed = result.confirmed
         else:
-            confirmed = result  # list[BlockHeader]
+            confirmed = result
 
         for h in confirmed:
             await self._process_confirmed_block(h.number, matcher=matcher, notifier=notifier)
 
     async def _prefetch_ancestors_for(self, header: BlockHeader) -> dict[str, BlockHeader]:
-        """Fetch up to `confirmations + 1` blocks at the heights below `header`
-        and index them by hash. The RPC node has typically already reorged, so
-        `fetch_block(n)` returns the new fork's header at height `n`.
-        """
         assert self._adapter is not None
         depth = max(1, self._chain.confirmations + 1)
         out: dict[str, BlockHeader] = {}
@@ -219,15 +222,32 @@ class ChainRunner:
         matcher: Matcher,
         notifier: Notifier,
     ) -> None:
-        assert self._adapter is not None
+        assert self._adapter is not None and self._evm_pipeline is not None
         block = await self._adapter.fetch_block(number)
-        events = list(self._pipeline.run(block))
+        events = list(self._evm_pipeline.run(block))
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
             if not hits:
                 continue
             await notifier.dispatch(event, hits)
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
+
+    async def _process_solana_slot(self, slot: int) -> None:
+        assert self._adapter is not None and self._solana_pipeline is not None
+        assert self._matcher is not None and self._notifier is not None
+        matcher = self._matcher
+        notifier = self._notifier
+
+        block = await self._adapter.fetch_block(slot)
+        if block is None:
+            return
+        events = list(self._solana_pipeline.run(block))
+        for event in events:
+            hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
+            if not hits:
+                continue
+            await notifier.dispatch(event, hits)
+        await self._cp.save(self._chain.id, block.slot, block.block_hash)
 
     async def stop(self) -> None:
         self._stop.set()

@@ -157,7 +157,7 @@ class _Worker:
             else:
                 runner = ChainRunner(
                     chain=cfg,
-                    adapter_factory=_default_adapter_factory,  # type: ignore[arg-type]
+                    adapter_factory=_default_adapter_factory,
                     channel_factory=_make_channel_factory(self._bus),
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import struct
 from collections.abc import Iterable
 
-from core.chains.types import SolanaBlock, SolanaTransaction
+import base58
+
+from core.chains.types import SolanaBlock, SolanaInstruction, SolanaTransaction
 from core.parser.event import Event
 
 SOLANA_SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
+_TRANSFER_DISC = b"\x02\x00\x00\x00"  # u32 LE = 2
+_TRANSFER_DATA_LEN = 12  # 4 (disc) + 8 (u64 LE lamports)
 
 
 class SolNativeTransferParser:
@@ -17,35 +22,22 @@ class SolNativeTransferParser:
         for tx in block.transactions:
             if not tx.success:
                 continue
-            ev = self._try_extract(tx, block)
-            if ev is not None:
-                yield ev
+            yield from self._extract_transfers(tx, block)
 
-    def _try_extract(self, tx: SolanaTransaction, block: SolanaBlock) -> Event | None:
+    def _extract_transfers(
+        self, tx: SolanaTransaction, block: SolanaBlock,
+    ) -> Iterable[Event]:
         for ix in tx.instructions:
             if ix.program_id != SOLANA_SYSTEM_PROGRAM_ID:
                 continue
             if ix.stack_depth != 1:
                 continue
+            lamports = self._decode_transfer(ix)
+            if lamports is None:
+                continue
             if len(ix.accounts) < 2:
                 continue
-            # System Program Transfer: discriminator is 2u32 LE = b'\x02\x00\x00\x00'
-            # base58 decode of the data would give us the discriminator + lamports,
-            # but we can use balance diffs for simpler extraction.
-            from_addr = ix.accounts[0]
-            to_addr = ix.accounts[1]
-
-            from_idx = tx.account_keys.index(from_addr) if from_addr in tx.account_keys else None
-            to_idx = tx.account_keys.index(to_addr) if to_addr in tx.account_keys else None
-
-            if from_idx is None or to_idx is None:
-                continue
-
-            lamports_sent = tx.pre_balances[from_idx] - tx.post_balances[from_idx] - tx.fee
-            if lamports_sent <= 0:
-                continue
-
-            return Event(
+            yield Event(
                 chain_id=self._chain_id,
                 block_number=block.slot,
                 block_hash=block.block_hash,
@@ -57,10 +49,22 @@ class SolNativeTransferParser:
                 contract=None,
                 name=None,
                 args={
-                    "from": from_addr,
-                    "to": to_addr,
-                    "value": str(lamports_sent),
+                    "from": ix.accounts[0],
+                    "to": ix.accounts[1],
+                    "value": str(lamports),
                 },
                 raw={"signature": tx.signature},
             )
-        return None
+
+    @staticmethod
+    def _decode_transfer(ix: SolanaInstruction) -> int | None:
+        try:
+            data = base58.b58decode(ix.data_b58)
+        except Exception:  # noqa: BLE001
+            return None
+        if len(data) != _TRANSFER_DATA_LEN:
+            return None
+        if data[:4] != _TRANSFER_DISC:
+            return None
+        result: int = struct.unpack("<Q", data[4:])[0]
+        return result

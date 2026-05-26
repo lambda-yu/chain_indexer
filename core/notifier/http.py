@@ -27,7 +27,8 @@ class HttpChannel(Channel):
 
     type = "http"
 
-    def __init__(self, *, config: dict[str, Any], base_delay: float = 1.0) -> None:
+    def __init__(self, *, config: dict[str, Any], bus: object = None, base_delay: float = 1.0) -> None:
+        del bus
         self._url: str = config["url"]
         self._method: str = config.get("method", "POST").upper()
         self._headers: dict[str, str] = dict(config.get("headers", {}))

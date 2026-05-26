@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+from collections.abc import Callable
 
 import structlog
 
@@ -35,9 +36,11 @@ def _default_adapter_factory(cfg: SnapshotChain) -> EvmAdapter:
     )
 
 
-def _default_channel_factory(cfg: SnapshotChannel) -> Channel:
-    cls = CHANNEL_REGISTRY[cfg.type]
-    return cls(config=cfg.config)  # type: ignore[call-arg]
+def _make_channel_factory(bus: RedisBus) -> Callable[[SnapshotChannel], Channel]:
+    def factory(cfg: SnapshotChannel) -> Channel:
+        cls = CHANNEL_REGISTRY[cfg.type]
+        return cls(config=cfg.config, bus=bus)  # type: ignore[call-arg]
+    return factory
 
 
 class _CheckpointAdapter:
@@ -145,7 +148,7 @@ class _Worker:
                 runner = ChainRunner(
                     chain=cfg,
                     adapter_factory=_default_adapter_factory,
-                    channel_factory=_default_channel_factory,
+                    channel_factory=_make_channel_factory(self._bus),
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,
                 )

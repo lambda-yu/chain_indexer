@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from eth_abi.abi import decode as eth_abi_decode
+from eth_abi.exceptions import DecodingError as EthAbiDecodingError
 from eth_utils.abi import (
     event_signature_to_log_topic,
     function_signature_to_4byte_selector,
@@ -124,7 +125,7 @@ def decode_event(
         raw = bytes.fromhex(data.removeprefix("0x"))
         try:
             decoded_tuple = eth_abi_decode(types, raw)
-        except (ValueError, OverflowError) as exc:
+        except (ValueError, OverflowError, EthAbiDecodingError) as exc:
             raise DecodeFailed(f"data decode failed: {exc}") from exc
         for inp, val in zip(not_indexed, decoded_tuple, strict=True):
             args[inp["name"]] = _normalize_value(_canonical_type(inp), val)
@@ -147,7 +148,7 @@ def decode_function_call(fn_abi: dict[str, Any], calldata: str) -> dict[str, Any
     types = [_canonical_type(i) for i in fn_abi.get("inputs", [])]
     try:
         decoded_tuple = eth_abi_decode(types, raw[4:])
-    except (ValueError, OverflowError) as exc:
+    except (ValueError, OverflowError, EthAbiDecodingError) as exc:
         raise DecodeFailed(f"calldata decode failed: {exc}") from exc
 
     out: dict[str, Any] = {}

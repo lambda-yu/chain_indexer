@@ -4580,3 +4580,588 @@ Expected: clean.
 
 ---
 
+
+## Chunk 7: `RedisStreamsChannel`
+
+Closes spec §4.4. M1 ships a single notification channel — `HttpChannel`. Chunk 7 adds the second concrete `Channel` subclass: a Redis Streams MQ driver that `XADD`s the same `event_payload` (spec §8) the HTTP channel posts, with an optional `MAXLEN ~ N` cap for bounded stream length. The channel reuses M1's `core/notifier/retry.py` for 3-attempt exponential backoff and the **existing** `RedisBus` connection that `_Worker` already owns — it does not open its own Redis client.
+
+The single largest design seam this chunk has to chew through is **how the channel gets a Redis handle**. M1's `_default_channel_factory(cfg: SnapshotChannel) -> Channel` (`apps/worker/main.py:39`) takes only the config dict and constructs the channel — there's no parameter for "shared infrastructure". `RedisStreamsChannel` needs the `aioredis.Redis` client. Three options were considered:
+
+1. **Channel opens its own Redis client** from a URL in `cfg.config`. Rejected: forces two `redis.asyncio.Redis` instances per worker process (the bus already has one) and the channel needs to manage its own lifecycle.
+2. **Inject the URL, channel reconstructs the client.** Same downsides as (1) — duplicate connection pools — and the URL becomes part of the per-subscription config blob, leaking transport-layer detail into the subscription schema.
+3. **Inject the existing `RedisBus` (or its `aioredis.Redis` client) into the factory and pass it to every channel constructor.** Channels that don't need it (`HttpChannel`) accept the keyword and ignore it; channels that need it (`RedisStreamsChannel`, and chunk 8's `WebSocketChannel`) require it. This is what spec §4.4 means by "uses the existing `RedisBus` connection".
+
+Option 3 is the design. Concretely:
+- `RedisBus` exposes a `.client` property that returns its `aioredis.Redis` instance (asserts the bus has been `connect()`ed).
+- The `Channel` ABC documents (but does not enforce) that subclass constructors accept `(*, config: dict[str, Any], bus: RedisBus | None = None)` plus their own kwargs. `RedisBus | None` keeps direct test construction ergonomic (`HttpChannel(config={...})` still works without a bus).
+- `HttpChannel.__init__` is widened to accept `bus` and ignore it.
+- The worker's module-level `_default_channel_factory` is replaced with a `_make_channel_factory(bus)` closure built once at `_Worker.start()` time.
+
+The reason to plumb `bus` to **every** channel uniformly (rather than special-casing `cfg.type == "redis_streams"` inside the factory) is that chunk 8 adds a second bus-consuming channel, and a uniform interface keeps the factory dispatch a single line: `cls(config=cfg.config, bus=bus)`. No `isinstance` chains, no class-level "wants_bus" flags.
+
+**Spec §4.4 scope:**
+- New `core/notifier/redis_streams.py` with `class RedisStreamsChannel(Channel)`, `type = "redis_streams"`.
+- Constructor: `__init__(self, *, config: dict[str, Any], bus: RedisBus, base_delay: float = 1.0)`. Reads `config["stream"]` (required) and `config.get("maxlen")` (optional `int | None`). Raises `KeyError` if `stream` is missing — channel-config validation is M3+ territory and a missing `stream` is a programmer error, not a runtime fallback.
+- `send(payload)`: serialize `payload` as JSON, `XADD <stream> [MAXLEN ~ N] * data <json>`. Wraps the `xadd` call in `retry_with_backoff(max_attempts=3, base_delay=…)` (matches `HttpChannel` policy).
+- `start()` / `stop()`: no-ops. The channel does not own the Redis connection.
+- The channel auto-registers via chunk 6's `__init_subclass__` hook; the worker only needs the side-effecting `from core.notifier.redis_streams import RedisStreamsChannel  # noqa: F401` import to make the class definition execute at process start.
+
+**Trim semantics:** Spec §6 explicitly calls out `MAXLEN ~` (approximate trim) as best-effort. `redis-py`'s `xadd(..., maxlen=N, approximate=True)` already issues `MAXLEN ~ N` in the same `XADD` call, so a trim failure can only happen if the entire `XADD` fails — and that is already retried by `retry_with_backoff`. There is **no separate `XTRIM` follow-up call**; the spec line "Trim failures log a warning but do not fail the delivery" only applies if a future refactor splits trim into its own call. We add a short comment in the code documenting that this branch is intentionally not exercised today.
+
+**Modified files this chunk:**
+- `core/bus/redis_bus.py` — add `.client` property.
+- `core/notifier/channel.py` — extend ABC docstring noting the `bus` keyword convention (no signature change to `Channel.__init__` since `Channel` is abstract and has no `__init__` of its own).
+- `core/notifier/http.py` — widen `HttpChannel.__init__` to accept `bus` (ignored).
+- `core/notifier/redis_streams.py` — **new**: `RedisStreamsChannel`.
+- `apps/worker/main.py` — replace module-level `_default_channel_factory` with `_make_channel_factory(bus)` closure built in `_Worker._reconcile` (or `_make_channel_factory` called from `start()` and stashed on `self`). Add the side-effect import for the new channel module.
+- `tests/unit/test_http_channel.py` — every `HttpChannel(...)` constructor call gains `bus=None`. (Or — equivalently — we make `bus` default to `None`, which keeps the existing tests untouched. **We're going with the default `bus=None`**; the unit tests are not modified.)
+- `tests/unit/test_redis_streams_channel.py` — **new**: unit tests with an `AsyncMock` Redis client.
+- `tests/integration/test_redis_streams_channel.py` — **new**: testcontainers Redis round-trip (`XADD` then `XREAD` from the same stream).
+
+**Out of scope this chunk:**
+- Consumer-side semantics — workers don't consume from these streams. The downstream consumer (`xreadgroup`-style) is a user-of-this-project concern, not in M2.
+- Multi-stream fanout — one channel ↔ one stream by config. Multi-stream fanout is a subscription-level concern (the subscription can list multiple `channel_ids`).
+- `XADD NOMKSTREAM` semantics — we always allow auto-creation. The spec is silent on pre-creation; if a user wants strict pre-creation, they can configure the stream out-of-band and an `XADD` on a deleted stream just recreates it (Redis default behaviour).
+- Channel config-shape validation — channels still trust their `config: dict[str, Any]` blob at construction; per-channel JSON-schema validation is M3+ territory (same out-of-scope line as chunks 6 and 8).
+
+**Note on `aioredis.Redis` import path:** M1 uses `redis.asyncio as aioredis` (`core/bus/redis_bus.py:8`), not the old separate `aioredis` package. This chunk continues that import style — `from redis.asyncio import Redis` — and types the channel's client field as `Redis` from that namespace.
+
+### Task 7.1: Preparatory — `RedisBus.client` property + factory closure + `HttpChannel(bus=None)`
+
+Three small mechanical edits land in one commit because they're a single conceptual change: "the channel factory can now hand a Redis client to channel constructors". The new channel in Task 7.3 depends on this scaffolding; doing it in a separate commit makes the diff for the actual channel implementation pure.
+
+**Files:**
+- Modify: `core/bus/redis_bus.py` — add `client` property.
+- Modify: `core/notifier/http.py` — widen `__init__` signature.
+- Modify: `apps/worker/main.py` — replace module-level `_default_channel_factory` with a closure built in `_Worker`.
+- Test: existing `tests/unit/test_http_channel.py` continues to pass unchanged; a new test verifies `_make_channel_factory` injects the bus.
+
+- [ ] **Step 1: Write the failing test for the bus injection contract**
+
+This is the only NEW behaviour landing in this task — the rest is signature widening. Pick `tests/unit/test_channel_registry.py` (already touched by chunk 6) as the home for this test since it's the file that covers channel registration / construction, and add:
+
+```python
+# tests/unit/test_channel_registry.py — append at end of file
+from typing import Any
+from unittest.mock import AsyncMock
+
+from core.bus.redis_bus import RedisBus
+from core.config.snapshot import SnapshotChannel
+from core.notifier.channel import CHANNEL_REGISTRY, Channel
+
+
+def test_make_channel_factory_injects_bus_into_constructor() -> None:
+    """`_make_channel_factory(bus)` returns a factory that hands `bus` to every
+    channel constructor it builds. HTTP ignores it; bus-consuming channels read it."""
+    from apps.worker.main import _make_channel_factory
+
+    seen: dict[str, Any] = {}
+
+    class _ProbeChannel(Channel):
+        type = "probe-7-1"
+
+        def __init__(self, *, config: dict[str, Any], bus: RedisBus | None = None) -> None:
+            seen["config"] = config
+            seen["bus"] = bus
+
+        async def start(self) -> None: ...
+        async def stop(self) -> None: ...
+        async def send(self, payload: dict[str, Any]) -> None: ...
+
+    try:
+        fake_bus = AsyncMock(spec=RedisBus)
+        factory = _make_channel_factory(fake_bus)
+        cfg = SnapshotChannel(id="c-7-1", name="probe", type="probe-7-1", config={"k": "v"})
+        ch = factory(cfg)
+        assert isinstance(ch, _ProbeChannel)
+        assert seen["config"] == {"k": "v"}
+        assert seen["bus"] is fake_bus
+    finally:
+        del CHANNEL_REGISTRY["probe-7-1"]
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_make_channel_factory_injects_bus_into_constructor -v`
+Expected: FAIL with `ImportError: cannot import name '_make_channel_factory' from 'apps.worker.main'` (the symbol doesn't exist yet).
+
+- [ ] **Step 3: Add `RedisBus.client` property**
+
+Edit `core/bus/redis_bus.py`, add after `disconnect()`:
+
+```python
+    @property
+    def client(self) -> aioredis.Redis:
+        """Return the underlying redis-py async client. Raises if `connect()`
+        has not been called. Used by `Channel` subclasses that need direct
+        Redis commands (e.g. `RedisStreamsChannel.send` issues `XADD`)."""
+        assert self._client is not None, "RedisBus.connect() must be called first"
+        return self._client
+```
+
+- [ ] **Step 4: Widen `HttpChannel.__init__` to accept `bus`**
+
+In `core/notifier/http.py`, change the constructor signature:
+
+```python
+    def __init__(
+        self,
+        *,
+        config: dict[str, Any],
+        bus: "RedisBus | None" = None,  # ignored; accepted for uniform factory wiring
+        base_delay: float = 1.0,
+    ) -> None:
+```
+
+And add `from core.bus.redis_bus import RedisBus  # noqa: TC001 — only for type` to the top of the file. (Or use `TYPE_CHECKING`-guarded import — either works. The `noqa: TC001` keeps ruff happy if a `TYPE_CHECKING` rule fires.)
+
+Reference the parameter as `_ = bus` inside `__init__` (or skip it entirely — Python lets you accept a kwarg without binding it to anything beyond the parameter slot). To keep linters quiet without a no-op statement, prefix the parameter name as `_bus` instead of `bus`:
+
+```python
+    def __init__(
+        self,
+        *,
+        config: dict[str, Any],
+        bus: "RedisBus | None" = None,
+        base_delay: float = 1.0,
+    ) -> None:
+        del bus  # accepted for uniform factory wiring; HttpChannel doesn't need it
+```
+
+The `del bus` makes the intent explicit and silences "unused argument" warnings without renaming the parameter — the factory always passes `bus=` by keyword.
+
+- [ ] **Step 5: Replace module-level `_default_channel_factory` with `_make_channel_factory(bus)`**
+
+In `apps/worker/main.py`:
+
+1. Delete the existing function at lines 39-41:
+   ```python
+   def _default_channel_factory(cfg: SnapshotChannel) -> Channel:
+       cls = CHANNEL_REGISTRY[cfg.type]
+       return cls(config=cfg.config)  # type: ignore[call-arg]
+   ```
+2. Add a closure factory builder above `_Worker`:
+   ```python
+   def _make_channel_factory(bus: RedisBus) -> Callable[[SnapshotChannel], Channel]:
+       """Build a channel factory closed over the shared Redis bus.
+
+       Channels that need direct Redis access (`RedisStreamsChannel`, `WebSocketChannel`)
+       receive `bus` and use it; channels that don't (`HttpChannel`) accept the kwarg
+       and ignore it. Keeping the dispatch uniform avoids per-type branching here.
+       """
+       def factory(cfg: SnapshotChannel) -> Channel:
+           cls = CHANNEL_REGISTRY[cfg.type]
+           return cls(config=cfg.config, bus=bus)  # type: ignore[call-arg]
+       return factory
+   ```
+   You'll need `from collections.abc import Callable` at the top of the file.
+3. In `_Worker._reconcile`, the `ChainRunner(... channel_factory=_default_channel_factory ...)` call (currently line 134) becomes:
+   ```python
+   channel_factory=_make_channel_factory(self._bus),
+   ```
+   Each new `ChainRunner` gets its own factory instance, but they all close over the same `self._bus`. Building once and stashing on `self` is a future micro-optimisation; per-call closure construction is cheap.
+
+- [ ] **Step 6: Re-run the unit test**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_make_channel_factory_injects_bus_into_constructor -v`
+Expected: PASS.
+
+- [ ] **Step 7: Run the full HTTP channel suite to confirm widened signature is non-breaking**
+
+Run: `pytest tests/unit/test_http_channel.py -v`
+Expected: All 6 existing tests still PASS. (None of them pass `bus=`; the new default `None` keeps them working.)
+
+- [ ] **Step 8: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean. The `# type: ignore[call-arg]` on `cls(config=cfg.config, bus=bus)` stays — `Channel` is abstract with no `__init__` constraint, so pyright cannot see any concrete subclass's signature through the `type[Channel]` mapping. The ignore is structurally required.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add core/bus/redis_bus.py core/notifier/http.py apps/worker/main.py tests/unit/test_channel_registry.py
+git commit -m "feat(notifier): bus-aware channel factory + RedisBus.client property"
+```
+
+### Task 7.2: Red — `RedisStreamsChannel` unit tests
+
+Drives Task 7.3. Three behaviours under test: (a) basic `XADD` with the JSON payload as the `data` field; (b) `MAXLEN ~ N` is forwarded when configured; (c) transient `RedisError` is retried, persistent failure raises `RetryExhausted`. We mock the `aioredis.Redis` client with a plain `AsyncMock()` so the test surface stays in-process and doesn't depend on a live Redis (the IT in Task 7.5 covers the wire-level contract).
+
+**Why plain `AsyncMock()` and NOT `AsyncMock(spec=Redis)`:** `redis.asyncio.Redis.xadd` is declared with a return type of `Awaitable[Any] | Any` rather than as a real `async def` — `inspect.iscoroutinefunction(Redis.xadd)` returns `False`. `AsyncMock(spec=Redis)` would therefore auto-wrap `xadd` as a plain `MagicMock`, and `await client.xadd(...)` inside `RedisStreamsChannel.send` would raise `TypeError: 'MagicMock' object can't be awaited`. Plain `AsyncMock()` (no spec) makes every accessed attribute an `AsyncMock` — which is what the implementation expects to await. We lose the spec-typo safety net in exchange for a working async surface; the integration test (Task 7.5) catches any attribute-name drift against the real client.
+
+**Files:**
+- Create: `tests/unit/test_redis_streams_channel.py`
+
+- [ ] **Step 1: Write the failing test file**
+
+```python
+# tests/unit/test_redis_streams_channel.py
+from __future__ import annotations
+
+import json
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from redis.exceptions import RedisError
+
+from core.bus.redis_bus import RedisBus
+from core.notifier.redis_streams import RedisStreamsChannel
+from core.notifier.retry import RetryExhausted
+
+
+def _fake_bus_with_client(client: AsyncMock) -> AsyncMock:
+    """Build an `AsyncMock` `RedisBus` whose `.client` property returns `client`.
+
+    `AsyncMock(spec=RedisBus)` doesn't auto-attach `.client` because the spec
+    inspects instance attributes, so we override the attribute directly.
+
+    The `client` arg is expected to be a plain `AsyncMock()` (no `spec=Redis`)
+    — see the chunk preamble for why spec-mode breaks `await client.xadd(...)`.
+    """
+    bus = AsyncMock(spec=RedisBus)
+    bus.client = client
+    return bus
+
+
+@pytest.mark.asyncio
+async def test_xadd_sends_json_payload_to_configured_stream() -> None:
+    client = AsyncMock()
+    bus = _fake_bus_with_client(client)
+    ch = RedisStreamsChannel(config={"stream": "events"}, bus=bus)
+    await ch.start()
+    try:
+        payload: dict[str, Any] = {"k": 1, "subscription_id": "s1"}
+        await ch.send(payload)
+    finally:
+        await ch.stop()
+
+    client.xadd.assert_awaited_once()
+    args, kwargs = client.xadd.call_args
+    assert args[0] == "events"  # stream name
+    fields = args[1]
+    assert json.loads(fields["data"]) == payload
+    assert "maxlen" not in kwargs  # no cap configured
+
+
+@pytest.mark.asyncio
+async def test_xadd_forwards_maxlen_when_configured() -> None:
+    client = AsyncMock()
+    bus = _fake_bus_with_client(client)
+    ch = RedisStreamsChannel(config={"stream": "events", "maxlen": 1000}, bus=bus)
+    await ch.start()
+    try:
+        await ch.send({"k": 1})
+    finally:
+        await ch.stop()
+
+    args, kwargs = client.xadd.call_args
+    assert kwargs.get("maxlen") == 1000
+    assert kwargs.get("approximate") is True  # MAXLEN ~ N, not strict
+
+
+@pytest.mark.asyncio
+async def test_transient_redis_error_is_retried_then_succeeds() -> None:
+    client = AsyncMock()
+    client.xadd.side_effect = [RedisError("temporary"), b"1700000000000-0"]
+    bus = _fake_bus_with_client(client)
+    ch = RedisStreamsChannel(config={"stream": "events"}, bus=bus, base_delay=0.0)
+    await ch.start()
+    try:
+        await ch.send({"k": 1})
+    finally:
+        await ch.stop()
+    assert client.xadd.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_persistent_redis_error_raises_retry_exhausted() -> None:
+    client = AsyncMock()
+    client.xadd.side_effect = RedisError("hard down")
+    bus = _fake_bus_with_client(client)
+    ch = RedisStreamsChannel(config={"stream": "events"}, bus=bus, base_delay=0.0)
+    await ch.start()
+    try:
+        with pytest.raises(RetryExhausted):
+            await ch.send({"k": 1})
+    finally:
+        await ch.stop()
+    assert client.xadd.await_count == 3  # max_attempts
+
+
+@pytest.mark.asyncio
+async def test_missing_stream_config_raises_at_construction() -> None:
+    client = AsyncMock()
+    bus = _fake_bus_with_client(client)
+    with pytest.raises(KeyError):
+        RedisStreamsChannel(config={"maxlen": 100}, bus=bus)
+
+
+def test_type_attribute_is_redis_streams() -> None:
+    # Confirms the auto-registration key is correct (chunk 6's __init_subclass__
+    # will already have registered the class on import, but the explicit assertion
+    # documents the public contract).
+    assert RedisStreamsChannel.type == "redis_streams"
+```
+
+- [ ] **Step 2: Run the new tests to confirm they fail**
+
+Run: `pytest tests/unit/test_redis_streams_channel.py -v`
+Expected: 6 FAILs with `ModuleNotFoundError: No module named 'core.notifier.redis_streams'`.
+
+### Task 7.3: Green — implement `RedisStreamsChannel`
+
+**Files:**
+- Create: `core/notifier/redis_streams.py`
+
+- [ ] **Step 1: Write the minimal implementation**
+
+```python
+# core/notifier/redis_streams.py
+from __future__ import annotations
+
+import json
+from functools import partial
+from typing import Any
+
+import structlog
+from redis.exceptions import RedisError
+
+from core.bus.redis_bus import RedisBus
+from core.notifier.channel import Channel
+from core.notifier.retry import retry_with_backoff
+
+log = structlog.get_logger(__name__)
+
+
+class RedisStreamsChannel(Channel):
+    """XADD-based Redis Streams notification driver.
+
+    Reuses the worker's shared `RedisBus` connection — does not own a client.
+    `MAXLEN ~ N` trimming is issued in the same `XADD` call (`approximate=True`)
+    so there is no separate trim-failure code path; a failed trim implies a
+    failed `XADD` and is therefore covered by the standard retry policy.
+    """
+
+    type = "redis_streams"
+
+    def __init__(
+        self,
+        *,
+        config: dict[str, Any],
+        bus: RedisBus,
+        base_delay: float = 1.0,
+    ) -> None:
+        self._stream: str = config["stream"]  # required; KeyError surfaces misconfig
+        self._maxlen: int | None = config.get("maxlen")
+        self._bus = bus
+        self._base_delay = base_delay
+
+    async def start(self) -> None:
+        # The bus is started/stopped by the worker; this channel is a thin user
+        # of that connection.
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def send(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, separators=(",", ":"))
+        await retry_with_backoff(
+            partial(self._xadd_once, body=body),
+            max_attempts=3,
+            base_delay=self._base_delay,
+        )
+
+    async def _xadd_once(self, *, body: str) -> None:
+        client = self._bus.client
+        try:
+            kwargs: dict[str, Any] = {}
+            if self._maxlen is not None:
+                kwargs["maxlen"] = self._maxlen
+                kwargs["approximate"] = True
+            await client.xadd(self._stream, {"data": body}, **kwargs)
+        except RedisError:
+            # Re-raise as-is; retry_with_backoff classifies it as a retryable error.
+            raise
+```
+
+- [ ] **Step 2: Re-run the unit tests**
+
+Run: `pytest tests/unit/test_redis_streams_channel.py -v`
+Expected: all 6 PASS.
+
+- [ ] **Step 3: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+### Task 7.4: Wire the new channel into the worker's registry side-effect imports
+
+The class auto-registers via chunk 6's `__init_subclass__` hook, but that only fires once the module is imported. The worker entrypoint needs to import `core.notifier.redis_streams` so the class definition runs before any snapshot reconciliation attempts a `CHANNEL_REGISTRY["redis_streams"]` lookup.
+
+**Files:**
+- Modify: `apps/worker/main.py` — add the side-effect import.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `tests/unit/test_channel_registry.py`:
+
+```python
+def test_redis_streams_channel_is_registered_via_worker_import() -> None:
+    """Importing `apps.worker.main` should register the redis_streams channel
+    type because the worker's side-effect imports include it. This guards
+    against forgetting the import line after adding a new channel."""
+    import apps.worker.main  # noqa: F401 — side-effect: triggers channel registration
+
+    from core.notifier.channel import CHANNEL_REGISTRY
+    assert "redis_streams" in CHANNEL_REGISTRY
+```
+
+(No `importlib.reload` — Python caches modules in `sys.modules`, so a plain `import` is enough. Reload would not re-execute downstream class statements anyway, so it doesn't defend against test pollution.)
+
+- [ ] **Step 2: Run the test to confirm it fails**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_redis_streams_channel_is_registered_via_worker_import -v`
+Expected: FAIL — `"redis_streams" not in CHANNEL_REGISTRY` because nothing imports the module yet.
+
+- [ ] **Step 3: Add the side-effect import to `apps/worker/main.py`**
+
+Below the existing `from core.notifier.http import HttpChannel  # noqa: F401 — side-effect: register http` line, add:
+
+```python
+from core.notifier.redis_streams import RedisStreamsChannel  # noqa: F401 — side-effect: register redis_streams
+```
+
+- [ ] **Step 4: Re-run the test**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_redis_streams_channel_is_registered_via_worker_import -v`
+Expected: PASS.
+
+- [ ] **Step 5: Run the full channel-registry test file**
+
+Run: `pytest tests/unit/test_channel_registry.py -v`
+Expected: all tests still pass. The reload in the new test is scoped to `apps.worker.main`; chunk 6's tests don't touch this module.
+
+### Task 7.5: Integration test — round-trip via testcontainers Redis
+
+Unit tests with mocked `xadd` prove the channel issues the right calls; this test proves the end-to-end contract: a real `XADD` shows up on a real `XREAD`. Uses the same `testcontainers.redis.RedisContainer` pattern as `tests/integration/test_bus.py`.
+
+**Files:**
+- Create: `tests/integration/test_redis_streams_channel.py`
+
+- [ ] **Step 1: Write the integration test**
+
+```python
+# tests/integration/test_redis_streams_channel.py
+from __future__ import annotations
+
+import json
+
+import pytest
+from testcontainers.redis import RedisContainer  # type: ignore[import-untyped]
+
+from core.bus.redis_bus import RedisBus
+from core.notifier.redis_streams import RedisStreamsChannel
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.mark.asyncio
+async def test_xadd_round_trip_against_real_redis() -> None:
+    with RedisContainer("redis:7-alpine") as rc:
+        url = f"redis://{rc.get_container_host_ip()}:{rc.get_exposed_port(6379)}/0"
+        bus = RedisBus(url)
+        await bus.connect()
+        try:
+            ch = RedisStreamsChannel(config={"stream": "evt-it"}, bus=bus)
+            await ch.start()
+            try:
+                await ch.send({"k": 1, "subscription_id": "s1"})
+                await ch.send({"k": 2, "subscription_id": "s2"})
+            finally:
+                await ch.stop()
+
+            # Read back via XREAD from beginning.
+            client = bus.client
+            entries = await client.xread({"evt-it": "0"}, block=100, count=10)
+            assert entries  # list of (stream, [(id, {field: value}), ...])
+            stream_name, items = entries[0]
+            assert stream_name in ("evt-it", b"evt-it")
+            assert len(items) == 2
+            for _entry_id, fields in items:
+                # redis-py with decode_responses=True (used by RedisBus) returns str keys.
+                data = fields.get("data") or fields.get(b"data")
+                if isinstance(data, bytes):
+                    data = data.decode()
+                payload = json.loads(data)
+                assert payload["k"] in (1, 2)
+        finally:
+            await bus.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_maxlen_caps_stream_length_approximately() -> None:
+    """With `maxlen=2 approximate=True`, after pushing ~200 entries the stream
+    length is far below the unbounded total. Redis trims in macro-node chunks
+    (~100 entries default), so the cap is approximate and can overshoot the
+    nominal `maxlen` by tens of entries on a small stream — but it MUST be
+    well below the unbounded push count. We push 200 and assert `< 200` with
+    a generous ceiling of 150 to leave headroom for redis-version drift."""
+    with RedisContainer("redis:7-alpine") as rc:
+        url = f"redis://{rc.get_container_host_ip()}:{rc.get_exposed_port(6379)}/0"
+        bus = RedisBus(url)
+        await bus.connect()
+        try:
+            ch = RedisStreamsChannel(config={"stream": "evt-cap", "maxlen": 2}, bus=bus)
+            await ch.start()
+            try:
+                for i in range(200):
+                    await ch.send({"i": i})
+            finally:
+                await ch.stop()
+
+            client = bus.client
+            length = await client.xlen("evt-cap")
+            # Approximate trim can overshoot but should be far below 200.
+            assert length < 150, f"expected approximate trim well below 200, got {length}"
+        finally:
+            await bus.disconnect()
+```
+
+- [ ] **Step 2: Run the integration tests**
+
+Run: `pytest tests/integration/test_redis_streams_channel.py -v -m integration`
+Expected: both tests PASS. The first run pulls the `redis:7-alpine` image (~30s on cold cache); subsequent runs are 1-2s.
+
+If `make test` is configured to skip the `integration` marker by default, that's fine — the test runs explicitly with `-m integration` here and in CI's IT job.
+
+### Task 7.6: Run the full suite, lint, type-check, and commit
+
+- [ ] **Step 1: Run all unit tests**
+
+Run: `pytest tests/unit/ -v`
+Expected: clean. Counts roughly: prior baseline + 6 new redis-streams tests + 1 new factory test + 1 new registration test = +8 vs. chunk 6.
+
+- [ ] **Step 2: Run all integration tests**
+
+Run: `pytest tests/integration/ -v -m integration`
+Expected: chunks 1-6's IT (e.g. `test_bus.py`, `test_worker_config_reload.py`) plus the 2 new redis-streams tests PASS.
+
+- [ ] **Step 3: Lint / type-check**
+
+Run: `make lint typecheck`
+Expected: clean. The `# type: ignore[call-arg]` on the factory's `cls(config=..., bus=...)` is correct here — `CHANNEL_REGISTRY` types its values as `type[Channel]`, and `Channel` is abstract with no `__init__` constraint, so a concrete subclass's specific kwargs aren't visible to the type-checker at the factory boundary.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add core/notifier/redis_streams.py \
+        tests/unit/test_redis_streams_channel.py \
+        tests/unit/test_channel_registry.py \
+        tests/integration/test_redis_streams_channel.py \
+        apps/worker/main.py
+git commit -m "feat(notifier): add RedisStreamsChannel with MAXLEN trim + retry"
+```
+
+---

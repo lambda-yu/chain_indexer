@@ -20,8 +20,10 @@ def _split(key: str) -> tuple[str, str]:
 
 
 def _norm(v: Any) -> Any:
-    """Hex-address equality is case-insensitive. Lower-case strings for comparison."""
-    return v.lower() if isinstance(v, str) else v
+    """Lowercase only EVM hex strings (start with '0x'). Solana base58 is case-sensitive."""
+    if isinstance(v, str) and v.startswith("0x"):
+        return v.lower()
+    return v
 
 
 def validate(filters: dict[str, Any]) -> None:

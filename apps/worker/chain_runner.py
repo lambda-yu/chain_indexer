@@ -23,6 +23,7 @@ from core.parser.erc20 import Erc20TransferParser
 from core.parser.native import EvmNativeTransferParser
 from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
 from core.parser.sol_native import SolNativeTransferParser
+from core.parser.spl_transfer import SplTransferParser
 
 log = structlog.get_logger(__name__)
 
@@ -80,6 +81,7 @@ class ChainRunner:
         if self._chain.kind == "solana":
             self._solana_pipeline = SolanaParserPipeline([
                 SolNativeTransferParser(chain_id=self._chain.id),
+                SplTransferParser(chain_id=self._chain.id),
             ])
         else:
             evm_parsers: list[Any] = [

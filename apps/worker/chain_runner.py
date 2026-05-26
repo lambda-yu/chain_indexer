@@ -19,6 +19,7 @@ from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
 from core.parser.abi_call import AbiCallParser
 from core.parser.abi_event import AbiEventParser
+from core.parser.anchor_event import AnchorIdlEventParser
 from core.parser.erc20 import Erc20TransferParser
 from core.parser.native import EvmNativeTransferParser
 from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
@@ -79,10 +80,13 @@ class ChainRunner:
 
     def _build_pipeline(self) -> None:
         if self._chain.kind == "solana":
-            self._solana_pipeline = SolanaParserPipeline([
+            sol_parsers: list[Any] = [
                 SolNativeTransferParser(chain_id=self._chain.id),
                 SplTransferParser(chain_id=self._chain.id),
-            ])
+            ]
+            if self._abi_registry is not None:
+                sol_parsers.append(AnchorIdlEventParser(chain_id=self._chain.id, registry=self._abi_registry))
+            self._solana_pipeline = SolanaParserPipeline(sol_parsers)
         else:
             evm_parsers: list[Any] = [
                 EvmNativeTransferParser(chain_id=self._chain.id),

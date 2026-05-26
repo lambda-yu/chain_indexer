@@ -2,8 +2,12 @@
 land in chunk 13 via `borsh-construct` and live in this same module."""
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
+import base58 as _base58
+import borsh_construct
+import construct
 from eth_abi.abi import decode as eth_abi_decode
 from eth_abi.exceptions import DecodingError as EthAbiDecodingError
 from eth_utils.abi import (
@@ -154,4 +158,63 @@ def decode_function_call(fn_abi: dict[str, Any], calldata: str) -> dict[str, Any
     out: dict[str, Any] = {}
     for inp, val in zip(fn_abi.get("inputs", []), decoded_tuple, strict=True):
         out[inp["name"]] = _normalize_value(_canonical_type(inp), val)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Anchor IDL helpers (Solana — chunk 13)
+# ---------------------------------------------------------------------------
+
+_ANCHOR_SCALAR_MAP: dict[str, construct.Construct[Any, Any]] = {
+    "bool": borsh_construct.Bool,
+    "u8": borsh_construct.U8,
+    "u16": borsh_construct.U16,
+    "u32": borsh_construct.U32,
+    "u64": borsh_construct.U64,
+    "u128": borsh_construct.U128,
+    "i8": borsh_construct.I8,
+    "i16": borsh_construct.I16,
+    "i32": borsh_construct.I32,
+    "i64": borsh_construct.I64,
+    "i128": borsh_construct.I128,
+    "bytes": borsh_construct.Bytes,
+    "string": borsh_construct.String,
+    "pubkey": construct.Bytes(32),
+    "publicKey": construct.Bytes(32),
+}
+
+
+def anchor_event_discriminator(event_name: str) -> bytes:
+    return hashlib.sha256(f"event:{event_name}".encode()).digest()[:8]
+
+
+def build_anchor_event_struct(
+    idl_event: dict[str, Any],
+) -> construct.Construct[Any, Any] | None:
+    fields_spec: list[Any] = []
+    for field in idl_event.get("fields", []):
+        ft = field.get("type")
+        if isinstance(ft, str) and ft in _ANCHOR_SCALAR_MAP:
+            fields_spec.append(field["name"] / _ANCHOR_SCALAR_MAP[ft])
+        else:
+            return None
+    return borsh_construct.CStruct(*fields_spec)
+
+
+def decode_anchor_event(
+    struct: construct.Construct[Any, Any],
+    body_bytes: bytes,
+) -> dict[str, Any]:
+    try:
+        parsed = struct.parse(body_bytes)
+    except Exception as exc:
+        raise DecodeFailed(f"borsh decode failed: {exc}") from exc
+    out: dict[str, Any] = {}
+    for k, v in parsed.items():
+        if isinstance(v, bytes) and len(v) == 32:
+            out[k] = _base58.b58encode(v).decode()
+        elif isinstance(v, int):
+            out[k] = str(v) if abs(v) > 2**53 else v
+        else:
+            out[k] = v
     return out

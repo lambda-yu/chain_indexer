@@ -405,6 +405,19 @@ wheels = [
 ]
 
 [[package]]
+name = "borsh-construct"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "construct-typing" },
+    { name = "sumtypes" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8e/0c/8062d8d795e7b9518923bfba453f883e2cbf80c5b05de699e4424a523a71/borsh-construct-0.1.0.tar.gz", hash = "sha256:c916758ceba70085d8f456a1cc26991b88cb64233d347767766473b651b37263", size = 5808, upload-time = "2021-10-20T11:16:49.095Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/21/1d/52c0741626a17eb1a2f554e27dc2883f9bb98bb7b2392f9cbd1f39c36fea/borsh_construct-0.1.0-py3-none-any.whl", hash = "sha256:f584c791e2a03f8fc36e6c13011a27bcaf028c9c54ba89cd70f485a7d1c687ed", size = 6386, upload-time = "2021-10-20T11:16:47.84Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.5.20"
 source = { registry = "https://pypi.org/simple" }
@@ -421,6 +434,7 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "alembic" },
     { name = "base58" },
+    { name = "borsh-construct" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -460,6 +474,7 @@ requires-dist = [
     { name = "asyncmy", marker = "extra == 'mysql'", specifier = ">=0.2.9" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29" },
     { name = "base58", specifier = ">=2.1,<3" },
+    { name = "borsh-construct", specifier = ">=0.1.0,<0.2" },
     { name = "eth-account", marker = "extra == 'dev'", specifier = ">=0.11,<1" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
@@ -639,6 +654,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "construct"
+version = "2.10.68"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e0/b7/a4a032e94bcfdff481f2e6fecd472794d9da09f474a2185ed33b2c7cad64/construct-2.10.68.tar.gz", hash = "sha256:7b2a3fd8e5f597a5aa1d614c3bd516fa065db01704c72a1efaaeec6ef23d8b45", size = 57856, upload-time = "2022-02-21T23:09:15.1Z" }
+
+[[package]]
+name = "construct-typing"
+version = "0.5.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "construct" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/42/5f/89f8e4fc17ea96ef9af66aa4818e00c4fb84c289c4c6879df411d11f15a4/construct-typing-0.5.6.tar.gz", hash = "sha256:0dc501351cd6b308f15ec54e5fe7c0fbc07cc1530a1b77b4303062a0a93c1297", size = 22716, upload-time = "2023-05-09T11:05:50.106Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3e/c5/d68c7b7e5e2875d199b49f86f9fda2b18a58ff0a835f608cb664bbc3a53e/construct_typing-0.5.6-py3-none-any.whl", hash = "sha256:39c948329e880564e33521cba497b21b07967c465b9c9037d6334e2cffa1ced9", size = 24098, upload-time = "2023-05-09T11:05:48.66Z" },
 ]
 
 [[package]]
@@ -2391,6 +2424,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
+]
+
+[[package]]
+name = "sumtypes"
+version = "0.1a6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3a/aa/1aa52ae948166291cf615687a733151d4567645beac7e51b7bae3fd88ad4/sumtypes-0.1a6.tar.gz", hash = "sha256:1a6ff095e06a1885f340ddab803e0f38e3f9bed81f9090164ca9682e04e96b43", size = 5272, upload-time = "2021-11-30T14:18:43.172Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5a/29/4ef1ff91dad16f8396bab999a09011d4939951f47b9729b3f73cc1f74756/sumtypes-0.1a6-py2.py3-none-any.whl", hash = "sha256:3e9d71322dd927d25d935072f8be7daec655ea292fd392359a5bb2c1e53dfdc3", size = 5817, upload-time = "2021-11-30T14:18:41.447Z" },
 ]
 
 [[package]]

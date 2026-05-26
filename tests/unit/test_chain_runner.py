@@ -8,14 +8,19 @@ from typing import Any
 import pytest
 
 from apps.worker.chain_runner import ChainRunner
-from core.chains.types import Block, BlockHeader, Tx
+from core.abi.registry import AbiRegistry as _AbiRegistry
+from core.chains.types import Block, BlockHeader, Log, Tx
 from core.config.snapshot import (
     ConfigSnapshot,
     SnapshotChain,
     SnapshotChannel,
     SnapshotSubscription,
 )
+from core.config.snapshot import (
+    SnapshotAbi as _SnapshotAbi,
+)
 from core.notifier.channel import Channel
+from core.parser.erc20 import ERC20_TRANSFER_TOPIC0
 
 
 def _chain() -> SnapshotChain:
@@ -47,11 +52,11 @@ def _sub(channel_ids: list[str], **overrides: Any) -> SnapshotSubscription:
 
 
 def _ch(id_: str = "c1") -> SnapshotChannel:
-    return SnapshotChannel(id=id_, name="hook", type="collect", config={})
+    return SnapshotChannel(id=id_, name="hook", type="collect-runner", config={})
 
 
 class _CollectingChannel(Channel):
-    type = "collect"
+    type = "collect-runner"
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -263,3 +268,190 @@ async def test_chain_runner_seeds_buffer_from_checkpoint() -> None:
         assert runner.resume_from == (42, "0xh42")
     finally:
         await runner.stop()
+
+
+def _block_with_erc20_log(n: int, *, value: int = 1000) -> Block:
+    pad = "0" * 24
+    _from = "aaaa" + "00" * 18
+    _to = "bbbb" + "00" * 18
+    return Block(
+        header=_hdr(n, parent=f"0xh{n-1}" if n > 0 else "0x0"),
+        txs=[
+            Tx(hash=f"0xt{n}", index=0, from_addr="0xf0", to_addr="0xtoken",
+               value=0, input="0xa9059cbb", status=1),
+        ],
+        logs=[
+            Log(
+                tx_hash=f"0xt{n}",
+                log_index=0,
+                address="0xtoken",
+                topics=[
+                    ERC20_TRANSFER_TOPIC0,
+                    "0x" + pad + _from,
+                    "0x" + pad + _to,
+                ],
+                data="0x" + format(value, "064x"),
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_erc20_token_transfer() -> None:
+    chain = _chain()
+    blocks = [_block_with_erc20_log(n, value=n * 1000) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="token_transfer")],
+        channels=[_ch("c1")],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"token_transfer"}
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        assert values == {"1000", "2000"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+_TRANSFER_ABI = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from",  "type": "address", "indexed": True},
+        {"name": "to",    "type": "address", "indexed": True},
+        {"name": "value", "type": "uint256", "indexed": False},
+    ],
+}
+
+
+def test_chain_runner_pipeline_includes_abi_event_parser_when_registry_given() -> None:
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    chain = _chain()
+    runner_with = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+        abi_registry=reg,
+    )
+    types_with = [type(p).__name__ for p in runner_with._pipeline._parsers]
+    assert "AbiEventParser" in types_with
+
+    runner_without = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
+    assert "AbiEventParser" not in types_without
+    assert "EvmNativeTransferParser" in types_with and "EvmNativeTransferParser" in types_without
+    assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_abi_event_match() -> None:
+    chain = _chain()
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    blocks = [_block_with_erc20_log(n, value=n * 100) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="event", match_name="Transfer")],
+        channels=[_ch("c1")],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+        abi_registry=reg,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        names = {c["event"]["name"] for c in coll.calls}
+        assert names == {"Transfer"}
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"event"}
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        assert values == {"100", "200"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def test_chain_runner_pipeline_includes_abi_call_parser_when_registry_given() -> None:
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    chain = _chain()
+    runner_with = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+        abi_registry=reg,
+    )
+    types_with = [type(p).__name__ for p in runner_with._pipeline._parsers]
+    assert "AbiEventParser" in types_with
+    assert "AbiCallParser" in types_with
+
+    runner_without = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
+    assert "AbiCallParser" not in types_without
+    assert "AbiEventParser" not in types_without
+    assert "EvmNativeTransferParser" in types_with and "EvmNativeTransferParser" in types_without
+    assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without

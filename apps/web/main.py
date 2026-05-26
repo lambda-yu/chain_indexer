@@ -96,13 +96,17 @@ def create_app(
         return JSONResponse(body, status_code=status_code)
 
     # Routers (registered in later tasks of this chunk):
+    from apps.web.routers import abis as abis_router  # noqa: E402
     from apps.web.routers import chains as chains_router  # noqa: E402
     from apps.web.routers import channels as channels_router  # noqa: E402
     from apps.web.routers import subscriptions as subs_router  # noqa: E402
+    from apps.web.routers import ws as ws_router  # noqa: E402
 
     app.include_router(chains_router.router)
+    app.include_router(abis_router.router)
     app.include_router(channels_router.router)
     app.include_router(subs_router.router)
+    app.include_router(ws_router.router)
     return app
 
 

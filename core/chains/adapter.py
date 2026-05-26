@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from core.chains.types import Block, BlockHeader, Log
+from core.chains.types import Block, BlockHeader, Log, SolanaBlock
 
 
 @runtime_checkable
@@ -21,3 +21,14 @@ class ChainAdapter(Protocol):
     def subscribe_heads(self) -> AsyncIterator[BlockHeader]: ...
     # NOTE: subscribe_heads is a regular (non-async) function returning an
     # AsyncIterator. Callers iterate with `async for`; do NOT `await` the call.
+
+
+@runtime_checkable
+class SolanaChainAdapter(Protocol):
+    chain_id: str
+
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def get_latest_slot(self) -> int: ...
+    async def fetch_block(self, slot: int) -> SolanaBlock | None: ...
+    def subscribe_heads(self) -> AsyncIterator[int]: ...

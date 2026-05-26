@@ -28,6 +28,11 @@ class Notifier:
     per-instance limit here IS the per-chain limit. Do not share a single `Notifier`
     across chains; that would conflate the two budgets.
 
+    The semaphore is built lazily on the first `_send_one` call so it binds to
+    the running loop. Constructing a `Notifier` outside a running loop (e.g.
+    inside a sync fixture body) used to crash at first `send` with
+    `RuntimeError: ... bound to a different event loop`.
+
     Failures in one channel do not block sibling channels — each `send` is wrapped
     to log-and-continue, and `asyncio.gather(..., return_exceptions=True)` is used
     defensively so a bug *outside* the `try` in `_send_one` cannot cancel siblings.
@@ -40,8 +45,14 @@ class Notifier:
         max_concurrency: int = 50,
     ) -> None:
         self._factory = channel_factory
-        self._sem = asyncio.Semaphore(max_concurrency)
+        self._max_concurrency = max_concurrency
+        self._sem: asyncio.Semaphore | None = None
         self._channels: dict[str, Channel] = {}
+
+    def _get_sem(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._max_concurrency)
+        return self._sem
 
     async def start(self, channels: Sequence[SnapshotChannel]) -> None:
         for cfg in channels:
@@ -82,7 +93,7 @@ class Notifier:
     async def _send_one(
         self, ch: Channel, payload: dict[str, Any], subscription_id: str, channel_id: str
     ) -> None:
-        async with self._sem:
+        async with self._get_sem():
             try:
                 await ch.send(payload)
             except Exception:  # noqa: BLE001 — log-only per spec §9

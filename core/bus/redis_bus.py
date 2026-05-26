@@ -22,6 +22,11 @@ class RedisBus:
             await self._client.aclose()
             self._client = None
 
+    @property
+    def client(self) -> aioredis.Redis:
+        assert self._client is not None, "RedisBus.connect() must be called first"
+        return self._client
+
     async def ping(self) -> bool:
         """Return True if Redis is reachable. Used by the web `/healthz` route
         (Chunk 9 Task 9.1). Swallows exceptions and returns False on failure

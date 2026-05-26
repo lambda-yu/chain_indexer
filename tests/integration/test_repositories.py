@@ -1,7 +1,8 @@
 import pytest
 
-from core.config.models import ChainKind, ChannelType, MatchKind
+from core.config.models import AbiKind, ChainKind, ChannelType, MatchKind
 from core.config.repositories import (
+    AbiRepo,
     ChainRepo,
     ChannelRepo,
     CheckpointRepo,
@@ -128,3 +129,59 @@ async def test_load_snapshot_round_trip(db) -> None:
     assert snap.subscriptions[0].arg_filters == {"to": "0xabc"}
     assert len(snap.channels) == 1
     assert snap.channels[0].type == "http"
+
+
+_ERC20_TRANSFER_EVENT = {
+    "name": "Transfer", "type": "event", "inputs": [
+        {"name": "from", "type": "address", "indexed": True},
+        {"name": "to",   "type": "address", "indexed": True},
+        {"name": "value","type": "uint256", "indexed": False},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_abi_repo_create_get_list(db) -> None:
+    """Sanity check that M1's create/get/list_all still work — guards against
+    any accidental signature drift introduced by the delete patch."""
+    async with db.session() as s:
+        row = await AbiRepo(s).create(
+            name="erc20", kind=AbiKind.evm_abi, body=[_ERC20_TRANSFER_EVENT],
+        )
+        await s.commit()
+        abi_id = row.id
+        assert abi_id
+
+    async with db.session() as s:
+        got = await AbiRepo(s).get(abi_id)
+        assert got is not None
+        assert got.name == "erc20"
+        assert got.kind == AbiKind.evm_abi
+        rows = await AbiRepo(s).list_all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_abi_repo_delete_removes_row(db) -> None:
+    async with db.session() as s:
+        row = await AbiRepo(s).create(
+            name="erc20", kind=AbiKind.evm_abi, body=[_ERC20_TRANSFER_EVENT],
+        )
+        await s.commit()
+        abi_id = row.id
+
+    async with db.session() as s:
+        await AbiRepo(s).delete(abi_id)
+        await s.commit()
+
+    async with db.session() as s:
+        assert await AbiRepo(s).get(abi_id) is None
+
+
+@pytest.mark.asyncio
+async def test_abi_repo_delete_unknown_id_is_noop(db) -> None:
+    """delete() on a non-existent id must NOT raise — the router layer is
+    responsible for 404 surfacing (Task 2.3 does a get-first guard)."""
+    async with db.session() as s:
+        await AbiRepo(s).delete("no-such-id")
+        await s.commit()

@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config.repositories import (
+    AbiRepo,
     ChainRepo,
     ConfigVersionRepo,
     SubscriptionRepo,
@@ -42,6 +43,15 @@ class SnapshotChain:
     rpc_ws: str | None
     confirmations: int
     poll_interval_ms: int
+    commitment: str | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotAbi:
+    id: str
+    name: str
+    kind: str
+    body: dict[str, Any] | list[Any]
 
 
 @dataclass(frozen=True)
@@ -52,6 +62,7 @@ class ConfigSnapshot:
     subscriptions: list[SnapshotSubscription]
     channels: list[SnapshotChannel]
     chains: list[SnapshotChain] = field(default_factory=list)
+    abis: list[SnapshotAbi] = field(default_factory=list)
 
     def subscriptions_for_chain(self, chain_id: str) -> list[SnapshotSubscription]:
         return [s for s in self.subscriptions if s.chain_id == chain_id and s.enabled]
@@ -62,11 +73,18 @@ class ConfigSnapshot:
         by_id = {c.id: c for c in self.channels}
         return [by_id[cid] for cid in sub.channel_ids if cid in by_id]
 
+    def abi_by_id(self, abi_id: str) -> SnapshotAbi | None:
+        for a in self.abis:
+            if a.id == abi_id:
+                return a
+        return None
+
 
 async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
     """Build a ConfigSnapshot from the database in a single transaction."""
     version = await ConfigVersionRepo(session).get()
     chains_rows = await ChainRepo(session).list_enabled()
+    abi_rows = await AbiRepo(session).list_all()
     sub_bindings = await SubscriptionRepo(session).list_enabled_with_channels()
 
     snap_chains = [
@@ -77,8 +95,14 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
             rpc_ws=c.rpc_ws,
             confirmations=c.confirmations,
             poll_interval_ms=c.poll_interval_ms,
+            commitment=c.commitment,
         )
         for c in chains_rows
+    ]
+
+    snap_abis = [
+        SnapshotAbi(id=a.id, name=a.name, kind=a.kind.value, body=a.body)
+        for a in abi_rows
     ]
 
     snap_channels_by_id: dict[str, SnapshotChannel] = {}
@@ -109,4 +133,5 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
         subscriptions=snap_subs,
         channels=list(snap_channels_by_id.values()),
         chains=snap_chains,
+        abis=snap_abis,
     )

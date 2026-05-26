@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import structlog
 
-from core.notifier.channel import Channel, register_channel
+from core.notifier.channel import Channel
 from core.notifier.retry import RetryAbort, retry_with_backoff
 
 log = structlog.get_logger(__name__)
@@ -27,7 +27,8 @@ class HttpChannel(Channel):
 
     type = "http"
 
-    def __init__(self, *, config: dict[str, Any], base_delay: float = 1.0) -> None:
+    def __init__(self, *, config: dict[str, Any], bus: object = None, base_delay: float = 1.0) -> None:
+        del bus
         self._url: str = config["url"]
         self._method: str = config.get("method", "POST").upper()
         self._headers: dict[str, str] = dict(config.get("headers", {}))
@@ -68,6 +69,3 @@ class HttpChannel(Channel):
             raise RetryAbort(f"http {resp.status_code} from {self._url}")
         # 5xx or 408/429: raise a normal exception → retry path
         raise RuntimeError(f"http {resp.status_code} from {self._url}")
-
-
-register_channel(HttpChannel)

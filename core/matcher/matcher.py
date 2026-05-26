@@ -11,6 +11,10 @@ from core.parser.event import Event
 log = structlog.get_logger(__name__)
 
 
+def _addr_norm(s: str) -> str:
+    return s.lower() if s.startswith("0x") else s
+
+
 class Matcher:
     """Index subscriptions by `(chain_id, match_kind)` for O(1) candidate lookup.
 
@@ -44,7 +48,7 @@ class Matcher:
 
     def _matches(self, sub: SnapshotSubscription, event: Event) -> bool:
         if sub.address is not None and (
-            event.contract is None or sub.address.lower() != event.contract.lower()
+            event.contract is None or _addr_norm(sub.address) != _addr_norm(event.contract)
         ):
             return False
         if sub.match_name is not None and event.name != sub.match_name:

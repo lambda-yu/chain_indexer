@@ -36,11 +36,12 @@ class ChainRepo:
         confirmations: int,
         poll_interval_ms: int,
         enabled: bool,
+        commitment: str | None = None,
     ) -> Chain:
         c = Chain(
             id=id, kind=kind, rpc_http=rpc_http, rpc_ws=rpc_ws,
             confirmations=confirmations, poll_interval_ms=poll_interval_ms,
-            enabled=enabled,
+            enabled=enabled, commitment=commitment,
         )
         self.s.add(c)
         await self.s.flush()
@@ -176,6 +177,11 @@ class AbiRepo:
     async def list_all(self) -> list[Abi]:
         r = await self.s.execute(select(Abi))
         return list(r.scalars().all())
+
+    async def delete(self, abi_id: str) -> None:
+        a = await self.get(abi_id)
+        if a is not None:
+            await self.s.delete(a)
 
 
 class CheckpointRepo:

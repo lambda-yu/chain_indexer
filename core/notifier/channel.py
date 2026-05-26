@@ -16,6 +16,7 @@ class Channel(ABC):
     """
 
     type: ClassVar[str]
+    config_schema: ClassVar[dict[str, Any]]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -24,6 +25,10 @@ class Channel(ABC):
             raise TypeError(
                 f"{cls.__name__} must declare a `type` class attribute "
                 f"(non-empty str). Got {t!r}."
+            )
+        if not hasattr(cls, "config_schema") or not isinstance(cls.config_schema, dict):
+            raise TypeError(
+                f"{cls.__name__} must declare a `config_schema` class attribute (dict)."
             )
         register_channel(cls)
 
@@ -35,6 +40,16 @@ class Channel(ABC):
 
     @abstractmethod
     async def send(self, payload: dict[str, Any]) -> None: ...
+
+    @property
+    def _retry_config(self) -> tuple[int, float, float]:
+        cfg = getattr(self, "_config", None) or {}
+        retry = cfg.get("retry", {}) if isinstance(cfg, dict) else {}
+        return (
+            retry.get("max_attempts", 3),
+            retry.get("base_delay", 1.0),
+            retry.get("backoff_factor", 4.0),
+        )
 
 
 CHANNEL_REGISTRY: dict[str, type[Channel]] = {}

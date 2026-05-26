@@ -19,6 +19,7 @@ dependencies = [
     "solders>=0.21,<0.30",
     "base58>=2.1,<3",
     "borsh-construct>=0.1.0,<0.2",
+    "jsonschema>=4.20,<5",
 ]
 
 [project.scripts]
@@ -74,3 +75,8 @@ markers = [
     "e2e: end-to-end tests; require Foundry/Anvil and run a webhook receiver in-process",
 ]
 addopts = "-q --strict-markers"
+
+[dependency-groups]
+dev = [
+    "types-jsonschema>=4.26.0.20260518",
+]

@@ -34,9 +34,11 @@ class SolanaAdapter:
         rpc_http: str,
         commitment: str,
         poll_interval_ms: int = 2000,
+        rpc_ws: str | None = None,
     ) -> None:
         self.chain_id = chain_id
         self._rpc_url = rpc_http
+        self._rpc_ws = rpc_ws
         self._commitment = _COMMITMENT_MAP[commitment]
         self._poll_interval_s = poll_interval_ms / 1000.0
         self._client: httpx.AsyncClient | None = None
@@ -161,6 +163,11 @@ class SolanaAdapter:
         )
 
     def subscribe_heads(self) -> AsyncIterator[int]:
+        if self._rpc_ws is not None:
+            return self._ws_heads()
+        return self._poll_heads()
+
+    def _poll_heads(self) -> AsyncIterator[int]:
         async def _poll() -> AsyncIterator[int]:
             last_slot = 0
             while True:
@@ -176,3 +183,39 @@ class SolanaAdapter:
                     last_slot = current
                 await asyncio.sleep(self._poll_interval_s)
         return _poll()
+
+    def _ws_heads(self) -> AsyncIterator[int]:
+        import json as _json
+
+        import websockets
+
+        async def _gen() -> AsyncIterator[int]:
+            backoff = 1.0
+            last_slot = 0
+            while True:
+                try:
+                    async with websockets.connect(self._rpc_ws) as ws:  # type: ignore[arg-type]
+                        req = _json.dumps({
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "slotSubscribe",
+                        })
+                        await ws.send(req)
+                        backoff = 1.0
+                        async for msg in ws:
+                            data = _json.loads(msg)
+                            params = data.get("params", {})
+                            result = params.get("result", {})
+                            slot = result.get("slot")
+                            if isinstance(slot, int) and slot > last_slot:
+                                for s in range(last_slot + 1, slot + 1):
+                                    yield s
+                                last_slot = slot
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "solana_adapter.ws_disconnected",
+                        chain_id=self.chain_id,
+                        backoff_s=backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 4, 60.0)
+        return _gen()

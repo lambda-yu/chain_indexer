@@ -8,6 +8,7 @@ from typing import Any
 import structlog
 
 from core.abi.decoder import (
+    anchor_call_discriminator,
     anchor_event_discriminator,
     build_anchor_event_struct,
     decode_event,
@@ -53,6 +54,9 @@ class AbiRegistry:
         # Anchor IDL: (program_id, disc_hex) → (abi_id, event_name, struct)
         self._anchor_index: dict[tuple[str, str], tuple[str, str, Any]] = {}
         self._anchor_cache: dict[tuple[str, str], tuple[str, Any] | None] = {}
+        # Anchor call index: (program_id, call_disc_hex) → (abi_id, fn_name, struct)
+        self._anchor_call_index: dict[tuple[str, str], tuple[str, str, Any]] = {}
+        self._anchor_call_cache: dict[tuple[str, str], tuple[str, Any] | None] = {}
 
     def refresh(self, snap: ConfigSnapshot) -> None:
         new_abis: dict[str, SnapshotAbi] = {a.id: a for a in snap.abis}
@@ -73,6 +77,8 @@ class AbiRegistry:
         self._selector_cache.clear()
         self._rebuild_anchor_index()
         self._anchor_cache.clear()
+        self._rebuild_anchor_call_index()
+        self._anchor_call_cache.clear()
         log.info("abi_registry.refreshed", count=len(new_abis))
 
     def _evict(self, abi_id: str) -> None:
@@ -179,7 +185,7 @@ class AbiRegistry:
                 continue
             for ev in body.get("events", []):
                 name = ev.get("name", "")
-                struct = build_anchor_event_struct(ev)
+                struct = build_anchor_event_struct(ev, types_section=body.get("types", []))
                 if struct is None:
                     log.info("abi_registry.idl_event_unsupported_types", abi_id=abi_id, event_name=name)
                     continue
@@ -204,6 +210,47 @@ class AbiRegistry:
         _abi_id, event_name, struct = entry
         result = (event_name, struct)
         self._anchor_cache[key] = result
+        return result
+
+    def _rebuild_anchor_call_index(self) -> None:
+        idx: dict[tuple[str, str], tuple[str, str, Any]] = {}
+        for abi_id, abi in self._abis.items():
+            if abi.kind != "solana_idl":
+                continue
+            body = abi.body if isinstance(abi.body, dict) else {}
+            program_id = body.get("metadata", {}).get("address")
+            if not program_id:
+                continue
+            types_section = body.get("types", [])
+            for ix_def in body.get("instructions", []):
+                name = ix_def.get("name", "")
+                args = ix_def.get("args", ix_def.get("fields", []))
+                pseudo_event = {"name": name, "fields": args}
+                struct = build_anchor_event_struct(pseudo_event, types_section=types_section)
+                if struct is None:
+                    log.info("abi_registry.idl_call_unsupported_types", abi_id=abi_id, fn_name=name)
+                    continue
+                disc = anchor_call_discriminator(name).hex()
+                key = (program_id, disc)
+                if key in idx:
+                    log.warning("abi_registry.anchor_call_disc_collision", key=key, second_abi=abi_id)
+                    continue
+                idx[key] = (abi_id, name, struct)
+        self._anchor_call_index = idx
+
+    def lookup_idl_call_by_discriminator(
+        self, program_id: str, discriminator_hex: str,
+    ) -> tuple[str, Any] | None:
+        key = (program_id, discriminator_hex)
+        cached = self._anchor_call_cache.get(key)
+        if cached is not None:
+            return cached
+        entry = self._anchor_call_index.get(key)
+        if entry is None:
+            return None
+        _abi_id, fn_name, struct = entry
+        result = (fn_name, struct)
+        self._anchor_call_cache[key] = result
         return result
 
     def get_body(self, abi_id: str) -> dict[str, Any] | list[Any]:

@@ -13,6 +13,7 @@ from core.parser.event import Event
 
 class _CollectingChannel(Channel):
     type = "collect-notifier"
+    config_schema: dict = {}
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -92,6 +93,7 @@ async def test_dispatch_sends_payload_to_each_channel() -> None:
 async def test_one_channel_failure_does_not_block_others() -> None:
     class _Bad(Channel):
         type = "bad"
+        config_schema: dict = {}
 
         async def start(self) -> None: ...
         async def stop(self) -> None: ...
@@ -126,6 +128,7 @@ async def test_semaphore_caps_concurrent_sends() -> None:
 
     class _Slow(Channel):
         type = "slow"
+        config_schema: dict = {}
 
         async def start(self) -> None: ...
         async def stop(self) -> None: ...

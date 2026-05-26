@@ -9,6 +9,7 @@ from apps.web.schemas import ChannelCreate, ChannelOut
 from core.bus.redis_bus import RedisBus
 from core.config.models import ChannelType
 from core.config.repositories import ChannelRepo
+from core.notifier.channel import CHANNEL_REGISTRY
 
 router = APIRouter(prefix="/api/channels", tags=["channels"])
 
@@ -19,6 +20,13 @@ async def create_channel(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     bus: RedisBus = Depends(get_bus),  # noqa: B008
 ) -> ChannelOut:
+    cls = CHANNEL_REGISTRY.get(payload.type)
+    if cls is not None and hasattr(cls, "config_schema"):
+        import jsonschema
+        try:
+            jsonschema.validate(payload.config, cls.config_schema)
+        except jsonschema.ValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc.message)) from exc
     row = await ChannelRepo(session).create(
         name=payload.name,
         type=ChannelType(payload.type),

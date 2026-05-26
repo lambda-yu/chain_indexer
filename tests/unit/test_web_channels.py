@@ -60,7 +60,7 @@ def test_list_channels(db: Database) -> None:
     bus = _FakeBus()
     with _client(db, bus) as c:
         c.post("/api/channels", json={"name": "a", "type": "http", "config": {"url": "x"}})
-        c.post("/api/channels", json={"name": "b", "type": "mq",   "config": {"driver": "rabbitmq", "url": "amqp://"}})
+        c.post("/api/channels", json={"name": "b", "type": "mq",   "config": {"stream": "events"}})
         r = c.get("/api/channels")
     assert r.status_code == 200
     names = sorted(x["name"] for x in r.json())

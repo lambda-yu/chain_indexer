@@ -42,6 +42,7 @@ def _default_adapter_factory(cfg: SnapshotChain) -> EvmAdapter | SolanaAdapter:
             rpc_http=cfg.rpc_http,
             commitment=cfg.commitment,
             poll_interval_ms=cfg.poll_interval_ms,
+            rpc_ws=cfg.rpc_ws,
         )
     raise NotImplementedError(f"chain kind {cfg.kind!r} not supported")
 

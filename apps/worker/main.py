@@ -8,6 +8,7 @@ import structlog
 
 from apps.worker.chain_runner import ChainRunner
 from apps.worker.config_watcher import ConfigWatcher
+from core.abi.registry import AbiRegistry
 from core.bus.redis_bus import RedisBus
 from core.chains.evm import EvmAdapter
 from core.config.db import Database
@@ -78,6 +79,7 @@ class _Worker:
         self._db = Database(settings.database.url, echo=settings.database.echo)
         self._bus = RedisBus(url=settings.redis.url)
         self._checkpoint_adapter = _CheckpointAdapter(self._db)
+        self._registry = AbiRegistry()
         self._snap_queue: asyncio.Queue[ConfigSnapshot] = asyncio.Queue(maxsize=8)
         self._watcher: ConfigWatcher | None = None
         self._runners: dict[str, tuple[ChainRunner, asyncio.Task[None]]] = {}
@@ -130,6 +132,7 @@ class _Worker:
                     t.cancel()
 
     async def _reconcile(self, snap: ConfigSnapshot) -> None:
+        self._registry.refresh(snap)
         enabled = {c.id: c for c in snap.chains}
         for chain_id in list(self._runners):
             if chain_id not in enabled:
@@ -144,6 +147,7 @@ class _Worker:
                     adapter_factory=_default_adapter_factory,
                     channel_factory=_default_channel_factory,
                     checkpoint_repo=self._checkpoint_adapter,
+                    abi_registry=self._registry,
                 )
                 await runner.start(snap)
                 task = asyncio.create_task(runner.run(), name=f"chain-runner:{chain_id}")

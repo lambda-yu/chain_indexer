@@ -177,6 +177,11 @@ class AbiRepo:
         r = await self.s.execute(select(Abi))
         return list(r.scalars().all())
 
+    async def delete(self, abi_id: str) -> None:
+        a = await self.get(abi_id)
+        if a is not None:
+            await self.s.delete(a)
+
 
 class CheckpointRepo:
     def __init__(self, session: AsyncSession) -> None:

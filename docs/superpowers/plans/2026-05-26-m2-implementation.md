@@ -4253,3 +4253,330 @@ Expected: clean.
 
 ---
 
+## Chunk 6: `Channel.__init_subclass__` enforcement
+
+Closes spec §4.3. M1 already has the `Channel` ABC with `type: ClassVar[str]` declared and a `register_channel(cls)` function that raises on duplicate-type registrations from different classes (`core/notifier/channel.py:30`). The remaining seam is that subclasses can be defined without ever calling `register_channel` (it's a separate, explicit call at module bottom in `core/notifier/http.py:73`), and the omission only surfaces when the worker first tries to instantiate the missing channel type. Chunk 6 closes that hole with an `__init_subclass__` hook that:
+
+1. **Guards `type`** — refuses any subclass that doesn't declare `type: str` as a non-empty class attribute.
+2. **Auto-registers** — calls `register_channel(cls)` at class-definition time so a forgotten registration becomes impossible.
+
+This is the last bit of plumbing that lets chunks 7 (`RedisStreamsChannel`) and 8 (`WebSocketChannel`) be added simply by defining the subclass — the registration is automatic and the worker's existing `_channel_factory` lookup (`apps/worker/main.py`'s `_default_channel_factory` → `CHANNEL_REGISTRY[snap.type]`) wires them up.
+
+**Spec §4.3 scope:**
+- Add `Channel.__init_subclass__` that enforces `type: str` declaration AND calls `register_channel(cls)` automatically.
+- Keep `register_channel` callable for explicit registration in tests (idempotent on same-class re-registration — unchanged behaviour).
+- Drop the now-redundant explicit `register_channel(HttpChannel)` call at `core/notifier/http.py:73`.
+- Update `tests/unit/test_channel_registry.py` to reflect the new semantics: duplicate-type detection now fires at **class-definition time**, not at the explicit-`register_channel`-call time.
+
+**Why a preparatory rename first (Task 6.1):**
+Two M1 test files both define an in-test `class _CollectingChannel(Channel)` with `type = "collect"`:
+- `tests/unit/test_notifier.py:14`
+- `tests/unit/test_chain_runner.py:53`
+
+Today this is harmless because neither class is registered. The instant `__init_subclass__` auto-registers, the second import to load will raise `ValueError: channel type 'collect' already registered`, breaking every test in the second-loaded file. The first task disambiguates the two `type` strings — a pure no-op cleanup commit that unblocks the rest of the chunk.
+
+**Modified files this chunk:**
+- `core/notifier/channel.py` — add `__init_subclass__`.
+- `core/notifier/http.py` — drop the explicit `register_channel(HttpChannel)` line.
+- `tests/unit/test_notifier.py` — rename `_CollectingChannel.type` to `"collect-notifier"`.
+- `tests/unit/test_chain_runner.py` — rename `_CollectingChannel.type` to `"collect-runner"` (and update the `SnapshotChannel(type=...)` literal in the same file).
+- `tests/unit/test_channel_registry.py` — rewrite tests to reflect class-definition-time duplicate detection.
+
+**Out of scope this chunk:**
+- New channel implementations — those are chunks 7 (`RedisStreamsChannel`) and 8 (`WebSocketChannel`).
+- Channel config-shape validation — channels still trust their `config: dict[str, Any]` blob at construction; per-channel JSON-schema validation is M3+ territory.
+- Cleanup of `CHANNEL_REGISTRY` after test runs — tests that need a clean registry use a local `del CHANNEL_REGISTRY[type]` teardown; a global autouse fixture would silently mask leaks.
+
+**Note on indirect subclasses:** Because `__init_subclass__` fires on every subclass — direct or indirect — defining `class CustomHttpChannel(HttpChannel)` without changing `type` will raise `ValueError` (the inherited `type = "http"` collides with `HttpChannel`'s own registration). Intentional: there is no use case in M2 for two `Channel` classes sharing a `type` string. Subclasses meant to extend behaviour must override `type`.
+
+### Task 6.1: Preparatory — disambiguate test `_CollectingChannel.type`
+
+The two test files defining `_CollectingChannel(Channel)` with the same `type = "collect"` will conflict the moment `__init_subclass__` auto-registers. Rename each to a globally unique string up front so this commit is purely mechanical and the next task's behaviour change is the only delta.
+
+**Files:**
+- Modify: `tests/unit/test_notifier.py:15` (the `_CollectingChannel.type = "collect"` line)
+- Modify: `tests/unit/test_chain_runner.py:54` (the `_CollectingChannel.type = "collect"` line) **and** `tests/unit/test_chain_runner.py:50` (the `SnapshotChannel(..., type="collect", ...)` literal in the `_ch(id_: str)` helper)
+
+- [ ] **Step 1: Rename in `tests/unit/test_notifier.py`**
+
+Change:
+
+```python
+class _CollectingChannel(Channel):
+    type = "collect"
+```
+
+to:
+
+```python
+class _CollectingChannel(Channel):
+    type = "collect-notifier"
+```
+
+(`test_notifier.py` constructs `_CollectingChannel()` directly inside the test bodies. It doesn't go through `CHANNEL_REGISTRY` lookup. The `type` string is only ever consulted by `register_channel`; the rename has no behavioural side-effects today.)
+
+- [ ] **Step 2: Rename in `tests/unit/test_chain_runner.py`**
+
+Change the class:
+
+```python
+class _CollectingChannel(Channel):
+    type = "collect"
+```
+
+to:
+
+```python
+class _CollectingChannel(Channel):
+    type = "collect-runner"
+```
+
+And update the `_ch` helper at line ~50:
+
+```python
+def _ch(id_: str) -> SnapshotChannel:
+    return SnapshotChannel(id=id_, name="hook", type="collect", config={})
+```
+
+to:
+
+```python
+def _ch(id_: str) -> SnapshotChannel:
+    return SnapshotChannel(id=id_, name="hook", type="collect-runner", config={})
+```
+
+(The `SnapshotChannel.type` field carries the string used by the worker's channel factory to look up the registered class. Since `test_chain_runner.py` injects `channel_factory=lambda _cfg: _CollectingChannel()` directly into the runner constructor, the type string in the snapshot is metadata-only and any unique string works. But keeping the two consistent within the file improves readability.)
+
+- [ ] **Step 3: Run, expect PASS**
+
+Run: `pytest tests/unit/test_notifier.py tests/unit/test_chain_runner.py -v`
+Expected: both files pass — no behaviour change, just a string rename.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tests/unit/test_notifier.py tests/unit/test_chain_runner.py
+git commit -m "test(notifier): disambiguate _CollectingChannel types for upcoming auto-register"
+```
+
+### Task 6.2: Add `Channel.__init_subclass__` (type check + auto-register)
+
+The new hook does two things: (a) refuses subclasses without a non-empty `type: str` attribute, (b) calls `register_channel(cls)` automatically. The existing `register_channel` is unchanged — it stays callable in tests and is idempotent on same-class re-registration. The duplicate detection logic is unchanged; it just gets exercised one frame earlier (at `class` block execution, not at explicit-call time).
+
+**Files:**
+- Modify: `core/notifier/channel.py`
+- Rewrite: `tests/unit/test_channel_registry.py`
+
+- [ ] **Step 1: Rewrite `tests/unit/test_channel_registry.py` with the new contract**
+
+Replace the file contents:
+
+```python
+# tests/unit/test_channel_registry.py
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from core.notifier.channel import CHANNEL_REGISTRY, Channel, register_channel
+
+
+# At module load this auto-registers because of __init_subclass__.
+class _FakeChannel(Channel):
+    type = "fake"
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    async def send(self, payload: dict[str, Any]) -> None: ...
+
+
+def test_subclass_with_type_auto_registers_at_class_definition() -> None:
+    """Defining a Channel subclass with a `type` attribute registers it
+    automatically — no explicit `register_channel(cls)` call needed."""
+    assert CHANNEL_REGISTRY["fake"] is _FakeChannel
+
+
+def test_subclass_without_type_attr_raises_type_error() -> None:
+    """A Channel subclass that forgets to declare `type` is a programming
+    error — surfaced at class-definition time, not at first-use time."""
+    with pytest.raises(TypeError, match="must declare a `type` class attribute"):
+        class _Missing(Channel):  # noqa: N801 — intentional missing-type repro
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            async def send(self, payload: dict[str, Any]) -> None: ...
+
+
+def test_subclass_with_empty_type_raises_type_error() -> None:
+    """An empty `type` string is functionally equivalent to a missing one and
+    must also be refused."""
+    with pytest.raises(TypeError, match="must declare a `type` class attribute"):
+        class _Empty(Channel):
+            type = ""
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            async def send(self, payload: dict[str, Any]) -> None: ...
+
+
+def test_subclass_with_duplicate_type_raises_at_class_definition() -> None:
+    """Defining a SECOND Channel subclass with a type already in the registry
+    raises immediately — before any code attempts to use the duplicate."""
+    with pytest.raises(ValueError, match="already registered"):
+        class _Dup(Channel):
+            type = "fake"  # collides with _FakeChannel above
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            async def send(self, payload: dict[str, Any]) -> None: ...
+
+
+def test_explicit_register_channel_remains_idempotent_for_same_class() -> None:
+    """`register_channel(cls)` on a class that's already auto-registered with
+    the SAME class object is a no-op. This is the path tests use when they
+    need an explicit registration call for clarity."""
+    register_channel(_FakeChannel)
+    register_channel(_FakeChannel)  # second call must not raise
+    assert CHANNEL_REGISTRY["fake"] is _FakeChannel
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_channel_registry.py -v`
+Expected: at least three failures —
+- `test_subclass_with_type_auto_registers_at_class_definition` fails: `_FakeChannel` isn't in `CHANNEL_REGISTRY` (no auto-register yet).
+- `test_subclass_without_type_attr_raises_type_error` fails: the class block executes successfully (no TypeError raised).
+- `test_subclass_with_empty_type_raises_type_error` fails: same reason.
+- `test_subclass_with_duplicate_type_raises_at_class_definition` fails: the duplicate class block doesn't raise (the M1 duplicate check fires only at explicit `register_channel`).
+
+- [ ] **Step 3: Add `__init_subclass__` to `Channel`**
+
+Edit `core/notifier/channel.py`. Insert the hook into the `Channel` class body, after the `type: ClassVar[str]` declaration and before the abstract methods:
+
+```python
+class Channel(ABC):
+    """Abstract base for a notification channel driver.
+
+    Lifecycle: `start()` → many `send()` → `stop()`. Implementations should be
+    safe to construct from a `SnapshotChannel.config` dict; the worker calls
+    `start()` once on first use per chain pipeline.
+
+    Subclasses must declare a non-empty `type: ClassVar[str]` and are
+    auto-registered in `CHANNEL_REGISTRY` at class-definition time.
+    """
+
+    type: ClassVar[str]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        t = getattr(cls, "type", None)
+        if not isinstance(t, str) or not t:
+            raise TypeError(
+                f"{cls.__name__} must declare a `type` class attribute "
+                f"(non-empty str). Got {t!r}."
+            )
+        register_channel(cls)
+
+    @abstractmethod
+    async def start(self) -> None: ...
+
+    @abstractmethod
+    async def stop(self) -> None: ...
+
+    @abstractmethod
+    async def send(self, payload: dict[str, Any]) -> None: ...
+```
+
+Note on ordering: `register_channel` is defined **below** the `Channel` class in `channel.py`. That's fine — `__init_subclass__` references `register_channel` by name in its function body, not at class-definition time. The first `__init_subclass__` invocation happens when a subclass is defined (e.g. `HttpChannel`), which is in a different module imported after `channel.py` finishes loading. By then `register_channel` is a resolvable global.
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_channel_registry.py -v`
+Expected: all 5 PASS.
+
+- [ ] **Step 5: Full suite regression sweep**
+
+Run: `pytest tests/ -v`
+Expected: no failures introduced. Specifically:
+- `test_notifier.py` still passes (`_CollectingChannel.type = "collect-notifier"` from Task 6.1 auto-registers cleanly).
+- `test_chain_runner.py` still passes (`_CollectingChannel.type = "collect-runner"` from Task 6.1 auto-registers cleanly).
+- `HttpChannel` is still in `CHANNEL_REGISTRY["http"]` (auto-registered by `__init_subclass__`; the explicit `register_channel(HttpChannel)` at `http.py:73` is now a no-op).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/notifier/channel.py tests/unit/test_channel_registry.py
+git commit -m "feat(notifier): Channel.__init_subclass__ enforces type attr and auto-registers"
+```
+
+### Task 6.3: Drop the now-redundant `register_channel(HttpChannel)` call
+
+With auto-registration in place, the explicit call at `core/notifier/http.py:73` is no-op-on-same-class — safe to delete. Removing it is the canonical way to demonstrate the new contract for chunks 7 / 8: define the subclass, and registration is done.
+
+**Files:**
+- Modify: `core/notifier/http.py:73`
+
+- [ ] **Step 1: Append a regression test**
+
+Append to `tests/unit/test_channel_registry.py`:
+
+```python
+def test_http_channel_remains_registered_without_explicit_call() -> None:
+    """Regression seal for Task 6.3: removing the explicit
+    `register_channel(HttpChannel)` from `core/notifier/http.py` must
+    not break the registry — __init_subclass__ covers it."""
+    from core.notifier.http import HttpChannel
+    assert CHANNEL_REGISTRY["http"] is HttpChannel
+```
+
+- [ ] **Step 2: Run, expect PASS even before removal**
+
+Run: `pytest tests/unit/test_channel_registry.py::test_http_channel_remains_registered_without_explicit_call -v`
+Expected: PASS — because `register_channel(HttpChannel)` is idempotent on same class, both the explicit call and `__init_subclass__` set the same entry. This is the "test passes both before and after the change" pattern; the value is the regression seal.
+
+- [ ] **Step 3: Delete the explicit call**
+
+Edit `core/notifier/http.py`. Remove the trailing line:
+
+```python
+register_channel(HttpChannel)
+```
+
+Also drop the now-unused `register_channel` from the import at the top:
+
+```python
+from core.notifier.channel import Channel, register_channel
+```
+
+→
+
+```python
+from core.notifier.channel import Channel
+```
+
+(If `register_channel` is referenced elsewhere in `http.py`, leave the import. Check with `grep -n register_channel core/notifier/http.py` first — expected: zero remaining references after the deletion.)
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_channel_registry.py -v && pytest tests/unit/test_notifier.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/notifier/http.py tests/unit/test_channel_registry.py
+git commit -m "refactor(notifier): drop explicit register_channel(HttpChannel) — __init_subclass__ covers it"
+```
+
+### Task 6.4: Chunk 6 close-out
+
+- [ ] **Step 1: Run the full test suite**
+
+Run: `pytest tests/ -v`
+Expected: all M1 + chunks 1-6 tests pass.
+
+- [ ] **Step 2: Lint / type check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+---
+

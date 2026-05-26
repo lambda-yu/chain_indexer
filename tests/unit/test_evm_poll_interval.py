@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -60,10 +61,8 @@ async def test_poll_interval_ms_is_respected() -> None:
             await orig_sleep(0.01)
         finally:
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
                 await task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
     finally:
         evm_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
 

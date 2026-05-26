@@ -2153,3 +2153,458 @@ Expected: clean.
 
 ---
 
+## Chunk 3: `Erc20TransferParser`
+
+Decodes standard ERC-20 `Transfer(address,address,uint256)` logs into `kind="token_transfer"` events and wires the parser into every EVM `ChainRunner` pipeline.
+
+**Spec §4.2 / §8 chunk 3 scope:**
+- New parser `core/parser/erc20.py` that walks `block.logs`, matches the canonical ERC-20 Transfer topic0, decodes the two indexed address topics and the uint256 data, and emits a `token_transfer` `Event`.
+- The signature is fixed — **no `AbiRegistry` dependency** (unlike `AbiEventParser` in chunk 4). This keeps the parser cheap and lets every EVM chain consume it unconditionally.
+- ERC-721 reuses the same event name and types (`Transfer(address,address,uint256)`) but with **all three args indexed**, so the topic count differs: ERC-20 = 3 topics (topic0 + 2 indexed), ERC-721 = 4 topics (topic0 + 3 indexed). The parser uses topic count as the discriminator and skips ERC-721 silently.
+- Add it to the `ChainRunner._pipeline` constructor alongside the existing `NativeTransferParser`.
+
+**New files this chunk:**
+- `core/parser/erc20.py`
+- `tests/unit/test_erc20_parser.py`
+
+**Modified files this chunk:**
+- `apps/worker/chain_runner.py` — extend `_pipeline` list with `Erc20TransferParser`.
+- `tests/unit/test_chain_runner.py` — extend with one test asserting ERC-20 logs in a block produce a dispatched payload.
+
+**Out of scope this chunk:**
+- AbiEventParser / EventKind rename — chunk 4.
+- The `value` decimal-string convention follows `NativeTransferParser` (Event.args §5.2). No change to `Event.args` shape.
+- `arg_filters` validation tightening — chunk 9.
+
+**Constants:**
+- ERC-20 Transfer topic0 = keccak256("Transfer(address,address,uint256)") = `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`. The plan hard-codes this hex value rather than computing it at import time so import-side failures (no eth-utils, etc.) can't break the parser.
+
+### Task 3.1: `Erc20TransferParser` core decode
+
+**Files:**
+- Create: `core/parser/erc20.py`
+- Test: `tests/unit/test_erc20_parser.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_erc20_parser.py
+from __future__ import annotations
+
+from core.chains.types import Block, BlockHeader, Log, Tx
+from core.parser.erc20 import (
+    ERC20_TRANSFER_TOPIC0,
+    Erc20TransferParser,
+)
+
+
+_ZERO_ADDR_PAD = "0" * 24   # left-padding for 20-byte address → 32-byte topic
+_FROM = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_TO   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_TOKEN_ADDR = "0xcafe000000000000000000000000000000000000"
+
+
+def _hdr(n: int = 10) -> BlockHeader:
+    return BlockHeader(number=n, hash=f"0xh{n}", parent_hash=f"0xh{n-1}", timestamp=1700000000)
+
+
+def _erc20_log(
+    *,
+    tx_hash: str = "0xt1",
+    log_index: int = 0,
+    address: str = _TOKEN_ADDR,
+    topic0: str = ERC20_TRANSFER_TOPIC0,
+    from_addr_hex: str = _FROM,
+    to_addr_hex: str = _TO,
+    value_hex: str | None = "0x" + ("0" * 62) + "7b",  # uint256(123)
+) -> Log:
+    """Build a synthetic ERC-20 Transfer log. `value_hex=None` → empty data."""
+    topics = [
+        topic0,
+        "0x" + _ZERO_ADDR_PAD + from_addr_hex,
+        "0x" + _ZERO_ADDR_PAD + to_addr_hex,
+    ]
+    return Log(
+        tx_hash=tx_hash,
+        log_index=log_index,
+        address=address,
+        topics=topics,
+        data=value_hex if value_hex is not None else "0x",
+    )
+
+
+def _block(logs: list[Log]) -> Block:
+    return Block(
+        header=_hdr(10),
+        txs=[
+            Tx(hash="0xt1", index=0, from_addr="0xf0", to_addr=_TOKEN_ADDR,
+               value=0, input="0xa9059cbb", status=1),
+        ],
+        logs=logs,
+    )
+
+
+def test_decodes_one_erc20_transfer_log() -> None:
+    p = Erc20TransferParser(chain_id="eth-mainnet")
+    blk = _block([_erc20_log()])
+    events = list(p.parse(blk))
+    assert len(events) == 1
+    e = events[0]
+    assert e.chain_id == "eth-mainnet"
+    assert e.kind == "token_transfer"
+    assert e.block_number == 10
+    assert e.block_hash == "0xh10"
+    assert e.tx_hash == "0xt1"
+    assert e.tx_index == 0
+    assert e.log_index == 0
+    assert e.contract == _TOKEN_ADDR
+    assert e.name == "Transfer"
+    assert e.args == {
+        "from":  "0x" + _FROM,
+        "to":    "0x" + _TO,
+        "value": "123",
+    }
+
+
+def test_emits_one_event_per_matching_log() -> None:
+    p = Erc20TransferParser(chain_id="eth-mainnet")
+    blk = _block([
+        _erc20_log(log_index=0, value_hex="0x" + "0" * 63 + "1"),
+        _erc20_log(log_index=1, value_hex="0x" + "0" * 62 + "0a"),  # 10
+    ])
+    events = list(p.parse(blk))
+    assert [e.log_index for e in events] == [0, 1]
+    assert [e.args["value"] for e in events] == ["1", "10"]
+
+
+def test_skips_logs_with_non_transfer_topic0() -> None:
+    other_topic0 = "0x" + "de" * 32
+    p = Erc20TransferParser(chain_id="eth-mainnet")
+    blk = _block([_erc20_log(topic0=other_topic0)])
+    assert list(p.parse(blk)) == []
+
+
+def test_skips_erc721_transfers_by_topic_count() -> None:
+    """ERC-721 uses the same name+types but indexes ALL THREE args (incl. tokenId),
+    producing 4 topics instead of ERC-20's 3. The parser must skip them — emitting
+    a `token_transfer` with `value` actually being a tokenId would be semantically
+    wrong and would corrupt downstream consumers.
+    """
+    log_721 = Log(
+        tx_hash="0xt1", log_index=0, address=_TOKEN_ADDR,
+        topics=[
+            ERC20_TRANSFER_TOPIC0,
+            "0x" + _ZERO_ADDR_PAD + _FROM,
+            "0x" + _ZERO_ADDR_PAD + _TO,
+            "0x" + "0" * 62 + "07",  # tokenId = 7
+        ],
+        data="0x",
+    )
+    p = Erc20TransferParser(chain_id="eth-mainnet")
+    blk = _block([log_721])
+    assert list(p.parse(blk)) == []
+
+
+def test_skips_logs_with_malformed_data_and_continues() -> None:
+    """A log whose `data` is shorter than 32 bytes can't carry a uint256 value.
+    The parser must skip it (with a structured log emission) and process the
+    remaining valid logs in the same block.
+    """
+    bad = _erc20_log(log_index=0, value_hex="0xdead")  # 2 bytes < 32
+    good = _erc20_log(log_index=1)  # standard 123
+    p = Erc20TransferParser(chain_id="eth-mainnet")
+    blk = _block([bad, good])
+    events = list(p.parse(blk))
+    assert len(events) == 1
+    assert events[0].log_index == 1
+    assert events[0].args["value"] == "123"
+
+
+def test_normalizes_topic_addresses_to_lowercase_0x() -> None:
+    """Even if a test fixture leaves topic addresses upper-case, the emitted
+    args.from / args.to must be 0x-lowercase to match the Event.args convention."""
+    upper_from = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    p = Erc20TransferParser(chain_id="eth-mainnet")
+    blk = _block([_erc20_log(from_addr_hex=upper_from)])
+    e = next(iter(p.parse(blk)))
+    assert e.args["from"] == "0x" + upper_from.lower()
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_erc20_parser.py -v`
+Expected: `ImportError: cannot import name 'Erc20TransferParser'`.
+
+- [ ] **Step 3: Implement `core/parser/erc20.py`**
+
+```python
+# core/parser/erc20.py
+"""ERC-20 Transfer log parser.
+
+Decodes the canonical `Transfer(address,address,uint256)` event into a
+`token_transfer` Event. No ABI lookup — the signature is fixed.
+
+ERC-721 reuses the same name/types but indexes the tokenId, giving 4 topics
+instead of 3; topic-count is the discriminator.
+
+Reverted transactions: this parser does NOT inspect tx.status, because the
+EVM only emits logs for successful txs in the first place (failed txs revert
+and their logs disappear). Defensive logic kept minimal.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import structlog
+
+from core.chains.types import Block, Log
+from core.parser.event import Event
+
+log = structlog.get_logger(__name__)
+
+
+# keccak256("Transfer(address,address,uint256)") — well-known constant.
+# Hard-coded to keep import-time dependencies minimal (no eth-utils import).
+ERC20_TRANSFER_TOPIC0 = (
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+)
+
+
+class Erc20TransferParser:
+    """Emit a token_transfer Event for each ERC-20 Transfer log in a block."""
+
+    def __init__(self, chain_id: str) -> None:
+        self._chain_id = chain_id
+
+    def parse(self, block: Block) -> Iterable[Event]:
+        h = block.header
+        for log_entry in block.logs:
+            ev = self._try_decode(log_entry, header_number=h.number,
+                                  header_hash=h.hash, header_ts=h.timestamp)
+            if ev is not None:
+                yield ev
+
+    def _try_decode(
+        self,
+        log_entry: Log,
+        *,
+        header_number: int,
+        header_hash: str,
+        header_ts: int,
+    ) -> Event | None:
+        if not log_entry.topics:
+            return None
+        if log_entry.topics[0].lower() != ERC20_TRANSFER_TOPIC0:
+            return None
+        # ERC-20 has exactly 3 topics (topic0 + 2 indexed); ERC-721 has 4.
+        if len(log_entry.topics) != 3:
+            return None
+
+        data_hex = log_entry.data.removeprefix("0x")
+        if len(data_hex) < 64:  # 32 bytes for the uint256 value
+            log.warning(
+                "erc20_parser.malformed_data",
+                tx_hash=log_entry.tx_hash,
+                log_index=log_entry.log_index,
+                data_len=len(data_hex),
+            )
+            return None
+
+        try:
+            value = int(data_hex[:64], 16)
+        except ValueError:
+            log.warning(
+                "erc20_parser.malformed_value_hex",
+                tx_hash=log_entry.tx_hash,
+                log_index=log_entry.log_index,
+            )
+            return None
+
+        return Event(
+            chain_id=self._chain_id,
+            block_number=header_number,
+            block_hash=header_hash,
+            block_timestamp=header_ts,
+            tx_hash=log_entry.tx_hash,
+            tx_index=None,  # we don't have direct tx index from Log alone
+            log_index=log_entry.log_index,
+            kind="token_transfer",
+            contract=log_entry.address.lower(),
+            name="Transfer",
+            args={
+                "from":  _addr_from_topic(log_entry.topics[1]),
+                "to":    _addr_from_topic(log_entry.topics[2]),
+                "value": str(value),
+            },
+            raw={
+                "tx_hash": log_entry.tx_hash,
+                "log_index": log_entry.log_index,
+            },
+        )
+
+
+def _addr_from_topic(topic_hex: str) -> str:
+    """A 32-byte topic encodes a 20-byte address left-padded with zeros.
+    Take the last 40 hex chars and re-add the 0x prefix; lowercase normalised."""
+    body = topic_hex.removeprefix("0x").lower()
+    if len(body) < 40:
+        return "0x" + body  # last-resort safety; let the test fixture be wrong rather than crash
+    return "0x" + body[-40:]
+```
+
+Note on `tx_index`: `Log` doesn't carry `tx_index` in M1's `core/chains/types.py:14-22`. M1's `NativeTransferParser` reads `tx.index` from `Tx`. Cross-walking `tx_index` from logs would require either (a) extending `Log` with a `tx_index` field or (b) building a `{tx_hash → tx_index}` lookup in the parser. Deferring (b) until any subscription needs `tx_index` for token transfers; the spec §5.2 marks `tx_index` as `int | None`, so `None` is contractually OK for log-derived events.
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_erc20_parser.py -v`
+Expected: 6 PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/parser/erc20.py tests/unit/test_erc20_parser.py
+git commit -m "feat(parser): Erc20TransferParser for canonical ERC-20 Transfer logs"
+```
+
+### Task 3.2: Wire `Erc20TransferParser` into `ChainRunner`
+
+Every EVM `ChainRunner` should run both `NativeTransferParser` and `Erc20TransferParser` unconditionally. The Solana split (chunk 11) will introduce a separate Solana pipeline so this list is EVM-only by then; for now the runner is single-chain-kind so the wire is straightforward.
+
+**Files:**
+- Modify: `apps/worker/chain_runner.py:75` (extend `_pipeline` list)
+- Test: extend `tests/unit/test_chain_runner.py` with an ERC-20 dispatch case.
+
+- [ ] **Step 1: Append the failing test**
+
+```python
+# tests/unit/test_chain_runner.py — append (alongside existing tests)
+from core.chains.types import Log
+from core.parser.erc20 import ERC20_TRANSFER_TOPIC0
+
+
+def _block_with_erc20_log(n: int, *, value: int = 1000) -> Block:
+    """Build a block whose single log is an ERC-20 Transfer for `value` units."""
+    pad = "0" * 24
+    _from = "aaaa" + "00" * 18
+    _to = "bbbb" + "00" * 18
+    return Block(
+        header=_hdr(n, parent=f"0xh{n-1}" if n > 0 else "0x0"),
+        txs=[
+            Tx(hash=f"0xt{n}", index=0, from_addr="0xf0", to_addr="0xtoken",
+               value=0, input="0xa9059cbb", status=1),
+        ],
+        logs=[
+            Log(
+                tx_hash=f"0xt{n}",
+                log_index=0,
+                address="0xtoken",
+                topics=[
+                    ERC20_TRANSFER_TOPIC0,
+                    "0x" + pad + _from,
+                    "0x" + pad + _to,
+                ],
+                data="0x" + format(value, "064x"),
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_erc20_token_transfer() -> None:
+    chain = _chain()
+    blocks = [_block_with_erc20_log(n, value=n * 1000) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="token_transfer")],
+        channels=[_ch("c1")],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        # Same confirmation arithmetic as the native-transfer test above.
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"token_transfer"}
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        # block 1 → 1000, block 2 → 2000
+        assert values == {"1000", "2000"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_chain_runner.py::test_chain_runner_dispatches_erc20_token_transfer -v`
+Expected: FAIL — `len(coll.calls) == 0` (the existing `_pipeline` only runs `NativeTransferParser`, which yields nothing because the test block carries no value-transferring tx).
+
+- [ ] **Step 3: Add `Erc20TransferParser` to `ChainRunner._pipeline`**
+
+Edit `apps/worker/chain_runner.py`. At the top, import:
+
+```python
+from core.parser.erc20 import Erc20TransferParser
+```
+
+Then change the `_pipeline` construction at line 75 from:
+
+```python
+        self._pipeline = ParserPipeline([NativeTransferParser(chain_id=self._chain.id)])
+```
+
+to:
+
+```python
+        self._pipeline = ParserPipeline([
+            NativeTransferParser(chain_id=self._chain.id),
+            Erc20TransferParser(chain_id=self._chain.id),
+        ])
+```
+
+Order matters for stable test output but the matcher is keyed on `(chain_id, kind)`, so the order doesn't affect routing correctness.
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_chain_runner.py -v`
+Expected: all existing native-transfer tests PASS + new ERC-20 test PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add apps/worker/chain_runner.py tests/unit/test_chain_runner.py
+git commit -m "feat(runner): wire Erc20TransferParser into the EVM pipeline"
+```
+
+### Task 3.3: Chunk 3 close-out
+
+- [ ] **Step 1: Run the full test suite**
+
+Run: `pytest tests/ -v`
+Expected: all M1 + chunk-1 + chunk-2 + chunk-3 tests pass.
+
+- [ ] **Step 2: Lint / type check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+---
+

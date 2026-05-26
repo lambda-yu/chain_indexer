@@ -10,9 +10,22 @@ class Channel(ABC):
     Lifecycle: `start()` → many `send()` → `stop()`. Implementations should be
     safe to construct from a `SnapshotChannel.config` dict; the worker calls
     `start()` once on first use per chain pipeline.
+
+    Subclasses must declare a non-empty `type: ClassVar[str]` and are
+    auto-registered in `CHANNEL_REGISTRY` at class-definition time.
     """
 
     type: ClassVar[str]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        t = getattr(cls, "type", None)
+        if not isinstance(t, str) or not t:
+            raise TypeError(
+                f"{cls.__name__} must declare a `type` class attribute "
+                f"(non-empty str). Got {t!r}."
+            )
+        register_channel(cls)
 
     @abstractmethod
     async def start(self) -> None: ...

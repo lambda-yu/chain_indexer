@@ -153,15 +153,24 @@ class _Worker:
     async def shutdown(self) -> None:
         """Trigger graceful drain per spec §9.1. Idempotent and safe to call
         after a partially-failed `start()` — `RedisBus.disconnect()` and
-        `Database.disconnect()` both guard on connection state."""
+        `Database.disconnect()` both guard on connection state.
+
+        Runner stops are issued in parallel (each runner has its own ~30s drain
+        timeout; sequential shutdown would compound to N×30s). Bus/DB
+        disconnect must happen strictly AFTER all runners stop so a runner
+        cannot publish during teardown.
+        """
         if self._stop.is_set():
             return
         self._stop.set()
         log.info("worker.shutdown_starting")
         if self._watcher is not None:
             await self._watcher.stop()
-        for chain_id in list(self._runners):
-            await self._stop_runner(chain_id)
+        if self._runners:
+            await asyncio.gather(
+                *(self._stop_runner(cid) for cid in list(self._runners)),
+                return_exceptions=False,
+            )
         await self._bus.disconnect()
         await self._db.disconnect()
         log.info("worker.shutdown_complete")

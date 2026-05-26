@@ -76,12 +76,13 @@ def _normalize_value(t: str, v: Any) -> Any:
     chunk 4 where it actually matters.
     """
     if t == "address":
-        # eth-abi returns address as a checksum-cased str.
-        return v.lower() if isinstance(v, str) else "0x" + v.hex().lower()
+        assert isinstance(v, str), f"unexpected address type: {type(v).__name__}"
+        return v.lower()
     if t.startswith(("uint", "int")) and not t.endswith("]"):
         return str(int(v))
     if t.startswith("bytes") and not t.endswith("]"):
-        return "0x" + v.hex() if isinstance(v, bytes | bytearray) else v
+        assert isinstance(v, (bytes, bytearray)), f"unexpected bytes type: {type(v).__name__}"
+        return "0x" + v.hex()
     return v
 
 
@@ -89,7 +90,11 @@ def decode_event(
     event_abi: dict[str, Any], topics: list[str], data: str
 ) -> dict[str, Any]:
     """Decode an event log per spec §5.2. Returns a `{name: value}` dict
-    aligned with `Event.args` conventions."""
+    aligned with `Event.args` conventions.
+
+    Indexed reference-type args (``string``, ``bytes``, arrays, tuples) carry
+    the 32-byte topic hash (0x-hex), not the original value — Solidity hashes
+    them into the topic and the plaintext is unrecoverable."""
     indexed, not_indexed = _split_indexed(event_abi)
     expected_topic_count = 1 + len(indexed)  # topic0 + indexed inputs
     if len(topics) != expected_topic_count:
@@ -119,7 +124,7 @@ def decode_event(
         raw = bytes.fromhex(data.removeprefix("0x"))
         try:
             decoded_tuple = eth_abi_decode(types, raw)
-        except Exception as exc:
+        except (ValueError, OverflowError) as exc:
             raise DecodeFailed(f"data decode failed: {exc}") from exc
         for inp, val in zip(not_indexed, decoded_tuple, strict=True):
             args[inp["name"]] = _normalize_value(_canonical_type(inp), val)
@@ -142,7 +147,7 @@ def decode_function_call(fn_abi: dict[str, Any], calldata: str) -> dict[str, Any
     types = [_canonical_type(i) for i in fn_abi.get("inputs", [])]
     try:
         decoded_tuple = eth_abi_decode(types, raw[4:])
-    except Exception as exc:
+    except (ValueError, OverflowError) as exc:
         raise DecodeFailed(f"calldata decode failed: {exc}") from exc
 
     out: dict[str, Any] = {}

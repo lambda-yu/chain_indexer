@@ -5,7 +5,6 @@ from typing import Any
 
 import structlog
 
-from core.abi.decoder import decode_function_call
 from core.abi.errors import DecodeFailed
 from core.abi.registry import AbiRegistry
 from core.chains.types import Block, InternalCall

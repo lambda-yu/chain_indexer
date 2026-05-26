@@ -44,6 +44,7 @@ class SnapshotChain:
     confirmations: int
     poll_interval_ms: int
     commitment: str | None = None
+    trace_internal_calls: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,7 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
             confirmations=c.confirmations,
             poll_interval_ms=c.poll_interval_ms,
             commitment=c.commitment,
+            trace_internal_calls=bool(c.trace_internal_calls) if c.trace_internal_calls is not None else False,
         )
         for c in chains_rows
     ]

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from apps.worker.chain_runner import ChainRunner
-from core.chains.types import Block, BlockHeader, Tx
+from core.chains.types import Block, BlockHeader, Log, Tx
 from core.config.snapshot import (
     ConfigSnapshot,
     SnapshotChain,
@@ -16,6 +16,7 @@ from core.config.snapshot import (
     SnapshotSubscription,
 )
 from core.notifier.channel import Channel
+from core.parser.erc20 import ERC20_TRANSFER_TOPIC0
 
 
 def _chain() -> SnapshotChain:
@@ -263,3 +264,70 @@ async def test_chain_runner_seeds_buffer_from_checkpoint() -> None:
         assert runner.resume_from == (42, "0xh42")
     finally:
         await runner.stop()
+
+
+def _block_with_erc20_log(n: int, *, value: int = 1000) -> Block:
+    pad = "0" * 24
+    _from = "aaaa" + "00" * 18
+    _to = "bbbb" + "00" * 18
+    return Block(
+        header=_hdr(n, parent=f"0xh{n-1}" if n > 0 else "0x0"),
+        txs=[
+            Tx(hash=f"0xt{n}", index=0, from_addr="0xf0", to_addr="0xtoken",
+               value=0, input="0xa9059cbb", status=1),
+        ],
+        logs=[
+            Log(
+                tx_hash=f"0xt{n}",
+                log_index=0,
+                address="0xtoken",
+                topics=[
+                    ERC20_TRANSFER_TOPIC0,
+                    "0x" + pad + _from,
+                    "0x" + pad + _to,
+                ],
+                data="0x" + format(value, "064x"),
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_erc20_token_transfer() -> None:
+    chain = _chain()
+    blocks = [_block_with_erc20_log(n, value=n * 1000) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="token_transfer")],
+        channels=[_ch("c1")],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"token_transfer"}
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        assert values == {"1000", "2000"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

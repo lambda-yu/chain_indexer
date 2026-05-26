@@ -17,6 +17,7 @@ from core.config.snapshot import (
 from core.matcher.matcher import Matcher
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
+from core.parser.erc20 import Erc20TransferParser
 from core.parser.native import NativeTransferParser
 from core.parser.pipeline import ParserPipeline
 
@@ -72,7 +73,10 @@ class ChainRunner:
 
         self._adapter: ChainAdapter | None = None
         self._buffer: ConfirmationBuffer | None = None
-        self._pipeline = ParserPipeline([NativeTransferParser(chain_id=self._chain.id)])
+        self._pipeline = ParserPipeline([
+            NativeTransferParser(chain_id=self._chain.id),
+            Erc20TransferParser(chain_id=self._chain.id),
+        ])
         self._matcher: Matcher | None = None
         self._notifier: Notifier | None = None
         self._current_snap: ConfigSnapshot | None = None

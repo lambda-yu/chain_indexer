@@ -5943,3 +5943,978 @@ git commit -m "feat(notifier): WebSocketChannel + /ws fanout server with back-pr
 ```
 
 ---
+
+## Chunk 9: `arg_filters` Pydantic tighten + EVM ERC-20 E2E
+
+The EVM-segment close-out. Three pieces that ship together because they share the same theme — "harden the EVM path end-to-end and prove it" — and because the offender-scanner + Pydantic tighten are both small enough that batching avoids a tag whiplash between sub-commits.
+
+1. **`arg_filters` Pydantic tightening** (`apps/web/schemas.py`): closes spec §9.1 item 5. The schema currently accepts `dict[str, Any]`, which lets the API store nested dicts that `filters.evaluate(...)` will silently mis-match against. Chunk 9 narrows the value type to `str | int | bool | list[str | int | bool]` and additionally runs the existing `core.matcher.filters.validate(...)` (typo grammar — `_eq`/`_ne`/etc. rejected) inside a Pydantic `field_validator` so the rejection surfaces at API time with a 422, not at first match attempt.
+2. **`scripts/validate_arg_filters.py`** — a one-shot operator script that scans every `subscriptions.arg_filters` JSON blob in the database and prints any row whose value shape does not conform to the tightened schema OR fails `filters.validate(...)`. Returns exit code 0 (clean) or 1 (offenders printed). M2 ships no migration for this — it's an inspection tool the operator runs once at upgrade time. Spec §4.8 final sentence.
+3. **EVM ERC-20 E2E** (`tests/e2e/test_evm_erc20_e2e.py`): the capstone test for the EVM segment. Anvil from chunk 11 of M1's E2E fixture is reused; a minimal ERC-20 contract is compiled via `py-solc-x` at session setup, deployed, and the test drives the full chain `Transfer(...)` → block → `Erc20TransferParser` → Matcher → `HttpChannel` → webhook receiver path. Asserts payload shape per spec §8 with `kind="token_transfer"` and `args.from / args.to / args.value`.
+
+After Task 9.6, the branch is tagged `m2-evm-complete`. The Solana segment (chunks 10–14) builds on the same skeleton but does NOT depend on this tag at code level — the tag exists only for human navigation.
+
+**Modified files this chunk:**
+- `apps/web/schemas.py` — narrow `arg_filters` value type + `field_validator`.
+- `scripts/__init__.py` — **new** if absent (empty marker).
+- `scripts/validate_arg_filters.py` — **new**: offender-scanner.
+- `tests/unit/test_schemas_arg_filters.py` — **new**: Pydantic-level rejection tests.
+- `tests/unit/test_validate_arg_filters_script.py` — **new**: scanner output tests.
+- `tests/e2e/conftest.py:60-…` — extend with `erc20_token` fixture (depends on `anvil` fixture from M1).
+- `tests/e2e/test_evm_erc20_e2e.py` — **new**: the ERC-20 E2E test.
+- `pyproject.toml` — add `py-solc-x>=2.0,<3` to `[project.optional-dependencies].dev`.
+
+**Out of scope this chunk:**
+- Backfilling bad existing rows. The scanner only PRINTS offenders; rewriting them is an operator decision (could be deletion, partial-update, or schema migration in M3). Spec §4.8 stops at "print offenders for operator review".
+- API-time conversion of legacy `arg_filters` blobs into the tightened shape. If the operator wants to migrate values (e.g. wrap a bare int in a list), they do it manually. The scanner identifies; it does not transform.
+- Solana E2E — that's the entire Solana segment (chunks 10–14).
+- Multi-chain E2E. Anvil only. Solana E2E is chunk 14.
+- `core/matcher/filters.py` — no logic change. We only EXPORT `validate` from a stable import path; the file itself is untouched. (Spec §4.8: "filters.validate (existing function)".)
+
+**Pydantic version note:** This codebase pins Pydantic v2 (`pydantic>=2,<3` in `pyproject.toml`, confirmed by `pydantic.ConfigDict` usage in `apps/web/schemas.py`). Chunk 9 uses `from pydantic import field_validator` and the v2 decorator signature `@field_validator("arg_filters")`. If the implementer is reading the v1 docs by accident, the v1 equivalent is `@validator(...)` — that would silently no-op because Pydantic v2 doesn't recognize the name. Stick with `field_validator`.
+
+**`py-solc-x` note:** First test run downloads the solc 0.8.20 binary (~2-3 s, cached under `~/.solcx/`). Subsequent runs are O(ms). If the host can't reach `binaries.soliditylang.org` (offline CI), the test fails at compile-time with a clear `SolcInstallationError`; treat this the same as the "anvil not installed" skip in M1 chunk 11 — gate the E2E with the existing `e2e` marker so CI labels can opt out.
+
+### Task 9.1: Red — Pydantic schema rejection tests
+
+Tests live in their own file rather than appending to `test_web_subscriptions.py` because the focus is the schema validator in isolation (no DB / API layer needed). Three behaviour groups: (a) accepted value shapes round-trip; (b) value-type rejections produce a Pydantic `ValidationError`; (c) typo-grammar rejection delegates to `filters.validate`.
+
+**Files:**
+- Create: `tests/unit/test_schemas_arg_filters.py`
+
+- [ ] **Step 1: Write the failing test file**
+
+```python
+# tests/unit/test_schemas_arg_filters.py
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from apps.web.schemas import SubscriptionCreate
+
+
+def _base(**overrides):
+    payload = dict(
+        name="s1",
+        chain_id="eth-mainnet",
+        address=None,
+        abi_id=None,
+        match_kind="native_transfer",
+        match_name=None,
+        arg_filters={},
+        enabled=True,
+    )
+    payload.update(overrides)
+    return payload
+
+
+# -- accepted shapes ----------------------------------------------------------
+
+def test_arg_filters_accepts_string_value() -> None:
+    s = SubscriptionCreate(**_base(arg_filters={"from": "0xabc"}))
+    assert s.arg_filters == {"from": "0xabc"}
+
+
+def test_arg_filters_accepts_int_value() -> None:
+    s = SubscriptionCreate(**_base(arg_filters={"value_gte": 1000}))
+    assert s.arg_filters == {"value_gte": 1000}
+
+
+def test_arg_filters_accepts_bool_value() -> None:
+    s = SubscriptionCreate(**_base(arg_filters={"is_live": True}))
+    assert s.arg_filters is not None
+    assert s.arg_filters["is_live"] is True
+
+
+def test_arg_filters_accepts_list_of_primitives() -> None:
+    s = SubscriptionCreate(**_base(arg_filters={"to_in": ["0x1", "0x2", "0x3"]}))
+    assert s.arg_filters == {"to_in": ["0x1", "0x2", "0x3"]}
+
+
+def test_arg_filters_empty_dict_is_accepted() -> None:
+    s = SubscriptionCreate(**_base(arg_filters={}))
+    assert s.arg_filters == {}
+
+
+# -- value-type rejections ----------------------------------------------------
+
+def test_arg_filters_rejects_nested_dict() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        SubscriptionCreate(**_base(arg_filters={"from": {"nested": "dict"}}))
+    # The error should reference the offending field path.
+    msg = str(exc_info.value)
+    assert "arg_filters" in msg
+
+
+def test_arg_filters_rejects_float_value() -> None:
+    with pytest.raises(ValidationError):
+        SubscriptionCreate(**_base(arg_filters={"value_gte": 1.5}))
+
+
+def test_arg_filters_rejects_none_value() -> None:
+    with pytest.raises(ValidationError):
+        SubscriptionCreate(**_base(arg_filters={"x": None}))
+
+
+def test_arg_filters_rejects_list_with_dict_element() -> None:
+    with pytest.raises(ValidationError):
+        SubscriptionCreate(
+            **_base(arg_filters={"to_in": ["0x1", {"nested": "x"}]})
+        )
+
+
+def test_arg_filters_rejects_list_with_float_element() -> None:
+    with pytest.raises(ValidationError):
+        SubscriptionCreate(**_base(arg_filters={"vals_in": [1, 2.5]}))
+
+
+# -- typo-grammar rejection (delegates to filters.validate) -------------------
+
+def test_arg_filters_rejects_typo_eq_suffix() -> None:
+    """`_eq` is a forbidden typo — `filters.validate` catches it."""
+    with pytest.raises(ValidationError) as exc_info:
+        SubscriptionCreate(**_base(arg_filters={"value_eq": 100}))
+    assert "value_eq" in str(exc_info.value) or "unknown operator" in str(exc_info.value)
+
+
+def test_arg_filters_rejects_typo_ne_suffix() -> None:
+    with pytest.raises(ValidationError):
+        SubscriptionCreate(**_base(arg_filters={"to_ne": "0x1"}))
+
+
+def test_arg_filters_accepts_valid_operator_suffixes() -> None:
+    """`_in`, `_gte`, `_lte`, plain field — all pass `filters.validate`."""
+    s = SubscriptionCreate(**_base(arg_filters={
+        "to": "0xabc",
+        "to_in": ["0x1", "0x2"],
+        "value_gte": 100,
+        "value_lte": 200,
+    }))
+    assert set(s.arg_filters.keys()) == {"to", "to_in", "value_gte", "value_lte"}
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_schemas_arg_filters.py -v`
+Expected: the 5 acceptance tests PASS (current `dict[str, Any]` accepts anything). The 7 rejection tests FAIL because nothing rejects nested dicts / floats / `_eq` today.
+
+### Task 9.2: Green — tighten `arg_filters` schema
+
+**Files:**
+- Modify: `apps/web/schemas.py:9-12`, `:66` — add type alias + `field_validator` on `SubscriptionCreate`. (`SubscriptionOut.arg_filters` at line 80 stays `dict[str, Any]` deliberately; do NOT tighten the OUT schema.)
+
+- [ ] **Step 1: Update the imports**
+
+Replace the existing `from typing import Any, Literal` and `from pydantic import BaseModel, ConfigDict, Field` with:
+
+```python
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from core.matcher.filters import FilterError, validate as _validate_filter_keys
+
+ArgFilterValue = str | int | bool | list[str | int | bool]
+```
+
+The module-level type alias lives at the top of the file (after imports) so both `SubscriptionCreate` and `SubscriptionOut` reuse the same shape. (`SubscriptionOut` keeps the loose `dict[str, Any]` for back-compat with already-stored rows that may pre-date this tightening — the OUT schema is informational only and `Any` keeps deserialization permissive. The IN schema is the gate.)
+
+- [ ] **Step 2: Tighten the `SubscriptionCreate.arg_filters` field**
+
+Replace line 66 of `apps/web/schemas.py`:
+
+```python
+# was: arg_filters: dict[str, Any] = Field(default_factory=dict)
+arg_filters: dict[str, ArgFilterValue] = Field(default_factory=dict)
+```
+
+- [ ] **Step 3: Add the typo-grammar validator**
+
+Append a `field_validator` to the `SubscriptionCreate` class body, AFTER the existing fields:
+
+```python
+    @field_validator("arg_filters")
+    @classmethod
+    def _check_operator_grammar(
+        cls, v: dict[str, ArgFilterValue]
+    ) -> dict[str, ArgFilterValue]:
+        """Reject typo'd operator suffixes (`_eq`, `_ne`, ...) by delegating
+        to `core.matcher.filters.validate`. Raises Pydantic ValidationError
+        with a clear message instead of crashing at first match attempt."""
+        try:
+            _validate_filter_keys(v)
+        except FilterError as exc:
+            raise ValueError(str(exc)) from exc
+        return v
+```
+
+`field_validator` re-wraps the raised `ValueError` into a Pydantic `ValidationError` automatically; the API layer's `RequestValidationError` handler then returns 422 with the error string. (The wrap-as-ValueError pattern is the documented v2 idiom — Pydantic does NOT catch arbitrary exceptions from validators by design.)
+
+- [ ] **Step 4: Re-run the schema tests**
+
+Run: `pytest tests/unit/test_schemas_arg_filters.py -v`
+Expected: all 12 PASS.
+
+- [ ] **Step 5: Re-run the existing subscriptions API tests**
+
+Run: `pytest tests/unit/test_web_subscriptions.py -v`
+Expected: clean — the test suite uses simple equality filters that survive tightening. If a test breaks because it was using a nested dict, that's a real bug being surfaced; update the test to use a valid shape rather than relaxing the schema.
+
+- [ ] **Step 6: Lint + typecheck**
+
+Run: `make lint typecheck`
+Expected: clean. mypy may warn on `dict[str, ArgFilterValue]` containing `bool` because `bool` is a subtype of `int` in Python — the union `str | int | bool` is technically redundant. Keep `bool` explicit anyway for readability; if mypy complains, add `# type: ignore[misc]` to the alias line.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/web/schemas.py tests/unit/test_schemas_arg_filters.py
+git commit -m "feat(api): tighten arg_filters Pydantic value-type + delegate to filters.validate"
+```
+
+### Task 9.3: Offender-scanner script
+
+A one-shot operator tool: read every `subscriptions.arg_filters` JSON column in the DB, run it through the same validator the schema uses, and print every offending row. Exit 0 if clean, 1 if any offender. The script imports `core.matcher.filters.validate` and uses `pydantic.TypeAdapter(dict[str, ArgFilterValue]).validate_python(...)` so the two checks (value-shape + typo grammar) match `SubscriptionCreate` exactly. Future schema drift only needs to update the type alias.
+
+**Files:**
+- Create: `scripts/__init__.py` (empty marker — only if not present already)
+- Create: `scripts/validate_arg_filters.py`
+- Create: `tests/unit/test_validate_arg_filters_script.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_validate_arg_filters_script.py
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+import pytest_asyncio
+
+from core.config.db import Database
+from core.config.models import Base, MatchKind, Subscription
+from scripts.validate_arg_filters import scan_database
+
+
+@pytest_asyncio.fixture
+async def db() -> AsyncIterator[Database]:
+    d = Database("sqlite+aiosqlite:///:memory:")
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield d
+    await d.disconnect()
+
+
+async def _insert_subscription(
+    db: Database, *, name: str, arg_filters: dict[str, Any]
+) -> str:
+    """Insert directly via the ORM, bypassing the Pydantic schema so we can
+    seed rows that the tightened schema would reject."""
+    async with db.session() as s:
+        row = Subscription(
+            name=name,
+            chain_id="eth-mainnet",
+            address=None,
+            abi_id=None,
+            match_kind=MatchKind.native_transfer,
+            match_name=None,
+            arg_filters=arg_filters,
+            enabled=True,
+        )
+        s.add(row)
+        await s.commit()
+        return row.id
+
+
+@pytest.mark.asyncio
+async def test_scanner_returns_empty_for_clean_database(db: Database) -> None:
+    await _insert_subscription(db, name="good1", arg_filters={"from": "0xabc"})
+    await _insert_subscription(db, name="good2", arg_filters={"value_gte": 100})
+    offenders = await scan_database(db)
+    assert offenders == []
+
+
+@pytest.mark.asyncio
+async def test_scanner_flags_nested_dict_in_value(db: Database) -> None:
+    bad_id = await _insert_subscription(
+        db, name="bad-nested", arg_filters={"from": {"nested": "x"}}
+    )
+    offenders = await scan_database(db)
+    assert len(offenders) == 1
+    assert offenders[0].subscription_id == bad_id
+    assert offenders[0].name == "bad-nested"
+    assert "from" in offenders[0].reason or "nested" in offenders[0].reason
+
+
+@pytest.mark.asyncio
+async def test_scanner_flags_typo_operator(db: Database) -> None:
+    bad_id = await _insert_subscription(
+        db, name="bad-eq", arg_filters={"value_eq": 100}
+    )
+    offenders = await scan_database(db)
+    assert len(offenders) == 1
+    assert offenders[0].subscription_id == bad_id
+    assert "value_eq" in offenders[0].reason or "unknown operator" in offenders[0].reason
+
+
+@pytest.mark.asyncio
+async def test_scanner_reports_multiple_offenders(db: Database) -> None:
+    await _insert_subscription(db, name="ok", arg_filters={"from": "0x1"})
+    await _insert_subscription(db, name="bad1", arg_filters={"x": None})
+    await _insert_subscription(db, name="bad2", arg_filters={"y_ne": "z"})
+    offenders = await scan_database(db)
+    names = {o.name for o in offenders}
+    assert names == {"bad1", "bad2"}
+
+
+def test_main_exits_zero_when_clean(monkeypatch, capsys) -> None:
+    """`main()` returns 0 and prints a one-liner when there are no offenders."""
+    from scripts import validate_arg_filters as mod
+
+    async def _empty_scan(_db: Database):
+        return []
+
+    async def _fake_connect(self):
+        return None
+
+    async def _fake_disconnect(self):
+        return None
+
+    monkeypatch.setattr(mod, "scan_database", _empty_scan)
+    monkeypatch.setattr(Database, "connect", _fake_connect)
+    monkeypatch.setattr(Database, "disconnect", _fake_disconnect)
+
+    rc = mod.main(["--database-url", "sqlite+aiosqlite:///:memory:"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "no offenders" in captured.out.lower() or "0 offenders" in captured.out.lower()
+
+
+def test_main_exits_one_when_offenders(monkeypatch, capsys) -> None:
+    from scripts import validate_arg_filters as mod
+
+    async def _scan(_db: Database):
+        return [mod.Offender(subscription_id="abc", name="bad-row", reason="bad value shape")]
+
+    async def _fake_connect(self):
+        return None
+
+    async def _fake_disconnect(self):
+        return None
+
+    monkeypatch.setattr(mod, "scan_database", _scan)
+    monkeypatch.setattr(Database, "connect", _fake_connect)
+    monkeypatch.setattr(Database, "disconnect", _fake_disconnect)
+
+    rc = mod.main(["--database-url", "sqlite+aiosqlite:///:memory:"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "bad-row" in captured.out
+    assert "bad value shape" in captured.out
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_validate_arg_filters_script.py -v`
+Expected: 6 FAILs with `ModuleNotFoundError: No module named 'scripts.validate_arg_filters'`.
+
+- [ ] **Step 3: Create the package marker if absent**
+
+```python
+# scripts/__init__.py
+# (empty marker — makes `scripts` an importable package for tests)
+```
+
+(If `scripts/` already exists as a package from M1, skip this step. `ls scripts/__init__.py` confirms.)
+
+- [ ] **Step 4: Implement the scanner**
+
+```python
+# scripts/validate_arg_filters.py
+"""One-shot operator script: scan `subscriptions.arg_filters` rows for any
+value shape that the M2-tightened API schema would reject.
+
+Usage:
+    python -m scripts.validate_arg_filters --database-url <url>
+
+Exit 0 when no offenders; 1 when offenders are printed.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+from dataclasses import dataclass
+
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy import select
+
+from apps.web.schemas import ArgFilterValue
+from core.config.db import Database
+from core.config.models import Subscription
+from core.matcher.filters import FilterError, validate as _validate_filter_keys
+
+_VALUE_SHAPE = TypeAdapter(dict[str, ArgFilterValue])
+
+
+@dataclass(frozen=True)
+class Offender:
+    subscription_id: str
+    name: str
+    reason: str
+
+
+async def scan_database(db: Database) -> list[Offender]:
+    """Iterate every Subscription row and check `arg_filters` against the
+    M2 schema. Returns a list of `Offender` records, one per failing row."""
+    offenders: list[Offender] = []
+    async with db.session() as s:
+        result = await s.execute(select(Subscription))
+        for row in result.scalars().all():
+            try:
+                _VALUE_SHAPE.validate_python(row.arg_filters)
+                _validate_filter_keys(row.arg_filters)
+            except ValidationError as exc:
+                offenders.append(
+                    Offender(
+                        subscription_id=row.id,
+                        name=row.name,
+                        reason=f"value shape: {exc.errors()[0]['msg']}",
+                    )
+                )
+            except FilterError as exc:
+                offenders.append(
+                    Offender(
+                        subscription_id=row.id,
+                        name=row.name,
+                        reason=f"operator grammar: {exc}",
+                    )
+                )
+    return offenders
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Scan subscriptions.arg_filters for M2-incompatible rows."
+    )
+    parser.add_argument(
+        "--database-url",
+        required=True,
+        help="SQLAlchemy URL (e.g. postgresql+asyncpg://... or sqlite+aiosqlite:///path).",
+    )
+    args = parser.parse_args(argv)
+
+    async def _run() -> int:
+        db = Database(args.database_url)
+        await db.connect()
+        try:
+            offenders = await scan_database(db)
+        finally:
+            await db.disconnect()
+
+        if not offenders:
+            print("✔ no offenders — all arg_filters rows pass the M2 schema")
+            return 0
+
+        print(f"✗ {len(offenders)} offender(s):")
+        for o in offenders:
+            print(f"  - id={o.subscription_id} name={o.name!r} reason={o.reason}")
+        return 1
+
+    return asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 5: Re-run the tests**
+
+Run: `pytest tests/unit/test_validate_arg_filters_script.py -v`
+Expected: all 6 PASS.
+
+- [ ] **Step 6: Smoke-run against a freshly-migrated SQLite DB**
+
+The script expects a `subscriptions` table to exist. Against a bare in-memory DB you'd get `OperationalError: no such table: subscriptions` — that's the unmigrated-DB failure mode, not a bug. Smoke-test against a temp file with the schema applied:
+
+```bash
+python -c "
+import asyncio
+from core.config.db import Database
+from core.config.models import Base
+async def _run():
+    d = Database('sqlite+aiosqlite:///./_smoke.sqlite')
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await d.disconnect()
+asyncio.run(_run())
+"
+python -m scripts.validate_arg_filters \
+    --database-url "sqlite+aiosqlite:///./_smoke.sqlite"
+rm -f ./_smoke.sqlite
+```
+
+Expected: prints `✔ no offenders` (or `no offenders`) and exits 0. If the script crashes with `no such table: subscriptions`, the schema-creation block above didn't run — re-check the working directory.
+
+- [ ] **Step 7: Lint + typecheck**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add scripts/__init__.py scripts/validate_arg_filters.py \
+        tests/unit/test_validate_arg_filters_script.py
+git commit -m "feat(scripts): offender-scanner for arg_filters M2 schema"
+```
+
+### Task 9.4: ERC-20 E2E fixture — compile + deploy a minimal token
+
+The fixture compiles a 30-line Solidity ERC-20 with `py-solc-x`, deploys it to Anvil (reusing M1's `anvil` fixture), mints the full supply to `anvil.accounts[0]`, and yields a small handle with `address`, `abi`, and `deployer_pk`. Compile happens once per session; deploy happens once per test invocation.
+
+**Files:**
+- Modify: `pyproject.toml` — add `py-solc-x>=2.0,<3` to `[project.optional-dependencies].dev`.
+- Modify: `tests/e2e/conftest.py` — append the new fixture and helpers.
+
+- [ ] **Step 1: Add `py-solc-x` to dev deps**
+
+In `pyproject.toml` under `[project.optional-dependencies]`, the `dev` array gets one new entry:
+
+```toml
+# pyproject.toml — ADD inside [project.optional-dependencies].dev
+"py-solc-x>=2.0,<3",
+```
+
+Re-resolve and install:
+
+```bash
+pip install -e ".[dev]"
+```
+
+- [ ] **Step 2: Append the ERC-20 fixture to `tests/e2e/conftest.py`**
+
+Add at the bottom of the existing M1 conftest (do NOT overwrite the M1 `anvil` / `webhook_receiver` fixtures; APPEND):
+
+```python
+# tests/e2e/conftest.py  --  ADD below the existing M1 fixtures
+# (M1 conftest already imports `dataclass` at module top — reuse it; do NOT
+# re-import.)
+
+from functools import lru_cache
+
+from eth_account import Account
+from web3 import AsyncHTTPProvider, AsyncWeb3
+
+
+# Minimal mintable ERC-20 — compiles to ~700 bytes of runtime bytecode.
+# Public Transfer(address,address,uint256) signature is the one
+# `Erc20TransferParser` (chunk 3) decodes.
+_ERC20_SOURCE = """
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract MiniToken {
+    mapping(address => uint256) public balanceOf;
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    constructor(uint256 supply) {
+        balanceOf[msg.sender] = supply;
+        emit Transfer(address(0), msg.sender, supply);
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "low balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+}
+"""
+
+_ERC20_INITIAL_SUPPLY = 10 ** 24  # 1,000,000 tokens (18 decimals not enforced here)
+_SOLC_VERSION = "0.8.20"
+
+
+@dataclass
+class Erc20Handle:
+    address: str
+    abi: list[dict]
+    deployer_pk: str
+    deployer_address: str
+
+
+def _ensure_solc_installed() -> None:
+    """Make sure solc `_SOLC_VERSION` is on disk. Calls `pytest.skip` from
+    the FIXTURE (not from inside `lru_cache`) if the install attempt fails
+    — typically because the host can't reach `binaries.soliditylang.org`.
+
+    `install_solc` is a no-op when the version is already installed (it
+    checks `get_installed_solc_versions()` internally), so calling it once
+    per test session is cheap on warm hosts."""
+    import solcx  # type: ignore[import-untyped]
+
+    if _SOLC_VERSION in {str(v) for v in solcx.get_installed_solc_versions()}:
+        return
+    try:
+        solcx.install_solc(_SOLC_VERSION)
+    except solcx.exceptions.SolcInstallationError:
+        pytest.skip(
+            f"solc {_SOLC_VERSION} not installable (offline?); ERC-20 E2E "
+            "requires network access to binaries.soliditylang.org"
+        )
+
+
+@lru_cache(maxsize=1)
+def _compile_erc20() -> tuple[str, list[dict]]:
+    """Compile the inline Solidity source ONCE per test session. Caches the
+    (bytecode, abi) tuple in-process. Assumes `_ensure_solc_installed()`
+    has already been called from the fixture."""
+    import solcx  # type: ignore[import-untyped]
+
+    out = solcx.compile_source(
+        _ERC20_SOURCE,
+        output_values=["abi", "bin"],
+        solc_version=_SOLC_VERSION,
+    )
+    # `out` keys look like '<stdin>:MiniToken'.
+    _, artifact = next(iter(out.items()))
+    return artifact["bin"], artifact["abi"]
+
+
+async def _deploy_erc20(anvil: AnvilHandle) -> Erc20Handle:
+    bytecode, abi = _compile_erc20()
+    deployer_pk = anvil.private_keys[0]
+    deployer = Account.from_key(deployer_pk).address
+
+    w3 = AsyncWeb3(AsyncHTTPProvider(anvil.rpc_url))
+    try:
+        Token = w3.eth.contract(abi=abi, bytecode=bytecode)
+        # NOTE: `AsyncContractConstructor.build_transaction` is `async def`
+        # in modern web3.py — it MUST be awaited. Same applies to
+        # `contract.functions.<fn>(...).build_transaction(...)`.
+        nonce = await w3.eth.get_transaction_count(deployer, "pending")
+        tx = await Token.constructor(_ERC20_INITIAL_SUPPLY).build_transaction({
+            "from": deployer,
+            "nonce": nonce,
+            "gas": 2_000_000,
+            "gasPrice": await w3.eth.gas_price,
+            "chainId": anvil.chain_id,
+        })
+        signed = Account.sign_transaction(tx, deployer_pk)
+        h = await w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = await w3.eth.wait_for_transaction_receipt(h, timeout=10.0)
+        assert receipt.status == 1, f"ERC-20 deploy failed: {receipt}"
+        return Erc20Handle(
+            address=receipt.contractAddress,
+            abi=abi,
+            deployer_pk=deployer_pk,
+            deployer_address=deployer,
+        )
+    finally:
+        await w3.provider.disconnect()
+
+
+@pytest_asyncio.fixture
+async def erc20_token(anvil: AnvilHandle) -> Erc20Handle:
+    """Deploy a minimal ERC-20 to the running Anvil node. Returns the deployed
+    address, the ABI, and the deployer credentials (the deployer holds the
+    initial supply and can `transfer` to anyone).
+
+    Solc install (if needed) happens here — outside `lru_cache` — so that
+    `pytest.skip` cleanly skips the test instead of poisoning a cache slot."""
+    _ensure_solc_installed()
+    return await _deploy_erc20(anvil)
+```
+
+- [ ] **Step 3: Smoke-test the fixture**
+
+A quick sanity check that the fixture deploys without errors. This is a one-off invocation; don't commit a placeholder test for it — the ERC-20 E2E test in Task 9.5 exercises the fixture end-to-end.
+
+```bash
+python -m pytest tests/e2e/conftest.py --collect-only -q
+```
+
+Expected: no import errors. (Anvil/solcx aren't invoked at collect time.)
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add pyproject.toml tests/e2e/conftest.py
+git commit -m "test(e2e): erc20_token fixture compiles MiniToken via py-solc-x"
+```
+
+### Task 9.5: ERC-20 E2E — full chain to webhook
+
+Mirrors M1 chunk 11 Task 11.2's structure. Drives the API to create chain + ERC-20-scoped subscription + webhook channel, runs the worker in-process, calls `transfer()` on the deployed token N times, then asserts N payloads arrived with `kind="token_transfer"`.
+
+**Files:**
+- Create: `tests/e2e/test_evm_erc20_e2e.py`
+
+- [ ] **Step 1: Write the test**
+
+```python
+# tests/e2e/test_evm_erc20_e2e.py
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+
+import pytest
+import pytest_asyncio
+from eth_account import Account
+from httpx import ASGITransport, AsyncClient
+from web3 import AsyncHTTPProvider, AsyncWeb3
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from apps.worker.main import run_worker
+from core.bus.redis_bus import RedisBus
+from core.config.db import Database
+from core.config.models import Base
+from core.settings import Settings
+
+pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
+
+
+TRANSFER_COUNT = 3
+DELIVERY_TIMEOUT_S = 30.0
+
+
+@pytest_asyncio.fixture
+async def db_url(tmp_path) -> str:
+    return f"sqlite+aiosqlite:///{tmp_path / 'e2e_erc20.sqlite'}"
+
+
+@pytest_asyncio.fixture
+async def initialised_db(db_url: str) -> AsyncIterator[Database]:
+    d = Database(db_url)
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield d
+    await d.disconnect()
+
+
+async def _send_erc20_transfer(
+    w3: AsyncWeb3,
+    *,
+    token_address: str,
+    token_abi: list[dict],
+    sender_pk: str,
+    to: str,
+    amount: int,
+    chain_id: int,
+) -> str:
+    """Sign + submit a single `transfer(to, amount)` call.
+
+    Uses `"pending"` for the nonce so back-to-back transfers within one
+    block window each get a fresh nonce (matches M1's helper). `build_transaction`
+    on an `AsyncContract` function is `async def` in modern web3.py — must
+    be awaited."""
+    sender = Account.from_key(sender_pk).address
+    contract = w3.eth.contract(address=token_address, abi=token_abi)
+    nonce = await w3.eth.get_transaction_count(sender, "pending")
+    tx = await contract.functions.transfer(to, amount).build_transaction({
+        "from": sender,
+        "nonce": nonce,
+        "gas": 120_000,
+        "gasPrice": await w3.eth.gas_price,
+        "chainId": chain_id,
+    })
+    signed = Account.sign_transaction(tx, sender_pk)
+    h = await w3.eth.send_raw_transaction(signed.raw_transaction)
+    return h.hex()
+
+
+async def test_erc20_transfer_anvil_to_webhook(
+    anvil, webhook_receiver, erc20_token, initialised_db, db_url, redis_url,
+) -> None:
+    """Anvil + deployed ERC-20 → Worker → HttpChannel → in-process webhook.
+
+    Asserts payload conforms to spec §8 with kind=token_transfer:
+    contract address matches the deployed token, args.from/to/value present,
+    value is a decimal string carrying the transferred amount.
+    """
+    settings = Settings(
+        database={"url": db_url},
+        redis={"url": redis_url},
+    )
+
+    # 1) Seed chain + channel + ERC-20-scoped subscription via the real API.
+    bus_writer = RedisBus(url=redis_url)
+    await bus_writer.connect()
+    try:
+        app = create_app(lifespan=None)
+        app.dependency_overrides[get_db] = lambda: initialised_db
+        app.dependency_overrides[get_bus] = lambda: bus_writer
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as c:
+            r = await c.post("/api/chains", json={
+                "id": "anvil-local", "kind": "evm",
+                "rpc_http": anvil.rpc_url, "rpc_ws": None,
+                "confirmations": 1, "poll_interval_ms": 500,
+                "enabled": True,
+            })
+            assert r.status_code == 201, r.text
+
+            r = await c.post("/api/channels", json={
+                "name": "e2e-erc20-hook", "type": "http",
+                "config": {"url": webhook_receiver.url, "method": "POST"},
+            })
+            assert r.status_code == 201
+            channel_id = r.json()["id"]
+
+            r = await c.post("/api/subscriptions", json={
+                "name": "erc20-on-minitoken",
+                "chain_id": "anvil-local",
+                "address": erc20_token.address.lower(),  # scope to the deployed token
+                "abi_id": None,
+                "match_kind": "token_transfer",
+                "match_name": None,
+                "arg_filters": {},
+                "enabled": True,
+            })
+            assert r.status_code == 201, r.text
+            sub_id = r.json()["id"]
+
+            r = await c.post(f"/api/subscriptions/{sub_id}/channels",
+                             json={"channel_id": channel_id})
+            assert r.status_code == 204
+    finally:
+        await bus_writer.disconnect()
+
+    # 2) Start the worker.
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(run_worker(settings, stop_event))
+    await asyncio.sleep(1.0)
+
+    # 3) Submit N ERC-20 transfers.
+    w3 = AsyncWeb3(AsyncHTTPProvider(anvil.rpc_url))
+    try:
+        recipient = anvil.accounts[1]
+        submitted_hashes: list[str] = []
+        for i in range(TRANSFER_COUNT):
+            h = await _send_erc20_transfer(
+                w3,
+                token_address=erc20_token.address,
+                token_abi=erc20_token.abi,
+                sender_pk=erc20_token.deployer_pk,
+                to=recipient,
+                amount=10 ** 18 * (i + 1),  # 1, 2, 3 tokens (assuming 18 decimals)
+                chain_id=anvil.chain_id,
+            )
+            submitted_hashes.append(h.lower().removeprefix("0x"))
+
+        # 4) Wait for the receiver to collect N payloads.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DELIVERY_TIMEOUT_S
+        timed_out = False
+        while len(webhook_receiver.received) < TRANSFER_COUNT:
+            if loop.time() > deadline:
+                timed_out = True
+                break
+            await asyncio.sleep(0.5)
+    finally:
+        await w3.provider.disconnect()
+
+    # 5) Stop the worker.
+    stop_event.set()
+    try:
+        await asyncio.wait_for(worker_task, timeout=10.0)
+    except asyncio.TimeoutError:
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(worker_task, timeout=3.0)
+
+    if timed_out:
+        pytest.fail(
+            f"only {len(webhook_receiver.received)}/{TRANSFER_COUNT} ERC-20 "
+            f"payloads received within {DELIVERY_TIMEOUT_S}s"
+        )
+
+    # 6) Assert payload shape per spec §8 with kind=token_transfer.
+    received_tx_hashes = {
+        p["event"]["tx_hash"].lower().removeprefix("0x")
+        for p in webhook_receiver.received
+    }
+    for h in submitted_hashes:
+        assert h in received_tx_hashes, f"missing tx {h} in {received_tx_hashes}"
+
+    sample = webhook_receiver.received[0]
+    assert sample["subscription_id"] == sub_id
+    assert sample["subscription_name"] == "erc20-on-minitoken"
+    assert sample["chain_id"] == "anvil-local"
+    assert "delivery_id" in sample
+    assert "delivered_at" in sample
+
+    ev = sample["event"]
+    assert ev["kind"] == "token_transfer"
+    assert ev["address"].lower() == erc20_token.address.lower()
+    assert isinstance(ev["block_number"], int) and ev["block_number"] >= 1
+    assert ev["block_hash"].startswith("0x")
+    assert ev["tx_hash"].startswith("0x")
+    assert "from" in ev["args"] and "to" in ev["args"] and "value" in ev["args"]
+    assert isinstance(ev["args"]["value"], str)
+    assert int(ev["args"]["value"]) > 0
+    # The deployer is the only sender — every Transfer's `from` should match.
+    assert ev["args"]["from"].lower() == erc20_token.deployer_address.lower()
+```
+
+- [ ] **Step 2: Run the test**
+
+```bash
+make test-e2e
+```
+
+Or directly: `pytest tests/e2e/test_evm_erc20_e2e.py -v -m e2e`
+
+Expected: 1 PASS within ~30 s. First run downloads solc 0.8.20 (~3 s extra). If the test SKIPs with "anvil not installed" or "solc not installable", install Foundry / unblock network and re-run.
+
+- [ ] **Step 3: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+Expected: green.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tests/e2e/test_evm_erc20_e2e.py
+git commit -m "test(e2e): erc-20 transfer anvil → worker → webhook end-to-end"
+```
+
+### Task 9.6: Close-out — tag `m2-evm-complete`
+
+- [ ] **Step 1: Run the full unit + integration suite**
+
+```bash
+make test
+```
+Expected: every chunk 1–9 unit and integration test passes.
+
+- [ ] **Step 2: Run the full E2E suite**
+
+```bash
+make test-e2e
+```
+Expected: both `test_native_transfer_e2e.py` (from M1) and the new `test_evm_erc20_e2e.py` PASS. Total run time ≈ 1 min on a warm host.
+
+- [ ] **Step 3: Tag the EVM-complete milestone**
+
+```bash
+git tag m2-evm-complete
+git tag -l m2-evm-complete   # verify
+```
+
+The `m2-evm-complete` tag marks the end of the EVM segment of M2: ERC-20 / event / call parsers, MQ + WS channels, hardened arg_filters schema, and an end-to-end Anvil → webhook ERC-20 test. The Solana segment (chunks 10–14) starts on top of this commit.
+
+`m2-evm-complete` is informational — chunks 10–14 don't read it. The tag exists to let humans navigate "`git checkout m2-evm-complete` and the EVM segment is fully working" without sifting through the chunk history.
+
+---

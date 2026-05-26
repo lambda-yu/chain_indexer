@@ -87,3 +87,21 @@ class ChannelBindRequest(BaseModel):
 
 class SubscriptionDetail(SubscriptionOut):
     channel_ids: list[str] = Field(default_factory=list)
+
+
+# ---- ABIs -----------------------------------------------------------------
+
+
+class AbiCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    kind: Literal["evm_abi", "solana_idl"]
+    body: dict[str, Any] | list[Any]
+
+
+class AbiOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    kind: str
+    body: dict[str, Any] | list[Any]

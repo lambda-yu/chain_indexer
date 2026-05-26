@@ -8,9 +8,12 @@ from typing import Any
 import pytest
 
 from apps.worker.chain_runner import ChainRunner
+from core.abi.decoder import event_topic0 as _event_topic0
+from core.abi.registry import AbiRegistry as _AbiRegistry
 from core.chains.types import Block, BlockHeader, Log, Tx
 from core.config.snapshot import (
     ConfigSnapshot,
+    SnapshotAbi as _SnapshotAbi,
     SnapshotChain,
     SnapshotChannel,
     SnapshotSubscription,
@@ -331,3 +334,42 @@ async def test_chain_runner_dispatches_erc20_token_transfer() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+_TRANSFER_ABI = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from",  "type": "address", "indexed": True},
+        {"name": "to",    "type": "address", "indexed": True},
+        {"name": "value", "type": "uint256", "indexed": False},
+    ],
+}
+
+
+def test_chain_runner_pipeline_includes_abi_event_parser_when_registry_given() -> None:
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    chain = _chain()
+    runner_with = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+        abi_registry=reg,
+    )
+    types_with = [type(p).__name__ for p in runner_with._pipeline._parsers]
+    assert "AbiEventParser" in types_with
+
+    runner_without = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: _FakeAdapter([]),
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    types_without = [type(p).__name__ for p in runner_without._pipeline._parsers]
+    assert "AbiEventParser" not in types_without
+    assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
+    assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without

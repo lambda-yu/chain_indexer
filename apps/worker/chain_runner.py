@@ -17,6 +17,8 @@ from core.config.snapshot import (
 from core.matcher.matcher import Matcher
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
+from core.abi.registry import AbiRegistry
+from core.parser.abi_event import AbiEventParser
 from core.parser.erc20 import Erc20TransferParser
 from core.parser.native import NativeTransferParser
 from core.parser.pipeline import ParserPipeline
@@ -64,6 +66,7 @@ class ChainRunner:
         channel_factory: ChannelFactory,
         checkpoint_repo: _CheckpointRepo,
         notifier_max_concurrency: int = 50,
+        abi_registry: AbiRegistry | None = None,
     ) -> None:
         self._chain = chain
         self._adapter_factory = adapter_factory
@@ -73,10 +76,13 @@ class ChainRunner:
 
         self._adapter: ChainAdapter | None = None
         self._buffer: ConfirmationBuffer | None = None
-        self._pipeline = ParserPipeline([
+        parsers: list[NativeTransferParser | Erc20TransferParser | AbiEventParser] = [
             NativeTransferParser(chain_id=self._chain.id),
             Erc20TransferParser(chain_id=self._chain.id),
-        ])
+        ]
+        if abi_registry is not None:
+            parsers.append(AbiEventParser(chain_id=self._chain.id, registry=abi_registry))
+        self._pipeline = ParserPipeline(parsers)
         self._matcher: Matcher | None = None
         self._notifier: Notifier | None = None
         self._current_snap: ConfigSnapshot | None = None

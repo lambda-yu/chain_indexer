@@ -74,6 +74,7 @@ class Chain(Base, TimestampMixin):
     poll_interval_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=3000)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     commitment: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)
+    trace_internal_calls: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
 
 
 class Abi(Base, TimestampMixin):

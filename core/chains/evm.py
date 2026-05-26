@@ -5,6 +5,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+import structlog
 from web3 import AsyncHTTPProvider, AsyncWeb3, WebSocketProvider
 from web3.types import FilterParams, TxData
 from web3.utils.subscriptions import (
@@ -12,7 +13,7 @@ from web3.utils.subscriptions import (
     NewHeadsSubscriptionContext,
 )
 
-from core.chains.types import Block, BlockHeader, Log, Tx
+from core.chains.types import Block, BlockHeader, InternalCall, Log, Tx
 
 
 def _hexify(v: object) -> str:
@@ -193,3 +194,61 @@ class EvmAdapter:
                 handler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await handler_task
+
+    _log = structlog.get_logger(__name__)
+
+    async def trace_transaction(self, tx_hash: str) -> InternalCall | None:
+        try:
+            result = await self._w3.provider.make_request(  # type: ignore[union-attr]
+                "debug_traceTransaction",
+                [tx_hash, {"tracer": "callTracer", "tracerConfig": {"withLog": False}}],
+            )
+        except Exception as exc:  # noqa: BLE001
+            if "-32601" in str(exc):
+                return None
+            self._log.warning("evm.trace_transaction_failed", tx_hash=tx_hash, error=str(exc))
+            return None
+        raw = result.get("result")
+        if raw is None:
+            return None
+        return self._parse_call(raw)
+
+    async def trace_block(self, number: int) -> list[InternalCall]:
+        assert self._w3 is not None
+        block = await self._w3.eth.get_block(number, full_transactions=True)
+        out: list[InternalCall] = []
+        for tx in block.get("transactions", []):
+            tx_hash = tx.get("hash", tx) if isinstance(tx, dict) else tx
+            h = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
+            call = await self.trace_transaction(h)
+            if call is not None:
+                out.append(call)
+        return out
+
+    @classmethod
+    def _parse_call(cls, raw: dict[str, Any], depth: int = 0) -> InternalCall | None:
+        if depth > 64:
+            return None
+        children: list[InternalCall] = []
+        for c in raw.get("calls", []):
+            child = cls._parse_call(c, depth + 1)
+            if child is not None:
+                children.append(child)
+        call_type = raw.get("type", "CALL").upper()
+        created = None
+        to_addr = raw.get("to")
+        if call_type in ("CREATE", "CREATE2"):
+            created = to_addr
+            to_addr = None
+        return InternalCall(
+            type=call_type,
+            from_addr=(raw.get("from") or "").lower(),
+            to_addr=to_addr.lower() if to_addr else None,
+            value=int(raw.get("value", "0x0"), 16),
+            gas=int(raw.get("gas", "0x0"), 16),
+            input=raw.get("input", "0x"),
+            output=raw.get("output", "0x"),
+            error=raw.get("error"),
+            calls=children,
+            created_address=created.lower() if created else None,
+        )

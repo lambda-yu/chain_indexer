@@ -26,6 +26,7 @@ class ChainCreate(BaseModel):
     confirmations: int = Field(ge=0, le=10_000, default=0)
     poll_interval_ms: int = Field(ge=100, le=60_000, default=3000)
     commitment: Literal["confirmed", "finalized"] | None = None
+    trace_internal_calls: bool = False
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -47,6 +48,7 @@ class ChainOut(BaseModel):
     confirmations: int
     poll_interval_ms: int
     commitment: str | None
+    trace_internal_calls: bool | None
     enabled: bool
 
 

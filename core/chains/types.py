@@ -77,3 +77,17 @@ class SolanaBlock:
     parent_slot: int
     block_time: int | None
     transactions: list[SolanaTransaction]
+
+
+@dataclass(frozen=True)
+class InternalCall:
+    type: str
+    from_addr: str
+    to_addr: str | None
+    value: int
+    gas: int
+    input: str
+    output: str
+    error: str | None = None
+    calls: list[InternalCall] = field(default_factory=list)
+    created_address: str | None = None

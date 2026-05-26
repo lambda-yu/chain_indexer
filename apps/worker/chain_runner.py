@@ -22,6 +22,7 @@ from core.parser.abi_event import AbiEventParser
 from core.parser.anchor_call import AnchorIdlCallParser
 from core.parser.anchor_event import AnchorIdlEventParser
 from core.parser.erc20 import Erc20TransferParser
+from core.parser.internal_call import InternalCallParser
 from core.parser.native import EvmNativeTransferParser
 from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
 from core.parser.sol_native import SolNativeTransferParser
@@ -240,6 +241,16 @@ class ChainRunner:
             if not hits:
                 continue
             await notifier.dispatch(event, hits)
+        if self._chain.trace_internal_calls and self._abi_registry is not None:
+            trace_fn = getattr(self._adapter, "trace_block", None)
+            if callable(trace_fn):
+                traces = await trace_fn(number)
+                if traces:
+                    internal_parser = InternalCallParser(chain_id=self._chain.id, registry=self._abi_registry)
+                    for event in internal_parser.parse(traces, block):
+                        hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
+                        if hits:
+                            await notifier.dispatch(event, hits)
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
 
     async def _process_solana_slot(self, slot: int) -> None:

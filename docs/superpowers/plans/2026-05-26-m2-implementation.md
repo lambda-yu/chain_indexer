@@ -6918,3 +6918,1701 @@ The `m2-evm-complete` tag marks the end of the EVM segment of M2: ERC-20 / event
 `m2-evm-complete` is informational — chunks 10–14 don't read it. The tag exists to let humans navigate "`git checkout m2-evm-complete` and the EVM segment is fully working" without sifting through the chunk history.
 
 ---
+## Chunk 10: `SolanaAdapter` + `chains.commitment` migration
+
+First chunk of the Solana segment. Lays the foundation the next four chunks build on:
+
+1. **Block-type plumbing** — extend `core/chains/types.py` with `SolanaBlock`, `SolanaTransaction`, `SolanaTokenBalance`, `SolanaInstruction`, plus the `SolanaChainAdapter` Protocol in `core/chains/adapter.py`. The EVM `ChainAdapter` Protocol stays untouched (spec §4.6 names the divergence explicitly).
+2. **Schema migration** — add a nullable `commitment: str` column to `chains` via alembic `0002_solana_commitment.py`. Solana rows must supply a `commitment`; EVM rows leave it `NULL`.
+3. **API kind-validation** — `ChainCreate` gains a `commitment: Literal["confirmed","finalized"] | None` field plus a `@model_validator(mode="after")` that enforces "EVM ↔ confirmations" / "Solana ↔ commitment". Drift in either direction → 422.
+4. **Snapshot plumbing** — `SnapshotChain` carries `commitment`. `load_snapshot` reads it through.
+5. **`SolanaAdapter` itself** — `core/chains/solana.py`. `solders` for typed RPC request/response, `httpx.AsyncClient` for HTTP transport. Three behavior gates: (a) `getBlock(slot)` returning `null` (HTTP 200) → missed slot, advance checkpoint; (b) 4xx/5xx or transport error → wrapped in `retry_with_backoff(..., max_attempts=3, base_delay=1.0)` from `core/notifier/retry.py` (same helper EVM channels already use); (c) `subscribe_heads` polls `getSlot` at the configured commitment.
+6. **Worker factory branch** — `apps/worker/main.py:_default_adapter_factory` branches on `cfg.kind`. Solana returns a `SolanaAdapter`; EVM is unchanged. Hard-error path (M1's `NotImplementedError`) is removed.
+7. **Integration test** — `tests/integration/test_solana_adapter.py` against a session-scoped `solana-test-validator` (function-scoped would pay the 5-10 s cold start per test; the validator's state across tests is acceptable because each IT only reads). Validator install/skip-on-missing pattern matches M1's anvil fixture.
+
+The new pipeline-side glue (`SolanaParserPipeline`, `SolanaParser` protocol, ChainRunner pipeline selection) is chunk 11. Chunk 10 ends with the adapter callable from a unit test mocking `httpx.AsyncClient` and from an IT against a real validator. ChainRunner does NOT yet branch on `chain.kind` — that's chunk 11's job.
+
+**Modified files this chunk:**
+- `core/chains/types.py` — append `SolanaBlock`, `SolanaTransaction`, `SolanaTokenBalance`, `SolanaInstruction`. Existing EVM dataclasses unchanged.
+- `core/chains/adapter.py` — append `SolanaChainAdapter` Protocol. Existing `ChainAdapter` unchanged.
+- `core/chains/solana.py` — **new**: `SolanaAdapter` class.
+- `core/config/models.py:73` — add `commitment: Mapped[str | None]` to `Chain`.
+- `migrations/versions/0002_solana_commitment.py` — **new**.
+- `core/config/snapshot.py` — add `commitment: str | None` to `SnapshotChain`; pass through in `load_snapshot`.
+- `apps/web/schemas.py` — `ChainCreate.commitment` + `model_validator`; `ChainOut.commitment` (response).
+- `apps/web/routers/chains.py:25-33` — pass `commitment` through to `ChainRepo.create`.
+- `core/config/repositories.py:28-44` — `ChainRepo.create(commitment=...)` kwarg.
+- `apps/worker/main.py:24-36` — branch `_default_adapter_factory` on `cfg.kind`.
+- `pyproject.toml` — add `solders>=0.21,<0.30`, `httpx>=0.27,<0.29` (already pinned in M1; verify), and `solana>=0.34` is NOT added.
+- `tests/integration/test_solana_adapter.py` — **new**.
+- `tests/integration/conftest.py` — append `solana_validator` session-scoped fixture (file already exists from M1 with the `db` fixture; add the new fixture below it).
+- `tests/unit/test_solana_types.py` — **new**.
+- `tests/unit/test_solana_adapter.py` — **new**: httpx-mocked unit tests.
+- `tests/unit/test_solana_adapter_protocol.py` — **new**: structural Protocol-conformance check for `SolanaChainAdapter`.
+- `tests/unit/test_worker_adapter_factory.py` — **new**: covers EVM/Solana/unknown-kind branches.
+- `tests/unit/test_chain_create_kind_validation.py` — **new**: Pydantic cross-field test.
+- `tests/unit/test_snapshot_chain_commitment.py` — **new**: `SnapshotChain.commitment` round-trips from DB.
+- `tests/integration/test_alembic_solana_migration.py` — **new**: migration apply / downgrade tests.
+
+**Spec §8 row 10 reconciliation:** the spec lists `core/settings.py` as a touched file for this milestone row. It is **not** touched in this chunk. `commitment` is per-chain DB state (read from `chains.commitment`), not a global setting; nothing needs to land in `core/settings.py`. If you're cross-referencing the spec, this is intentional — do not invent a settings change.
+
+**Out of scope this chunk:**
+- `SolanaParser` protocol and parsers (`SolNativeTransferParser`, `SplTransferParser`, `AnchorIdlEventParser`). Chunks 11–13.
+- `SolanaParserPipeline`. Chunk 11.
+- `ChainRunner` branching. Chunk 11 (because runner wiring is meaningless without the pipeline class to wire to).
+- WS-based head subscription for Solana. Spec §4.6 specifies HTTP polling at commitment; native Solana WS for slot updates is an M3 ergonomic improvement.
+- Solana E2E. Chunk 14.
+- Touch of `core/notifier/retry.py`. The retry helper is M1-stable; the adapter imports it.
+
+**Library version pins (record in `pyproject.toml`):**
+- `solders>=0.21,<0.30` — tested against 0.21–0.24. Major-bump risk noted in spec §9.2.
+- `httpx>=0.27,<0.29` — already pinned in M1 for the webhook channel.
+
+**Naming pin (spec §4.6):** `ChainAdapter` (existing) is the EVM Protocol; `SolanaChainAdapter` (new) is the Solana Protocol. The concrete class for Solana is `SolanaAdapter` (matches `EvmAdapter` naming on the EVM side). Do NOT collapse these — the divergent return type of `fetch_block` (`Block` vs `SolanaBlock`) makes a single Protocol impossible to type-check. **`SolanaChainAdapter` is defined exactly once, in Task 10.5 of this chunk; chunks 11–14 import it but never redefine.**
+
+**Solders + httpx usage note:** The pattern is "build a typed request with `solders`, serialize to JSON, POST via `httpx`, parse the response with `solders`'s typed response class". Solders provides the request/response *types*; the transport is yours. Example for `getSlot`:
+
+```python
+from solders.rpc.requests import GetSlot
+from solders.rpc.responses import GetSlotResp
+from solders.rpc.config import RpcContextConfig
+from solders.commitment_config import CommitmentLevel
+
+req = GetSlot(RpcContextConfig(commitment=CommitmentLevel.Confirmed), id=1)
+resp = await client.post(self._rpc_url, content=req.to_json(), headers={"content-type": "application/json"})
+parsed = GetSlotResp.from_json(resp.text)
+slot = parsed.value  # int
+```
+
+Same idiom for `getBlock` → `GetBlockResp`. The null-block case shows up as `parsed.value is None`.
+
+### Task 10.1: Solana block types
+
+**Files:**
+- Modify: `core/chains/types.py` — append Solana dataclasses.
+- Create: `tests/unit/test_solana_types.py`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_solana_types.py
+from __future__ import annotations
+
+import pytest
+
+from core.chains.types import (
+    SolanaBlock,
+    SolanaInstruction,
+    SolanaTokenBalance,
+    SolanaTransaction,
+)
+
+
+def test_solana_token_balance_round_trip() -> None:
+    tb = SolanaTokenBalance(
+        account_index=2,
+        mint="So11111111111111111111111111111111111111112",
+        owner="11111111111111111111111111111111",
+        amount=1_000_000,
+        decimals=6,
+    )
+    assert tb.mint.endswith("112")
+    assert tb.amount == 1_000_000
+
+
+def test_solana_instruction_carries_program_and_accounts() -> None:
+    ix = SolanaInstruction(
+        program_id="11111111111111111111111111111111",
+        accounts=["A", "B"],
+        data_b58="3Bxs4h",
+        stack_depth=1,
+    )
+    assert ix.program_id == "11111111111111111111111111111111"
+    assert ix.accounts == ["A", "B"]
+
+
+def test_solana_transaction_holds_balances_and_logs() -> None:
+    tx = SolanaTransaction(
+        signature="5xyz",
+        slot=100,
+        success=True,
+        fee=5000,
+        account_keys=["A", "B"],
+        pre_balances=[10**9, 0],
+        post_balances=[10**9 - 5000, 0],
+        pre_token_balances=[],
+        post_token_balances=[],
+        log_messages=["Program X invoke [1]"],
+        instructions=[],
+    )
+    assert tx.success is True
+    assert tx.fee == 5000
+    assert tx.log_messages[0].startswith("Program X")
+
+
+def test_solana_block_top_level_shape() -> None:
+    block = SolanaBlock(
+        slot=100,
+        block_hash="hash100",
+        parent_slot=99,
+        block_time=1_700_000_000,
+        transactions=[],
+    )
+    assert block.slot == 100
+    assert block.parent_slot == 99
+
+
+def test_solana_block_is_frozen() -> None:
+    block = SolanaBlock(slot=1, block_hash="h", parent_slot=0, block_time=None, transactions=[])
+    with pytest.raises((AttributeError, TypeError)):
+        block.slot = 2  # type: ignore[misc]
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_solana_types.py -v`
+Expected: 5 FAILs with `ImportError: cannot import name 'SolanaBlock' from 'core.chains.types'`.
+
+- [ ] **Step 3: Implement the types**
+
+Append to `core/chains/types.py`:
+
+```python
+# core/chains/types.py  --  APPEND below the existing EVM dataclasses
+
+
+@dataclass(frozen=True)
+class SolanaTokenBalance:
+    """Snapshot of one (account, mint) SPL balance at a point in a tx.
+
+    `account_index` is the position in the tx's `account_keys` array — paired
+    with `pre_token_balances` / `post_token_balances`, lets parsers determine
+    transfer amounts without re-walking instructions.
+    """
+    account_index: int
+    mint: str
+    owner: str | None
+    amount: int  # raw base-units of the SPL token (apply `decimals` for human display)
+    decimals: int
+
+
+@dataclass(frozen=True)
+class SolanaInstruction:
+    """A single instruction inside a Solana transaction.
+
+    `stack_depth=1` means top-level; `>1` means an inner CPI (cross-program
+    invocation). Parsers that only care about top-level system transfers
+    filter on `stack_depth == 1`.
+    """
+    program_id: str
+    accounts: list[str]
+    data_b58: str  # base58-encoded instruction data (Solana's canonical form)
+    stack_depth: int
+
+
+@dataclass(frozen=True)
+class SolanaTransaction:
+    signature: str
+    slot: int
+    success: bool  # meta.err is None
+    fee: int  # lamports
+    account_keys: list[str]
+    pre_balances: list[int]   # lamport balances pre-tx, indexed by account_keys
+    post_balances: list[int]  # …post-tx
+    pre_token_balances: list[SolanaTokenBalance]
+    post_token_balances: list[SolanaTokenBalance]
+    log_messages: list[str]
+    instructions: list[SolanaInstruction]
+
+
+@dataclass(frozen=True)
+class SolanaBlock:
+    slot: int
+    block_hash: str
+    parent_slot: int
+    block_time: int | None  # unix seconds; can be None on fresh validator
+    transactions: list[SolanaTransaction]
+```
+
+- [ ] **Step 4: Re-run the tests**
+
+Run: `pytest tests/unit/test_solana_types.py -v`
+Expected: 5 PASS.
+
+- [ ] **Step 5: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+Expected: clean. `dataclass(frozen=True)` already covered by M1 EVM types.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/chains/types.py tests/unit/test_solana_types.py
+git commit -m "feat(chains): SolanaBlock + SolanaTransaction dataclasses"
+```
+
+### Task 10.2: `chains.commitment` migration + ORM column
+
+The DB column is nullable so existing EVM rows survive unchanged. Solana rows MUST set `commitment` at API time (enforced in Task 10.3). The migration script is hand-written (not autogenerated) to keep it readable.
+
+**Files:**
+- Modify: `core/config/models.py:73-75` — append `commitment` to `Chain`.
+- Modify: `core/config/repositories.py:28-44` — accept `commitment` kwarg in `ChainRepo.create`.
+- Create: `migrations/versions/0002_solana_commitment.py`.
+- Create: `tests/integration/test_alembic_solana_migration.py`.
+
+- [ ] **Step 1: Write the failing migration test**
+
+```python
+# tests/integration/test_alembic_solana_migration.py
+"""Apply 0002_solana_commitment against a fresh SQLite DB and check the
+column exists; then downgrade and check it's gone.
+
+This is an IT (not a unit test) because alembic touches a real connection.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from alembic import command as alembic_command
+from alembic.config import Config
+from sqlalchemy import create_engine, text
+
+
+@pytest.fixture
+def alembic_cfg(tmp_path: Path) -> Config:
+    cfg = Config("alembic.ini")
+    cfg.set_main_option(
+        "sqlalchemy.url", f"sqlite:///{tmp_path / 'mig.sqlite'}"
+    )
+    return cfg
+
+
+def test_upgrade_0002_adds_commitment_column(alembic_cfg: Config) -> None:
+    alembic_command.upgrade(alembic_cfg, "0002")
+    url = alembic_cfg.get_main_option("sqlalchemy.url")
+    assert url is not None
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        cols = conn.execute(
+            text("PRAGMA table_info(chains)")
+        ).fetchall()
+    names = [r[1] for r in cols]
+    assert "commitment" in names, f"commitment not in {names}"
+
+
+def test_downgrade_0002_removes_commitment_column(alembic_cfg: Config) -> None:
+    alembic_command.upgrade(alembic_cfg, "0002")
+    alembic_command.downgrade(alembic_cfg, "0001")
+    url = alembic_cfg.get_main_option("sqlalchemy.url")
+    assert url is not None
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        cols = conn.execute(
+            text("PRAGMA table_info(chains)")
+        ).fetchall()
+    names = [r[1] for r in cols]
+    assert "commitment" not in names
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/integration/test_alembic_solana_migration.py -v`
+Expected: both tests fail with `FAILED: ...Can't locate revision identified by '0002'` (the file doesn't exist yet).
+
+- [ ] **Step 3: Create the migration file**
+
+```python
+# migrations/versions/0002_solana_commitment.py
+"""solana commitment
+
+Revision ID: 0002
+Revises: 0001
+Create Date: 2026-05-26 09:00:00.000000
+"""
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "0002"
+down_revision: str | None = "0001"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    with op.batch_alter_table("chains") as batch:
+        batch.add_column(
+            sa.Column("commitment", sa.String(length=16), nullable=True)
+        )
+
+
+def downgrade() -> None:
+    with op.batch_alter_table("chains") as batch:
+        batch.drop_column("commitment")
+```
+
+The `batch_alter_table` wrapper is required for SQLite, which does not support `ALTER TABLE ... DROP COLUMN` directly; alembic emulates it by table-rename + recopy. On Postgres the wrapper is a no-op.
+
+- [ ] **Step 4: Add `commitment` to the ORM model**
+
+`core/config/models.py:73`, just after the existing `confirmations` column:
+
+```python
+    confirmations: Mapped[int] = mapped_column(Integer, nullable=False, default=12)
+    commitment: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    poll_interval_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=3000)
+```
+
+- [ ] **Step 5: Add `commitment` to `ChainRepo.create`**
+
+`core/config/repositories.py:28-44`:
+
+```python
+    async def create(
+        self,
+        *,
+        id: str,
+        kind: ChainKind,
+        rpc_http: str,
+        rpc_ws: str | None,
+        confirmations: int,
+        commitment: str | None,
+        poll_interval_ms: int,
+        enabled: bool,
+    ) -> Chain:
+        c = Chain(
+            id=id, kind=kind, rpc_http=rpc_http, rpc_ws=rpc_ws,
+            confirmations=confirmations, commitment=commitment,
+            poll_interval_ms=poll_interval_ms, enabled=enabled,
+        )
+        self.s.add(c)
+        await self.s.flush()
+        return c
+```
+
+(`commitment` is required-keyword. Callers pass `commitment=None` for EVM rows; the API layer enforces non-null for Solana — Task 10.3.)
+
+- [ ] **Step 6: Re-run the migration tests**
+
+Run: `pytest tests/integration/test_alembic_solana_migration.py -v`
+Expected: both PASS.
+
+- [ ] **Step 7: Re-run the full unit + IT suite**
+
+Run: `pytest tests/unit tests/integration -v`
+Expected: green. The M1 chain-router tests now pass `commitment=None` through the API → repo path; if they break, the API hasn't been updated yet (Task 10.3 fixes that). Run them last.
+
+Run: `pytest tests/unit/test_web_chains.py -v`
+Expected: This will likely FAIL right now because `ChainRepo.create` requires `commitment=` kwarg but `apps/web/routers/chains.py` doesn't pass it yet. That's expected — Task 10.3 fixes the router. Verify the failure mode is exactly "TypeError: create() missing 1 required keyword-only argument: 'commitment'" and proceed; do NOT skip ahead and fix the router from here.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add migrations/versions/0002_solana_commitment.py \
+        core/config/models.py core/config/repositories.py \
+        tests/integration/test_alembic_solana_migration.py
+git commit -m "feat(db): chains.commitment column + 0002 migration"
+```
+
+(Web tests stay red for one commit; Task 10.3's commit makes them green again. This split is deliberate — keeps the migration commit reviewable on its own. **If `make test` is invoked between this commit and the Task 10.3 commit, the `TypeError: create() missing 1 required keyword-only argument: 'commitment'` failures in `tests/unit/test_web_chains.py` are expected; do NOT roll back. The very next task fixes them.**)
+
+### Task 10.3: `ChainCreate` kind-validation
+
+EVM chains supply `confirmations`; Solana chains supply `commitment`. The cross-field rule is enforced by a Pydantic v2 `@model_validator(mode="after")`. The validator runs AFTER per-field validators, so `kind` and `confirmations` / `commitment` are already typed by the time we check their joint shape.
+
+**Files:**
+- Modify: `apps/web/schemas.py:11-23` — add import + `commitment` field + validator.
+- Modify: `apps/web/schemas.py:26-35` — add `commitment` to `ChainOut`.
+- Modify: `apps/web/routers/chains.py:25-33` — pass `commitment` through.
+- Create: `tests/unit/test_chain_create_kind_validation.py`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_chain_create_kind_validation.py
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from apps.web.schemas import ChainCreate
+
+
+def _evm_base(**overrides):
+    base = dict(
+        id="eth-mainnet", kind="evm",
+        rpc_http="http://x", rpc_ws=None,
+        confirmations=12, commitment=None,
+        poll_interval_ms=3000, enabled=True,
+    )
+    base.update(overrides)
+    return base
+
+
+def _sol_base(**overrides):
+    base = dict(
+        id="sol-devnet", kind="solana",
+        rpc_http="http://x", rpc_ws=None,
+        confirmations=0, commitment="confirmed",
+        poll_interval_ms=400, enabled=True,
+    )
+    base.update(overrides)
+    return base
+
+
+# -- happy paths -------------------------------------------------------------
+
+def test_evm_chain_with_confirmations_only() -> None:
+    c = ChainCreate(**_evm_base())
+    assert c.kind == "evm" and c.commitment is None and c.confirmations == 12
+
+
+def test_solana_chain_with_commitment_only() -> None:
+    c = ChainCreate(**_sol_base())
+    assert c.kind == "solana" and c.commitment == "confirmed" and c.confirmations == 0
+
+
+def test_solana_chain_finalized_is_accepted() -> None:
+    c = ChainCreate(**_sol_base(commitment="finalized"))
+    assert c.commitment == "finalized"
+
+
+# -- cross-field rejections --------------------------------------------------
+
+def test_evm_chain_with_commitment_is_rejected() -> None:
+    with pytest.raises(ValidationError) as exc:
+        ChainCreate(**_evm_base(commitment="confirmed"))
+    assert "commitment" in str(exc.value).lower()
+
+
+def test_solana_chain_without_commitment_is_rejected() -> None:
+    with pytest.raises(ValidationError) as exc:
+        ChainCreate(**_sol_base(commitment=None))
+    assert "commitment" in str(exc.value).lower()
+
+
+def test_solana_chain_with_invalid_commitment_value_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ChainCreate(**_sol_base(commitment="processed"))
+
+
+# -- legacy compatibility ----------------------------------------------------
+
+def test_evm_chain_legacy_payload_without_commitment_is_accepted() -> None:
+    """Legacy clients that don't send `commitment` for EVM still work."""
+    payload = _evm_base()
+    payload.pop("commitment")
+    c = ChainCreate(**payload)
+    assert c.commitment is None
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_chain_create_kind_validation.py -v`
+Expected: many fail with `ValidationError` about the unrecognized `commitment` field (because `ChainCreate` doesn't have it yet), or with the cross-field rules not being enforced.
+
+- [ ] **Step 3: Update `ChainCreate`**
+
+`apps/web/schemas.py` (top imports + `ChainCreate` body):
+
+```python
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# … (existing ArgFilterValue alias from chunk 9 stays here) …
+
+
+class ChainCreate(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    kind: Literal["evm", "solana"]
+    rpc_http: str = Field(min_length=1)
+    rpc_ws: str | None = None
+    confirmations: int = Field(ge=0, le=10_000)
+    commitment: Literal["confirmed", "finalized"] | None = None
+    poll_interval_ms: int = Field(ge=100, le=60_000)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _check_kind_specific_fields(self) -> "ChainCreate":
+        if self.kind == "evm" and self.commitment is not None:
+            raise ValueError(
+                "evm chains must not set 'commitment' (use 'confirmations' instead)"
+            )
+        if self.kind == "solana" and self.commitment is None:
+            raise ValueError(
+                "solana chains require 'commitment' ('confirmed' or 'finalized')"
+            )
+        return self
+```
+
+- [ ] **Step 4: Update `ChainOut`**
+
+```python
+class ChainOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    kind: str
+    rpc_http: str
+    rpc_ws: str | None
+    confirmations: int
+    commitment: str | None
+    poll_interval_ms: int
+    enabled: bool
+```
+
+- [ ] **Step 5: Pass `commitment` through the chain router**
+
+`apps/web/routers/chains.py:25-33` in `create_chain`:
+
+```python
+    row = await repo.create(
+        id=payload.id,
+        kind=ChainKind(payload.kind),
+        rpc_http=payload.rpc_http,
+        rpc_ws=payload.rpc_ws,
+        confirmations=payload.confirmations,
+        commitment=payload.commitment,
+        poll_interval_ms=payload.poll_interval_ms,
+        enabled=payload.enabled,
+    )
+```
+
+- [ ] **Step 6: Re-run the tests**
+
+Run: `pytest tests/unit/test_chain_create_kind_validation.py tests/unit/test_web_chains.py -v`
+Expected: chain validation tests all PASS; the M1 chain-router tests pass again (the `TypeError` from Task 10.2 Step 7 is gone).
+
+If `test_web_chains.py:test_create_chain_persists_and_publishes` sends the legacy EVM payload without `commitment`, that path is exercised by the new `test_evm_chain_legacy_payload_without_commitment_is_accepted` — both should pass.
+
+- [ ] **Step 7: Lint + typecheck**
+
+Run: `make lint && make typecheck`
+Expected: clean.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add apps/web/schemas.py apps/web/routers/chains.py \
+        tests/unit/test_chain_create_kind_validation.py
+git commit -m "feat(api): ChainCreate kind-validation + commitment field"
+```
+
+### Task 10.4: Snapshot plumbing — `SnapshotChain.commitment`
+
+The snapshot is what the worker reads. Adding `commitment` here is the bridge between the new DB column and the adapter factory in Task 10.7.
+
+**Files:**
+- Modify: `core/config/snapshot.py:37-45` — append `commitment` to `SnapshotChain`.
+- Modify: `core/config/snapshot.py:72-82` — pass `commitment` through in `load_snapshot`.
+- Modify: `tests/unit/test_snapshot.py` (if a Snapshot-builder test exists) OR — Create: `tests/unit/test_snapshot_chains_commitment.py`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/unit/test_snapshot_chains_commitment.py
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+
+import pytest
+import pytest_asyncio
+
+from core.config.db import Database
+from core.config.models import Base, Chain, ChainKind
+from core.config.snapshot import load_snapshot
+
+
+@pytest_asyncio.fixture
+async def db() -> AsyncIterator[Database]:
+    d = Database("sqlite+aiosqlite:///:memory:")
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield d
+    await d.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_commitment_for_solana(db: Database) -> None:
+    async with db.session() as s:
+        s.add(Chain(
+            id="sol-devnet", kind=ChainKind.solana,
+            rpc_http="http://x", rpc_ws=None,
+            confirmations=0, commitment="confirmed",
+            poll_interval_ms=400, enabled=True,
+        ))
+        await s.commit()
+    async with db.session() as s:
+        snap = await load_snapshot(s)
+    [sol] = snap.chains
+    assert sol.id == "sol-devnet"
+    assert sol.kind == "solana"
+    assert sol.commitment == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_commitment_is_none_for_evm(db: Database) -> None:
+    async with db.session() as s:
+        s.add(Chain(
+            id="eth", kind=ChainKind.evm,
+            rpc_http="http://x", rpc_ws=None,
+            confirmations=12, commitment=None,
+            poll_interval_ms=3000, enabled=True,
+        ))
+        await s.commit()
+    async with db.session() as s:
+        snap = await load_snapshot(s)
+    [evm] = snap.chains
+    assert evm.commitment is None
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_snapshot_chains_commitment.py -v`
+Expected: 2 FAIL with `AttributeError: 'SnapshotChain' object has no attribute 'commitment'`.
+
+- [ ] **Step 3: Extend `SnapshotChain`**
+
+`core/config/snapshot.py:37`:
+
+```python
+@dataclass(frozen=True)
+class SnapshotChain:
+    id: str
+    kind: str
+    rpc_http: str
+    rpc_ws: str | None
+    confirmations: int
+    commitment: str | None
+    poll_interval_ms: int
+```
+
+- [ ] **Step 4: Pass `commitment` through `load_snapshot`**
+
+`core/config/snapshot.py:72`:
+
+```python
+    snap_chains = [
+        SnapshotChain(
+            id=c.id,
+            kind=c.kind.value,
+            rpc_http=c.rpc_http,
+            rpc_ws=c.rpc_ws,
+            confirmations=c.confirmations,
+            commitment=c.commitment,
+            poll_interval_ms=c.poll_interval_ms,
+        )
+        for c in chains_rows
+    ]
+```
+
+- [ ] **Step 5: Re-run the tests**
+
+Run: `pytest tests/unit/test_snapshot_chains_commitment.py -v`
+Expected: both PASS.
+
+- [ ] **Step 6: Re-run the full snapshot test file**
+
+Run: `pytest tests/unit/test_snapshot.py -v`
+Expected: existing tests still pass — `SnapshotChain` gained a field but its callers use kwargs.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core/config/snapshot.py tests/unit/test_snapshot_chains_commitment.py
+git commit -m "feat(config): SnapshotChain.commitment plumbed from DB"
+```
+
+### Task 10.5: `SolanaChainAdapter` Protocol
+
+A typed shape the worker factory can return. Lives in `core/chains/adapter.py` alongside the EVM Protocol so both contracts are visible at a glance.
+
+**Files:**
+- Modify: `core/chains/adapter.py` — append `SolanaChainAdapter`.
+- Create: `tests/unit/test_solana_adapter_protocol.py`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/unit/test_solana_adapter_protocol.py
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+
+from core.chains.adapter import SolanaChainAdapter
+from core.chains.types import BlockHeader, SolanaBlock
+
+
+class _StubAdapter:
+    chain_id = "sol-devnet"
+    commitment = "confirmed"
+
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def get_latest_slot(self) -> int: return 0
+    async def fetch_block(self, slot: int) -> SolanaBlock | None: return None
+    def subscribe_heads(self) -> AsyncIterator[BlockHeader]:
+        async def _gen() -> AsyncIterator[BlockHeader]:
+            if False:
+                yield  # pragma: no cover
+        return _gen()
+
+
+def test_stub_conforms_to_solana_chain_adapter() -> None:
+    assert isinstance(_StubAdapter(), SolanaChainAdapter)
+```
+
+- [ ] **Step 2: Run the test to confirm it fails**
+
+Run: `pytest tests/unit/test_solana_adapter_protocol.py -v`
+Expected: FAIL with `ImportError: cannot import name 'SolanaChainAdapter' from 'core.chains.adapter'`.
+
+- [ ] **Step 3: Add the Protocol**
+
+`core/chains/adapter.py`, append (plus extend the existing `typing` and `core.chains.types` imports at the top of the file with `Literal` and `SolanaBlock` respectively):
+
+```python
+# add to the existing `from typing import ...` line: , Literal
+# add to the existing `from core.chains.types import ...` line: , SolanaBlock
+
+
+@runtime_checkable
+class SolanaChainAdapter(Protocol):
+    """Solana-side counterpart to ``ChainAdapter``. Diverges deliberately:
+    - ``commitment`` (not ``confirmations``) carries the finality preference.
+    - ``fetch_block`` returns ``SolanaBlock | None`` because Solana slots
+      may be empty (missed-slot case — handled by caller as "advance one
+      slot and continue", per spec §6).
+    - ``get_latest_slot`` replaces ``get_latest_block_number``: Solana
+      slots and blocks are NOT 1:1.
+    - There is no ``fetch_logs`` — Solana programs emit logs inside the
+      block's transactions; the parser pipeline reads them from
+      ``SolanaTransaction.log_messages``.
+    """
+
+    chain_id: str
+    commitment: Literal["confirmed", "finalized"]
+
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def get_latest_slot(self) -> int: ...
+    async def fetch_block(self, slot: int) -> SolanaBlock | None: ...
+    def subscribe_heads(self) -> AsyncIterator[BlockHeader]: ...
+```
+
+(The Solana adapter still yields the EVM `BlockHeader` from `subscribe_heads` — `BlockHeader` is intentionally chain-agnostic. The runner only needs `number` (which is the slot for Solana), `hash`, `parent_hash`, `timestamp`. The Solana adapter computes `hash`/`parent_hash` from the slot's `blockhash` and `parent_slot`'s `blockhash`.)
+
+- [ ] **Step 4: Re-run the test**
+
+Run: `pytest tests/unit/test_solana_adapter_protocol.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/chains/adapter.py tests/unit/test_solana_adapter_protocol.py
+git commit -m "feat(chains): SolanaChainAdapter Protocol"
+```
+
+### Task 10.6: `SolanaAdapter` — unit tests with httpx mocking (Red)
+
+Three behaviour gates from spec §6:
+1. `getBlock(slot)` HTTP 200 with `result: null` → returns `None` (missed slot).
+2. `getBlock(slot)` HTTP 4xx/5xx or transport error → retried by `core.notifier.retry.retry_with_backoff` (3 attempts, exponential); after max retries, the helper raises `RetryExhausted` whose `__cause__` is the original `httpx.HTTPStatusError`.
+3. `getSlot` returns the integer at the configured commitment.
+
+We mock `httpx.AsyncClient` via `httpx.MockTransport` so tests run without a validator. The integration test (Task 10.9) exercises the real RPC. Tests inject a no-op `sleep` into the adapter to skip the 1-second / 4-second retry waits.
+
+**Files:**
+- Create: `tests/unit/test_solana_adapter.py`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_solana_adapter.py
+"""Unit tests for SolanaAdapter — httpx mocked, no real RPC.
+
+Five contracts under test:
+- subscribe-style getSlot returns int at configured commitment.
+- getBlock(slot) returning JSON-RPC `result: null` -> Python `None` (missed slot).
+- getBlock(slot) returning a full block -> populated `SolanaBlock`.
+- getBlock(slot) returning persistent 5xx -> `RetryExhausted`, three attempts made.
+- `meta.err` non-null on a tx -> `tx.success is False`.
+
+The mocked handlers always dispatch on `body["method"]` so a single transport
+can satisfy any call sequence the adapter makes (currently `connect()` opens
+the client without an RPC ping, so the tests would still work without method
+dispatch — but the dispatch idiom makes the tests robust to future ping
+additions).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import httpx
+import pytest
+
+from core.chains.solana import SolanaAdapter
+from core.chains.types import SolanaBlock
+from core.notifier.retry import RetryExhausted
+
+
+async def _no_sleep(_: float) -> None:  # injected into the adapter to keep tests fast
+    return None
+
+
+def _ok_json(payload: dict[str, Any]) -> httpx.Response:
+    return httpx.Response(200, content=json.dumps(payload).encode())
+
+
+def _err_json(code: int) -> httpx.Response:
+    return httpx.Response(code, content=b'{"error":"boom"}')
+
+
+def _mock_transport(handler):
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_get_latest_slot_returns_int() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content.decode())
+        calls.append(body)
+        assert body["method"] == "getSlot"
+        return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": 12345})
+
+    adapter = SolanaAdapter(
+        chain_id="sol", rpc_url="http://x",
+        commitment="confirmed", poll_interval_ms=400,
+        transport=_mock_transport(handler),
+        sleep=_no_sleep,
+    )
+    await adapter.connect()
+    try:
+        slot = await adapter.get_latest_slot()
+    finally:
+        await adapter.disconnect()
+    assert slot == 12345
+    assert calls[0]["method"] == "getSlot"
+
+
+@pytest.mark.asyncio
+async def test_fetch_block_missed_slot_returns_none() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content.decode())
+        # Solana RPC returns `result: null` for missed slots, HTTP 200.
+        # Handler dispatches on method so future `connect()`-time pings would still work.
+        if body["method"] == "getSlot":
+            return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": 1000})
+        assert body["method"] == "getBlock"
+        return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": None})
+
+    adapter = SolanaAdapter(
+        chain_id="sol", rpc_url="http://x",
+        commitment="confirmed", poll_interval_ms=400,
+        transport=_mock_transport(handler),
+        sleep=_no_sleep,
+    )
+    await adapter.connect()
+    try:
+        result = await adapter.fetch_block(slot=999)
+    finally:
+        await adapter.disconnect()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_block_decodes_full_block() -> None:
+    """A non-null `getBlock` response with one tx becomes a populated SolanaBlock."""
+    block_payload = {
+        "blockhash": "BHASH",
+        "previousBlockhash": "PHASH",
+        "parentSlot": 99,
+        "blockTime": 1_700_000_000,
+        "transactions": [{
+            "transaction": {
+                "signatures": ["SIG1"],
+                "message": {
+                    "accountKeys": ["A", "B"],
+                    "instructions": [{
+                        "programIdIndex": 0,
+                        "accounts": [0, 1],
+                        "data": "3Bxs4h",
+                        "stackHeight": 1,
+                    }],
+                },
+            },
+            "meta": {
+                "err": None,
+                "fee": 5000,
+                "preBalances": [10**9, 0],
+                "postBalances": [10**9 - 5000, 0],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": ["Program A invoke [1]"],
+                "innerInstructions": [],
+            },
+        }],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content.decode())
+        if body["method"] == "getSlot":
+            return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": 100})
+        assert body["method"] == "getBlock"
+        return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": block_payload})
+
+    adapter = SolanaAdapter(
+        chain_id="sol", rpc_url="http://x",
+        commitment="confirmed", poll_interval_ms=400,
+        transport=_mock_transport(handler),
+        sleep=_no_sleep,
+    )
+    await adapter.connect()
+    try:
+        block = await adapter.fetch_block(slot=100)
+    finally:
+        await adapter.disconnect()
+    assert isinstance(block, SolanaBlock)
+    assert block.slot == 100
+    assert block.parent_slot == 99
+    assert block.block_hash == "BHASH"
+    assert block.block_time == 1_700_000_000
+    [tx] = block.transactions
+    assert tx.signature == "SIG1"
+    assert tx.success is True
+    assert tx.fee == 5000
+    assert tx.account_keys == ["A", "B"]
+    assert tx.log_messages == ["Program A invoke [1]"]
+    [ix] = tx.instructions
+    assert ix.program_id == "A"
+    assert ix.accounts == ["A", "B"]
+    assert ix.stack_depth == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_block_5xx_exhausts_retries() -> None:
+    """Persistent 5xx on `getBlock` -> `RetryExhausted` after 3 attempts;
+    the original `httpx.HTTPStatusError` is preserved as `__cause__`."""
+    call_count = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        body = json.loads(req.content.decode())
+        if body["method"] == "getSlot":
+            return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": 100})
+        # getBlock always 5xx
+        call_count += 1
+        return _err_json(503)
+
+    adapter = SolanaAdapter(
+        chain_id="sol", rpc_url="http://x",
+        commitment="confirmed", poll_interval_ms=400,
+        transport=_mock_transport(handler),
+        sleep=_no_sleep,
+    )
+    await adapter.connect()
+    try:
+        with pytest.raises(RetryExhausted) as exc_info:
+            await adapter.fetch_block(slot=100)
+    finally:
+        await adapter.disconnect()
+    # `core.notifier.retry.retry_with_backoff` re-raises after max_attempts;
+    # the adapter passes max_attempts=3.
+    assert call_count == 3, f"expected 3 RPC attempts under retry, got {call_count}"
+    assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+
+@pytest.mark.asyncio
+async def test_failed_tx_marked_not_success() -> None:
+    """`meta.err` non-null → tx.success = False."""
+    block_payload = {
+        "blockhash": "B", "previousBlockhash": "P",
+        "parentSlot": 0, "blockTime": 0,
+        "transactions": [{
+            "transaction": {
+                "signatures": ["SIG"],
+                "message": {"accountKeys": ["A"], "instructions": []},
+            },
+            "meta": {
+                "err": {"InstructionError": [0, "Custom"]},
+                "fee": 5000, "preBalances": [0], "postBalances": [0],
+                "preTokenBalances": [], "postTokenBalances": [],
+                "logMessages": [], "innerInstructions": [],
+            },
+        }],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content.decode())
+        if body["method"] == "getSlot":
+            return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": 1})
+        assert body["method"] == "getBlock"
+        return _ok_json({"jsonrpc": "2.0", "id": body["id"], "result": block_payload})
+
+    adapter = SolanaAdapter(
+        chain_id="sol", rpc_url="http://x",
+        commitment="confirmed", poll_interval_ms=400,
+        transport=_mock_transport(handler),
+        sleep=_no_sleep,
+    )
+    await adapter.connect()
+    try:
+        block = await adapter.fetch_block(slot=1)
+    finally:
+        await adapter.disconnect()
+    assert block is not None
+    [tx] = block.transactions
+    assert tx.success is False
+```
+
+- [ ] **Step 2: Run the tests to confirm they fail**
+
+Run: `pytest tests/unit/test_solana_adapter.py -v`
+Expected: 5 FAIL with `ModuleNotFoundError: No module named 'core.chains.solana'`.
+
+### Task 10.7: `SolanaAdapter` (Green)
+
+**Files:**
+- Modify: `pyproject.toml` — add `solders>=0.21,<0.30` to dependencies (NOT dev — used at runtime by the worker).
+- Create: `core/chains/solana.py`.
+
+- [ ] **Step 1: Add `solders` to runtime deps**
+
+In `pyproject.toml`, the `[project].dependencies` array:
+
+```toml
+"solders>=0.21,<0.30",
+```
+
+Re-resolve:
+
+```bash
+pip install -e ".[dev]"
+```
+
+- [ ] **Step 2: Implement `SolanaAdapter`**
+
+```python
+# core/chains/solana.py
+"""HTTP-only Solana adapter using `solders` for RPC type-safety and `httpx`
+for transport.
+
+Per spec §4.6:
+- HTTP-only polling at the configured commitment (no WebSocket).
+- ``fetch_block`` returns ``SolanaBlock | None``; ``None`` represents a
+  missed slot (the JSON-RPC `result: null` case).
+- Retries (3 attempts, exponential) on transport errors and 5xx via
+  ``core.notifier.retry.retry_with_backoff`` — reused, not reimplemented.
+
+solders + httpx idiom: build a typed request (e.g. ``GetSlot(...)``),
+serialize with ``.to_json()``, POST via ``httpx.AsyncClient``, parse the
+response with the matching ``*Resp.from_json(...)``. NOTE: chunk 10 keeps
+the JSON-RPC walk manual (the response shape is the simplest of any RPC
+method we use); solders' typed responses get exercised in chunks 12 / 13
+where the request side benefits most from ``Pubkey`` and borsh helpers.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
+from typing import Literal
+
+import httpx
+import structlog
+
+from core.chains.types import (
+    BlockHeader,
+    SolanaBlock,
+    SolanaInstruction,
+    SolanaTokenBalance,
+    SolanaTransaction,
+)
+from core.notifier.retry import retry_with_backoff
+
+log = structlog.get_logger(__name__)
+
+
+class SolanaAdapter:
+    chain_id: str
+    commitment: Literal["confirmed", "finalized"]
+
+    def __init__(
+        self,
+        *,
+        chain_id: str,
+        rpc_url: str,
+        commitment: Literal["confirmed", "finalized"],
+        poll_interval_ms: int,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.chain_id = chain_id
+        self.commitment = commitment
+        self._rpc_url = rpc_url
+        self._poll_interval_s = poll_interval_ms / 1000.0
+        self._transport = transport
+        self._sleep = sleep
+        self._client: httpx.AsyncClient | None = None
+        self._req_id = 0
+
+    async def connect(self) -> None:
+        # No RPC ping at connect: a real RPC error surfaces lazily on the
+        # first `get_latest_slot` / `fetch_block`, which is where the runner
+        # already has retry/abort logic. A ping here would add a second
+        # failure mode that callers don't expect.
+        self._client = httpx.AsyncClient(
+            transport=self._transport,
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+        )
+
+    async def disconnect(self) -> None:
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.aclose()
+            self._client = None
+
+    async def _rpc(self, method: str, params: list) -> dict:
+        assert self._client is not None
+        self._req_id += 1
+        body = {
+            "jsonrpc": "2.0",
+            "id": self._req_id,
+            "method": method,
+            "params": params,
+        }
+
+        async def _post() -> dict:
+            resp = await self._client.post(  # type: ignore[union-attr]
+                self._rpc_url,
+                json=body,
+                headers={"content-type": "application/json"},
+            )
+            # 4xx and 5xx alike → HTTPStatusError → retried by retry_with_backoff
+            # (which classifies every Exception except `RetryAbort` as retryable).
+            # Spec §6 wants 4xx retried too (transient gateway errors look like 4xx
+            # in some Solana RPC providers), so this is intentional.
+            resp.raise_for_status()
+            return resp.json()
+
+        return await retry_with_backoff(
+            partial(_post),
+            max_attempts=3,
+            base_delay=1.0,
+            sleep=self._sleep,
+        )
+
+    async def get_latest_slot(self) -> int:
+        result = await self._rpc("getSlot", [{"commitment": self.commitment}])
+        return int(result["result"])
+
+    async def fetch_block(self, slot: int) -> SolanaBlock | None:
+        params = [
+            slot,
+            {
+                "commitment": self.commitment,
+                "encoding": "json",
+                "maxSupportedTransactionVersion": 0,
+                "transactionDetails": "full",
+                "rewards": False,
+            },
+        ]
+        result = await self._rpc("getBlock", params)
+        raw = result.get("result")
+        if raw is None:
+            return None
+        return _decode_block(slot=slot, raw=raw)
+
+    def subscribe_heads(self) -> AsyncIterator[BlockHeader]:
+        """Poll ``getSlot`` at ``poll_interval_ms`` and yield BlockHeader
+        whenever the slot advances. ``hash`` / ``parent_hash`` are filled
+        with the slot integers stringified — chunk 11's ChainRunner doesn't
+        use them for reorg detection on Solana (commitment level guarantees
+        finality), so a stable placeholder is fine. TODO(chunk 11): the
+        Solana parser pipeline consumes ``SolanaBlock`` directly and never
+        reads ``BlockHeader.hash`` / ``parent_hash`` / ``timestamp``; keep
+        them as placeholders rather than over-engineering."""
+        return self._poll_heads()
+
+    async def _poll_heads(self) -> AsyncIterator[BlockHeader]:
+        last = -1
+        while True:
+            slot = await self.get_latest_slot()
+            if slot > last:
+                yield BlockHeader(
+                    number=slot,
+                    hash=str(slot),
+                    parent_hash=str(slot - 1) if slot > 0 else "",
+                    timestamp=0,
+                )
+                last = slot
+            await asyncio.sleep(self._poll_interval_s)
+
+
+# -- decode helpers ---------------------------------------------------------
+
+
+def _decode_token_balance(raw: dict) -> SolanaTokenBalance:
+    ut = raw.get("uiTokenAmount", {}) or {}
+    return SolanaTokenBalance(
+        account_index=int(raw["accountIndex"]),
+        mint=str(raw["mint"]),
+        owner=raw.get("owner"),
+        amount=int(ut.get("amount", "0")),
+        decimals=int(ut.get("decimals", 0)),
+    )
+
+
+def _decode_instruction(
+    raw: dict, account_keys: list[str], stack_depth: int
+) -> SolanaInstruction:
+    program_idx = int(raw["programIdIndex"])
+    # `stackHeight` exists on inner instructions (validator >= 1.14) but is absent
+    # on top-level instructions; fall back to the caller-supplied `stack_depth`
+    # (`1` for the top-level loop, incremented for inner CPI walks in chunk 13).
+    raw_stack = raw.get("stackHeight")
+    return SolanaInstruction(
+        program_id=account_keys[program_idx],
+        accounts=[account_keys[i] for i in raw.get("accounts", [])],
+        data_b58=str(raw.get("data", "")),
+        stack_depth=int(raw_stack) if raw_stack is not None else stack_depth,
+    )
+
+
+def _decode_transaction(raw: dict) -> SolanaTransaction:
+    meta = raw.get("meta") or {}
+    tx = raw.get("transaction") or {}
+    message = tx.get("message") or {}
+    account_keys = [str(k) for k in message.get("accountKeys", [])]
+    signatures = list(tx.get("signatures") or [])
+
+    top_level = [
+        _decode_instruction(ix, account_keys, stack_depth=1)
+        for ix in message.get("instructions", [])
+    ]
+    # Inner instructions are emitted inside a separate `innerInstructions`
+    # bucket per top-level position; chunk 11's parsers walk both.
+    inner: list[SolanaInstruction] = []
+    for inner_block in meta.get("innerInstructions") or []:
+        for ix in inner_block.get("instructions") or []:
+            inner.append(_decode_instruction(ix, account_keys, stack_depth=2))
+
+    return SolanaTransaction(
+        signature=signatures[0] if signatures else "",
+        slot=0,  # filled in by caller — block-level field
+        success=meta.get("err") is None,
+        fee=int(meta.get("fee", 0) or 0),
+        account_keys=account_keys,
+        pre_balances=[int(x) for x in meta.get("preBalances", []) or []],
+        post_balances=[int(x) for x in meta.get("postBalances", []) or []],
+        pre_token_balances=[_decode_token_balance(t) for t in meta.get("preTokenBalances", []) or []],
+        post_token_balances=[_decode_token_balance(t) for t in meta.get("postTokenBalances", []) or []],
+        log_messages=[str(m) for m in meta.get("logMessages", []) or []],
+        instructions=top_level + inner,
+    )
+
+
+def _decode_block(*, slot: int, raw: dict) -> SolanaBlock:
+    txs = [_decode_transaction(t) for t in raw.get("transactions", []) or []]
+    # Backfill the slot — _decode_transaction can't see it from `raw`.
+    txs = [
+        SolanaTransaction(
+            signature=t.signature,
+            slot=slot,
+            success=t.success,
+            fee=t.fee,
+            account_keys=t.account_keys,
+            pre_balances=t.pre_balances,
+            post_balances=t.post_balances,
+            pre_token_balances=t.pre_token_balances,
+            post_token_balances=t.post_token_balances,
+            log_messages=t.log_messages,
+            instructions=t.instructions,
+        )
+        for t in txs
+    ]
+    return SolanaBlock(
+        slot=slot,
+        block_hash=str(raw.get("blockhash", "")),
+        parent_slot=int(raw.get("parentSlot", 0) or 0),
+        block_time=raw.get("blockTime"),
+        transactions=txs,
+    )
+```
+
+The adapter is intentionally NOT using `solders`-typed responses for the body parsing — direct JSON walking is simpler, and `solders` 0.21–0.24 has small API drift on the response side that's brittle to pin against. The `solders` dep is held in `pyproject.toml` for chunk 12 (SPL) and chunk 13 (Anchor IDL) which need `Pubkey` validation + borsh helpers, not for the adapter itself.
+
+- [ ] **Step 3: Re-run the unit tests**
+
+Run: `pytest tests/unit/test_solana_adapter.py -v`
+Expected: all 5 PASS. If `test_fetch_block_5xx_exhausts_retries` fails with `call_count == 1`, `retry_with_backoff` isn't being called — check the `_post` wrapper is invoked through `partial(_post)` rather than the bare coroutine. If it fails with `call_count == 3` but `RetryExhausted` is not raised, the helper signature has drifted from M1 — re-read `core/notifier/retry.py`.
+
+- [ ] **Step 4: Lint + typecheck**
+
+Run: `make lint && make typecheck`
+Expected: clean. If mypy complains about `result["result"]` being `Any`, that's expected — we're walking arbitrary JSON. Leave the `Any`s; do not add `cast`s unless mypy is configured strict enough to require them.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/chains/solana.py tests/unit/test_solana_adapter.py pyproject.toml
+git commit -m "feat(chains): SolanaAdapter — http-poll RPC with missed-slot semantics"
+```
+
+### Task 10.8: Worker factory branch — Solana support
+
+**Files:**
+- Modify: `apps/worker/main.py:24-36` — branch on `cfg.kind`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/unit/test_worker_adapter_factory.py
+from __future__ import annotations
+
+from apps.worker.main import _default_adapter_factory
+from core.chains.evm import EvmAdapter
+from core.chains.solana import SolanaAdapter
+from core.config.snapshot import SnapshotChain
+
+
+def _evm_cfg() -> SnapshotChain:
+    return SnapshotChain(
+        id="eth", kind="evm",
+        rpc_http="http://x", rpc_ws=None,
+        confirmations=12, commitment=None,
+        poll_interval_ms=3000,
+    )
+
+
+def _sol_cfg() -> SnapshotChain:
+    return SnapshotChain(
+        id="sol", kind="solana",
+        rpc_http="http://x", rpc_ws=None,
+        confirmations=0, commitment="confirmed",
+        poll_interval_ms=400,
+    )
+
+
+def test_factory_returns_evm_adapter_for_evm_kind() -> None:
+    adapter = _default_adapter_factory(_evm_cfg())
+    assert isinstance(adapter, EvmAdapter)
+    assert adapter.chain_id == "eth"
+
+
+def test_factory_returns_solana_adapter_for_solana_kind() -> None:
+    adapter = _default_adapter_factory(_sol_cfg())
+    assert isinstance(adapter, SolanaAdapter)
+    assert adapter.chain_id == "sol"
+    assert adapter.commitment == "confirmed"
+
+
+def test_factory_unknown_kind_raises() -> None:
+    cfg = SnapshotChain(
+        id="x", kind="dogecoin",
+        rpc_http="http://x", rpc_ws=None,
+        confirmations=0, commitment=None, poll_interval_ms=400,
+    )
+    import pytest
+    with pytest.raises((NotImplementedError, ValueError)):
+        _default_adapter_factory(cfg)
+```
+
+- [ ] **Step 2: Run the test to confirm it fails**
+
+Run: `pytest tests/unit/test_worker_adapter_factory.py -v`
+Expected: the Solana case fails — current factory `raise NotImplementedError(...)` on non-EVM. The EVM case passes.
+
+- [ ] **Step 3: Branch the factory**
+
+`apps/worker/main.py:24-36`:
+
+```python
+def _default_adapter_factory(cfg: SnapshotChain):
+    if cfg.kind == "evm":
+        # Keep `poll_interval_ms` plumbed through — chunk 1.3 added it and ships a
+        # regression test (`tests/unit/test_evm_poll_interval.py`). Do not drop it.
+        return EvmAdapter(
+            chain_id=cfg.id,
+            rpc_http=cfg.rpc_http,
+            rpc_ws=cfg.rpc_ws,
+            confirmations=cfg.confirmations,
+            poll_interval_ms=cfg.poll_interval_ms,
+        )
+    if cfg.kind == "solana":
+        assert cfg.commitment is not None, (
+            f"solana chain {cfg.id!r} loaded without a commitment "
+            "— DB-level invariant broken; check chain create API"
+        )
+        return SolanaAdapter(
+            chain_id=cfg.id,
+            rpc_url=cfg.rpc_http,
+            commitment=cfg.commitment,  # type: ignore[arg-type]
+            poll_interval_ms=cfg.poll_interval_ms,
+        )
+    raise NotImplementedError(f"chain kind {cfg.kind!r} not supported")
+```
+
+Also add the import at the top of `apps/worker/main.py`:
+
+```python
+from core.chains.solana import SolanaAdapter
+```
+
+The return type is intentionally NOT annotated. The two branches return different concrete types; the union type would be `EvmAdapter | SolanaAdapter`, which is fine but adds churn at every call site. ChainRunner (chunk 11) accepts both via `ChainAdapter | SolanaChainAdapter`.
+
+- [ ] **Step 4: Re-run the test**
+
+Run: `pytest tests/unit/test_worker_adapter_factory.py -v`
+Expected: 3 PASS.
+
+- [ ] **Step 5: Re-run the full worker IT suite**
+
+Run: `pytest tests/integration/test_worker_*.py -v`
+Expected: still green. The Solana branch isn't exercised because no Solana chain is configured in M1's IT.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add apps/worker/main.py tests/unit/test_worker_adapter_factory.py
+git commit -m "feat(worker): adapter factory branches on chain kind"
+```
+
+### Task 10.9: Integration test against `solana-test-validator`
+
+A session-scoped fixture spins up `solana-test-validator` once per test session (5–10 s cold start), exposing an ephemeral RPC URL. The IT exercises `get_latest_slot`, `fetch_block` on a real slot, and the missed-slot case (slot intentionally chosen well above tip).
+
+Validator install is detected at fixture-entry; tests skip if `solana-test-validator` isn't on PATH. Install instructions are in `docs/dev-setup.md` (`sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"`).
+
+**Files:**
+- Modify (append to): `tests/integration/conftest.py` — file already exists from M1 with a `db` fixture; the `solana_validator` fixture below is **additive** (do NOT overwrite the existing fixtures or imports; add the new code below them).
+- Create: `tests/integration/test_solana_adapter.py`.
+
+**pytest-asyncio scope note:** the fixture below is a plain `@pytest.fixture(scope="session")` (sync `def`, not `async def`), and the IT functions are decorated with `pytestmark = [pytest.mark.asyncio]` (default function-scoped event loop). This combination is the safest cross-version pattern for pytest-asyncio: a sync session-scoped fixture is consumed by an async function-scoped test without ever asking pytest-asyncio to reconcile event-loop scopes. If the project later moves to pytest-asyncio 1.x and starts complaining about scope mismatches, the fix is to set `asyncio_default_fixture_loop_scope = "session"` in `pyproject.toml` (NOT to make the fixture `async`).
+
+- [ ] **Step 1: Add the validator fixture**
+
+```python
+# tests/integration/conftest.py  --  APPEND the below to the existing file (do not overwrite the M1 `db` fixture or its imports)
+
+from __future__ import annotations
+
+import contextlib
+import shutil
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+import httpx
+import pytest
+
+
+@dataclass
+class SolanaValidatorHandle:
+    rpc_url: str
+    process: subprocess.Popen
+    ledger_path: Path
+
+
+def _free_tcp_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_rpc(url: str, *, timeout_s: float = 25.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    body = b'{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.post(url, content=body, headers={"content-type": "application/json"}, timeout=2.0)
+            if r.status_code == 200 and r.json().get("result") == "ok":
+                return
+        except (httpx.RequestError, ValueError):
+            pass
+        time.sleep(0.5)
+    raise TimeoutError(f"solana-test-validator did not become healthy at {url}")
+
+
+@pytest.fixture(scope="session")
+def solana_validator(tmp_path_factory) -> Iterator[SolanaValidatorHandle]:
+    """Session-scoped: 5–10 s cold start; subsequent tests reuse the same
+    validator. Validator state accumulates across tests, but every IT here
+    is read-only so that's acceptable."""
+    if shutil.which("solana-test-validator") is None:
+        pytest.skip("solana-test-validator not installed; see docs/dev-setup.md")
+
+    rpc_port = _free_tcp_port()
+    faucet_port = _free_tcp_port()
+    ledger = tmp_path_factory.mktemp("solana-ledger")
+    proc = subprocess.Popen(
+        [
+            "solana-test-validator",
+            "--reset",
+            "--quiet",
+            "--ledger", str(ledger),
+            "--rpc-port", str(rpc_port),
+            "--faucet-port", str(faucet_port),
+            "--bind-address", "127.0.0.1",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    rpc_url = f"http://127.0.0.1:{rpc_port}"
+    try:
+        _wait_for_rpc(rpc_url)
+        yield SolanaValidatorHandle(rpc_url=rpc_url, process=proc, ledger_path=ledger)
+    finally:
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5.0)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+```
+
+- [ ] **Step 2: Write the integration test**
+
+```python
+# tests/integration/test_solana_adapter.py
+"""IT against a real solana-test-validator.
+
+Covers:
+- get_latest_slot returns an int that increases over time.
+- fetch_block at an existing slot returns a SolanaBlock with at least one tx
+  (the validator always has a `vote` tx).
+- fetch_block at a far-future slot returns None (missed slot semantics).
+"""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from core.chains.solana import SolanaAdapter
+from core.chains.types import SolanaBlock
+
+pytestmark = [pytest.mark.asyncio]
+
+
+async def test_get_latest_slot_increases(solana_validator) -> None:
+    adapter = SolanaAdapter(
+        chain_id="local",
+        rpc_url=solana_validator.rpc_url,
+        commitment="confirmed",
+        poll_interval_ms=400,
+    )
+    await adapter.connect()
+    try:
+        s1 = await adapter.get_latest_slot()
+        await asyncio.sleep(2.0)
+        s2 = await adapter.get_latest_slot()
+        assert s1 >= 0
+        assert s2 >= s1, f"slot did not advance: {s1} -> {s2}"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_fetch_existing_block_returns_solana_block(solana_validator) -> None:
+    adapter = SolanaAdapter(
+        chain_id="local",
+        rpc_url=solana_validator.rpc_url,
+        commitment="confirmed",
+        poll_interval_ms=400,
+    )
+    await adapter.connect()
+    try:
+        # Pick a slot well below the tip — every populated slot returns a block.
+        tip = await adapter.get_latest_slot()
+        target = max(tip - 5, 1)
+        # Walk backwards a few slots; pick the first non-null result.
+        block: SolanaBlock | None = None
+        for s in range(target, max(target - 10, 0), -1):
+            block = await adapter.fetch_block(s)
+            if block is not None:
+                break
+        assert block is not None, "no populated block found within 10 slots of tip"
+        assert block.slot >= 1
+        assert block.block_hash != ""
+        # Validator always emits a vote tx per slot.
+        assert len(block.transactions) >= 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_fetch_far_future_slot_returns_none(solana_validator) -> None:
+    adapter = SolanaAdapter(
+        chain_id="local",
+        rpc_url=solana_validator.rpc_url,
+        commitment="confirmed",
+        poll_interval_ms=400,
+    )
+    await adapter.connect()
+    try:
+        tip = await adapter.get_latest_slot()
+        # Way above the tip — slot 10 000 000 ahead does NOT exist yet.
+        result = await adapter.fetch_block(tip + 10_000_000)
+        assert result is None, "expected None for un-produced slot"
+    finally:
+        await adapter.disconnect()
+```
+
+- [ ] **Step 3: Run the IT**
+
+```bash
+pytest tests/integration/test_solana_adapter.py -v
+```
+
+Expected on a host with `solana-test-validator` installed: 3 PASS in ~10–15 s (5–10 s of which is the validator boot). On a host without it: 3 SKIP.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add tests/integration/conftest.py tests/integration/test_solana_adapter.py
+git commit -m "test(integration): solana adapter against solana-test-validator"
+```
+
+### Task 10.10: Close-out — verify full suite green
+
+- [ ] **Step 1: Run the full unit suite**
+
+```bash
+make test
+```
+Expected: every chunk 1–10 unit / IT test passes. If `tests/integration/test_solana_adapter.py` SKIPs because the validator isn't installed, that's acceptable.
+
+- [ ] **Step 2: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+Expected: clean.
+
+- [ ] **Step 3: Final commit**
+
+If any cleanup was needed (e.g., trailing `import core.chains.solana` left in a stub), this is the place to land it. No tag for chunk 10 — chunk 14 is the M2 close-out tag.
+
+```bash
+git status   # confirm nothing left uncommitted
+```
+
+---

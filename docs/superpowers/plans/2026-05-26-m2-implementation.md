@@ -9424,6 +9424,7 @@ from typing import Protocol
 
 import structlog
 
+from core.abi.registry import AbiRegistry
 from core.chains.adapter import ChainAdapter, SolanaChainAdapter
 from core.chains.confirmation_buffer import ConfirmationBuffer, ReorgEvent
 from core.chains.types import BlockHeader, SolanaBlock
@@ -9435,6 +9436,9 @@ from core.config.snapshot import (
 from core.matcher.matcher import Matcher
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
+from core.parser.abi_call import AbiCallParser
+from core.parser.abi_event import AbiEventParser
+from core.parser.erc20 import Erc20TransferParser
 from core.parser.event import Event
 from core.parser.native import EvmNativeTransferParser
 from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
@@ -9482,12 +9486,14 @@ class ChainRunner:
         channel_factory: ChannelFactory,
         checkpoint_repo: _CheckpointRepo,
         notifier_max_concurrency: int = 50,
+        abi_registry: AbiRegistry | None = None,
     ) -> None:
         self._chain = chain
         self._adapter_factory = adapter_factory
         self._channel_factory = channel_factory
         self._cp = checkpoint_repo
         self._notifier_max_concurrency = notifier_max_concurrency
+        self._abi_registry = abi_registry
 
         self._adapter: ChainAdapter | SolanaChainAdapter | None = None
         self._buffer: ConfirmationBuffer | None = None  # EVM only
@@ -9513,9 +9519,15 @@ class ChainRunner:
 
         if self._chain.kind == "evm":
             self._buffer = ConfirmationBuffer(confirmations=self._chain.confirmations)
+            evm_parsers: list = [
+                EvmNativeTransferParser(chain_id=self._chain.id),
+                Erc20TransferParser(chain_id=self._chain.id),
+            ]
+            if self._abi_registry is not None:
+                evm_parsers.append(AbiEventParser(chain_id=self._chain.id, registry=self._abi_registry))
+                evm_parsers.append(AbiCallParser(chain_id=self._chain.id, registry=self._abi_registry))
             self._pipeline = EvmParserPipeline(
-                self._evm_parsers_override
-                or [EvmNativeTransferParser(chain_id=self._chain.id)]
+                self._evm_parsers_override or evm_parsers
             )
         elif self._chain.kind == "solana":
             # No buffer for Solana — commitment handles finality (spec §4.6).
@@ -10841,3 +10853,1266 @@ git commit -m "docs(plan): mark M2 follow-up #11 (matcher case-folding) DONE"
 If `git status` is empty, this step is a no-op. No tag for chunk 12 — chunk 14 is the M2 close-out tag.
 
 ---
+## Chunk 13: `AnchorIdlEventParser` + `borsh-construct` decoder path
+
+The third (and last) Solana parser ships. It decodes Anchor IDL events emitted via the `emit!` macro, which surface in transaction logs as `Program data: <base64>` lines. The 8-byte discriminator at the head of each payload selects the event schema; the registry resolves `(program_id, discriminator) → (abi_id, event_name, schema)` so the parser borsh-decodes the body using the right struct. The remaining tasks wire the new parser into `ChainRunner.start()` so every Solana-kind chain runs all three Solana parsers out of the box once an `AbiRegistry` exists.
+
+**Why a new registry index instead of reusing the topic0 index from chunk 4?** EVM `topic0` is a 32-byte keccak hash, globally unique-ish across ABIs; Solana Anchor discriminators are an 8-byte sha256 prefix (`sha256("event:<EventName>")[:8]`), which is short enough that two unrelated programs can collide by accident. Spec §6 (row "Anchor IDL discriminator collision") resolves this by scoping every lookup by the *emitting* program ID — recovered at decode time from the surrounding `Program <pid> invoke [N]` / `Program <pid> success` log frame. The new index therefore keys on `(program_id_b58, discriminator_hex)`.
+
+**Anchor IDL ↔ program_id binding.** An Anchor IDL JSON has `metadata.address` set to the program's deployed pubkey. The index build reads `body["metadata"]["address"]`; IDLs missing it are logged and skipped.
+
+**Scope-limiting type support.** Chunk 13's borsh schema covers IDL fields of type: `bool`, `u8`/`u16`/`u32`/`u64`/`u128`, `i8`/`i16`/`i32`/`i64`/`i128`, `bytes`, `string`, `pubkey` (and the older alias `publicKey`). Nested `{defined: ...}`, vec/option/array are explicitly **out of scope**: any IDL event using them is logged-and-skipped at index-build time and never reaches `borsh-construct`. M3 can extend the synthesizer.
+
+**Files (this chunk):**
+- Modify: `pyproject.toml` — add `borsh-construct>=0.1.0,<0.2`.
+- Modify: `core/abi/decoder.py` — add three Anchor helpers.
+- Modify: `core/abi/registry.py` — `(program_id, discriminator)` index + `lookup_idl_event_by_discriminator()`.
+- Create: `core/parser/anchor_event.py` — `AnchorIdlEventParser(chain_id, registry)`.
+- Modify: `apps/worker/chain_runner.py` — extend Solana branch in `start()`.
+- Create: `tests/unit/test_anchor_event_decoder.py`.
+- Create: `tests/unit/test_anchor_event_parser.py`.
+- Modify: `tests/unit/test_abi_registry.py` — append IDL tests.
+- Modify: `tests/unit/test_chain_runner.py` — extend the existing Solana branch test.
+
+### Naming + constants pin (read once, refer often)
+
+| Symbol | Value |
+|--------|-------|
+| Anchor event discriminator | `sha256(f"event:{event_name}".encode())[:8]` (8 bytes; `emit!` prefix) |
+| `Program data:` log line | `"Program data: <base64>"` — one space, no quotes |
+| `Program ... invoke` line | `"Program <base58 pubkey> invoke [<depth>]"` (1-indexed) |
+| `Program ... success` line | `"Program <base58 pubkey> success"` (closes most-recent matching frame) |
+| IDL → program_id | `body["metadata"]["address"]` (Anchor IDL convention) |
+| Supported scalar types | `bool`, `u8`–`u128`, `i8`–`i128`, `bytes`, `string`, `pubkey`/`publicKey` |
+| Pubkey on-wire size | 32 bytes (decoded as fixed bytes; converted to base58 for `args`) |
+| Success `Event.kind` | `"event"` (matches `AbiEventParser`; post-§4.9 rename) |
+| Failure-downgrade `Event.kind` | `"event"` with `args={}` and `raw={"program_data", "program_id", "discriminator"}` |
+| Unknown program_id or discriminator | **Skip silently** — emit nothing |
+
+---
+
+### Task 13.1: Add `borsh-construct` dep + Anchor IDL decoder helpers
+
+Adds the `borsh-construct` Python package as a project dependency and lays down three module-level helpers in `core/abi/decoder.py` that the registry and the parser will reuse:
+
+- `anchor_event_discriminator(event_name: str) -> bytes` — pure function, computes the 8-byte sha256 prefix.
+- `build_anchor_event_struct(idl_event: dict[str, Any]) -> Construct` — synthesizes a `borsh_construct.CStruct` from an IDL event entry, returning `None` if any field type is out of scope.
+- `decode_anchor_event(struct: Construct, body_bytes: bytes) -> dict[str, Any]` — wraps `struct.parse(body_bytes)` and translates exceptions into `DecodeFailed`, plus converts `pubkey` fields (raw 32-byte bytes) into base58 strings for `Event.args`.
+
+**Files:**
+- Modify: `pyproject.toml` — add `borsh-construct>=0.1.0,<0.2` to `[project].dependencies`.
+- Modify: `core/abi/decoder.py` — append the three helpers and the unsupported-type guard.
+- Create: `tests/unit/test_anchor_event_decoder.py` — 6 unit tests.
+
+- [ ] **Step 1: Add `borsh-construct` to `pyproject.toml`**
+
+Open `pyproject.toml` and add to the `dependencies` array under `[project]` (keep the list alphabetized to match the existing style):
+
+```toml
+    "borsh-construct>=0.1.0,<0.2",
+```
+
+The other Solana-side dep (`base58`) was added in chunk 11 Task 11.3 Step 1; `borsh-construct` is the second Solana-side runtime dep introduced by M2 and the last one — the Solana E2E in chunk 14 needs only a CLI binary (`solana-test-validator`), not a new Python dep.
+
+Commit this in isolation before writing any tests so the dep is available to install when `make install` runs in CI for the test commits that follow:
+
+```bash
+make install
+git add pyproject.toml
+git commit -m "feat(deps): add borsh-construct for Anchor IDL event decoding"
+```
+
+`make install` is expected to PASS (resolves `borsh-construct` from PyPI; pulls the tiny `construct` C-extension wheel as a transitive dep).
+
+- [ ] **Step 2: Write the failing decoder tests**
+
+Create `tests/unit/test_anchor_event_decoder.py`:
+
+```python
+from __future__ import annotations
+
+import hashlib
+
+import pytest
+
+from core.abi.decoder import (
+    anchor_event_discriminator,
+    build_anchor_event_struct,
+    decode_anchor_event,
+)
+from core.abi.errors import DecodeFailed
+
+
+# A small fixture IDL event entry covering every supported scalar type.
+_IDL_EVENT_FULL = {
+    "name": "TradeExecuted",
+    "fields": [
+        {"name": "trader", "type": "pubkey"},
+        {"name": "side", "type": "u8"},
+        {"name": "size", "type": "u64"},
+        {"name": "price", "type": "u128"},
+        {"name": "memo", "type": "string"},
+        {"name": "is_market", "type": "bool"},
+        {"name": "raw_blob", "type": "bytes"},
+    ],
+}
+
+
+def test_anchor_event_discriminator_is_sha256_prefix() -> None:
+    name = "TradeExecuted"
+    expected = hashlib.sha256(f"event:{name}".encode()).digest()[:8]
+    assert anchor_event_discriminator(name) == expected
+    # And the prefix is exactly 8 bytes — Anchor's wire format.
+    assert len(anchor_event_discriminator(name)) == 8
+
+
+def test_build_struct_returns_none_for_unsupported_field_type() -> None:
+    # `{defined: "..."}` requires the type registry from IDL `types[]`, which is
+    # explicitly out of scope for chunk 13.
+    idl = {
+        "name": "Compound",
+        "fields": [{"name": "inner", "type": {"defined": "InnerStruct"}}],
+    }
+    assert build_anchor_event_struct(idl) is None
+
+
+def test_build_struct_returns_none_for_vec_field_type() -> None:
+    idl = {
+        "name": "BatchEmitted",
+        "fields": [{"name": "items", "type": {"vec": "u64"}}],
+    }
+    assert build_anchor_event_struct(idl) is None
+
+
+def test_round_trip_decode_full_scalar_event() -> None:
+    struct = build_anchor_event_struct(_IDL_EVENT_FULL)
+    assert struct is not None
+
+    # Build a sample payload by hand using `struct.build` so we know the bytes
+    # are valid borsh, then re-parse via the helper to verify the decoder.
+    trader_pubkey_bytes = bytes(range(32))  # arbitrary 32-byte pubkey
+    payload = struct.build({
+        "trader": trader_pubkey_bytes,
+        "side": 1,
+        "size": 12345,
+        "price": 9876543210123456789,
+        "memo": "spot fill",
+        "is_market": True,
+        "raw_blob": b"\xde\xad\xbe\xef",
+    })
+
+    decoded = decode_anchor_event(struct, payload)
+
+    # `pubkey` fields must be base58-encoded for the Event.args dict.
+    import base58
+    assert decoded["trader"] == base58.b58encode(trader_pubkey_bytes).decode()
+    assert decoded["side"] == 1
+    assert decoded["size"] == 12345
+    assert decoded["price"] == 9876543210123456789
+    assert decoded["memo"] == "spot fill"
+    assert decoded["is_market"] is True
+    assert decoded["raw_blob"] == "deadbeef"  # bytes → hex string
+
+
+def test_decode_raises_on_short_payload() -> None:
+    struct = build_anchor_event_struct(_IDL_EVENT_FULL)
+    assert struct is not None
+    with pytest.raises(DecodeFailed):
+        decode_anchor_event(struct, b"\x00\x01")  # nowhere near the right size
+
+
+def test_decode_raises_on_garbage_string_length() -> None:
+    # Build a half-formed payload: valid pubkey + side + size + price but then
+    # a string-length prefix that exceeds the remaining bytes.
+    struct = build_anchor_event_struct(_IDL_EVENT_FULL)
+    assert struct is not None
+    bad = (
+        bytes(range(32))      # trader
+        + b"\x01"             # side
+        + (12345).to_bytes(8, "little")   # size
+        + (1).to_bytes(16, "little")      # price
+        + (10**6).to_bytes(4, "little")   # memo length = 1_000_000 (way too big)
+        + b"hi"               # only 2 bytes of memo
+    )
+    with pytest.raises(DecodeFailed):
+        decode_anchor_event(struct, bad)
+```
+
+- [ ] **Step 3: Run the failing tests**
+
+```bash
+pytest tests/unit/test_anchor_event_decoder.py -v
+```
+
+Expected: ImportError on the three `core.abi.decoder` symbols (`anchor_event_discriminator`, `build_anchor_event_struct`, `decode_anchor_event`). They don't exist yet.
+
+- [ ] **Step 4: Implement the helpers**
+
+Append to `core/abi/decoder.py` (after the existing EVM helpers — keep the EVM block first since chunks 2–5 land first chronologically):
+
+```python
+# -------------------------------------------------------------------------
+# Solana Anchor IDL decoders (added in chunk 13)
+#
+# Used by `AnchorIdlEventParser` and the registry's IDL-event index.
+# Scope: see the "Naming + constants pin" in the plan — scalar types only;
+# nested IDL types defer to M3.
+# -------------------------------------------------------------------------
+import hashlib
+from typing import Any  # if not already imported at the top of the file
+
+import base58
+from borsh_construct import (
+    Bool,
+    Bytes,
+    I8, I16, I32, I64, I128,
+    String,
+    U8, U16, U32, U64, U128,
+    CStruct,
+)
+from construct import Bytes as _CBytes  # 32-byte fixed-length for pubkey
+
+
+_PUBKEY_BYTES = _CBytes(32)
+
+_SCALAR_TYPES: dict[str, Any] = {
+    "bool": Bool,
+    "u8": U8, "u16": U16, "u32": U32, "u64": U64, "u128": U128,
+    "i8": I8, "i16": I16, "i32": I32, "i64": I64, "i128": I128,
+    "string": String,
+    "bytes": Bytes,
+    "pubkey": _PUBKEY_BYTES,
+    "publicKey": _PUBKEY_BYTES,  # older IDLs use the camelCase alias
+}
+
+
+def anchor_event_discriminator(event_name: str) -> bytes:
+    """Return the 8-byte Anchor event discriminator for ``event_name``.
+
+    Algorithm: ``sha256(f"event:{event_name}").digest()[:8]``.
+    This is the exact prefix Anchor's `emit!` macro lays down before the
+    borsh-encoded event payload.
+    """
+    return hashlib.sha256(f"event:{event_name}".encode()).digest()[:8]
+
+
+def build_anchor_event_struct(idl_event: dict[str, Any]) -> CStruct | None:
+    """Synthesize a borsh-construct schema from an IDL event entry.
+
+    Returns ``None`` if any field's type falls outside the chunk-13 scope
+    (defined types, vec/option/array — see the plan's scope decision).
+    Callers should log-and-skip when this returns ``None``.
+    """
+    fields = []
+    for field in idl_event.get("fields", []):
+        ftype = field.get("type")
+        if not isinstance(ftype, str):
+            # `{defined: "..."}`, `{vec: ...}`, `{option: ...}`, `{array: [...]}` — all out of scope.
+            return None
+        ctor = _SCALAR_TYPES.get(ftype)
+        if ctor is None:
+            return None
+        fields.append(field["name"] / ctor)
+    return CStruct(*fields)
+
+
+def decode_anchor_event(struct: CStruct, body_bytes: bytes) -> dict[str, Any]:
+    """Decode an Anchor event body using ``struct`` and post-process for JSON.
+
+    Post-processing:
+      * `pubkey` fields (32-byte raw bytes) → base58 strings, matching the
+        format used by the rest of the Solana parsers (`account_keys` etc.).
+      * `bytes` fields → hex strings, since bytes don't round-trip through
+        JSON without a transform.
+
+    Raises ``DecodeFailed`` on any borsh-construct exception.
+    """
+    try:
+        parsed = struct.parse(body_bytes)
+    except Exception as exc:  # noqa: BLE001 — borsh-construct raises many concrete types
+        raise DecodeFailed(f"anchor borsh decode failed: {exc}") from exc
+
+    out: dict[str, Any] = {}
+    for key in parsed.keys():
+        if key.startswith("_"):  # construct internal fields
+            continue
+        val = parsed[key]
+        if isinstance(val, (bytes, bytearray)):
+            # Pubkey fields are exactly 32 bytes; everything else (`bytes` IDL
+            # type) is variable length. We use the length as a heuristic so
+            # the caller doesn't have to thread the IDL field type through.
+            if len(val) == 32:
+                out[key] = base58.b58encode(bytes(val)).decode()
+            else:
+                out[key] = bytes(val).hex()
+        else:
+            out[key] = val
+    return out
+```
+
+Also extend the existing module-level docstring so the next reader knows this file now covers two chains:
+
+```python
+"""ABI decoders for EVM (eth-abi) and Solana Anchor IDL (borsh-construct).
+
+The EVM half lands in chunk 2 (Task 2.6); the Solana half lands in chunk 13.
+Both halves expose pure functions — the registry layer owns caching and
+the parsers own log-line walking.
+"""
+```
+
+(Replace the original "EVM ABI decoders ... Solana Anchor IDL decoders land in chunk 13" docstring from chunk 2 Task 2.6 with this updated version — keeping the file's preamble accurate.)
+
+- [ ] **Step 5: Re-run the decoder tests**
+
+```bash
+pytest tests/unit/test_anchor_event_decoder.py -v
+```
+
+Expected: 6 PASS.
+
+- [ ] **Step 6: Lint + typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean. (`ruff` may warn about the `import base58` and `import hashlib` being at module body bottom rather than top — if so, hoist them to join the other imports at the top of `core/abi/decoder.py`. The placement shown in Step 4 is purely for diff readability in this plan.)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core/abi/decoder.py tests/unit/test_anchor_event_decoder.py
+git commit -m "feat(abi): Anchor IDL event decoder helpers (borsh-construct)"
+```
+
+---
+
+### Task 13.2: `AbiRegistry.lookup_idl_event_by_discriminator`
+
+Adds a second discriminator-keyed index on `AbiRegistry`, this one keyed by `(program_id_b58, discriminator_hex)`. Built at refresh time from every ABI with `kind == "solana_idl"`. The lookup returns `(event_name, struct, abi_id)` so the parser can both borsh-decode the body and stamp `abi_id` into the emitted `Event` for downstream subscription matching.
+
+**Files:**
+- Modify: `core/abi/registry.py` — add `_idl_event_index`, `_rebuild_idl_event_index()`, call it in `refresh()`, expose `lookup_idl_event_by_discriminator()`.
+- Modify: `tests/unit/test_abi_registry.py` — add 5 new tests at the end of the file.
+
+- [ ] **Step 1: Write the failing registry tests**
+
+Append to `tests/unit/test_abi_registry.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Anchor IDL discriminator lookup (chunk 13)
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+_PROG_A = "PrgA11111111111111111111111111111111111111"
+_PROG_B = "PrgB22222222222222222222222222222222222222"
+
+
+def _idl_event(name: str, fields: list[dict]) -> dict:
+    return {"name": name, "fields": fields}
+
+
+def _idl_body(program_id: str, events: list[dict]) -> dict:
+    return {
+        "metadata": {"address": program_id, "name": "test_program", "version": "0.1.0"},
+        "instructions": [],
+        "events": events,
+    }
+
+
+def _disc_hex(name: str) -> str:
+    return hashlib.sha256(f"event:{name}".encode()).digest()[:8].hex()
+
+
+def test_lookup_idl_event_returns_hit_for_known_program_and_discriminator() -> None:
+    body = _idl_body(_PROG_A, [
+        _idl_event("Trade", [{"name": "size", "type": "u64"}]),
+    ])
+    snap = _snap_with(abis=[SnapshotAbi(id="idl1", name="prog_a", kind="solana_idl", body=body)])
+    r = AbiRegistry()
+    r.refresh(snap)
+
+    hit = r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("Trade"))
+    assert hit is not None
+    event_name, struct, abi_id = hit
+    assert event_name == "Trade"
+    assert abi_id == "idl1"
+    # Smoke-test the returned schema: build then parse the round-trip.
+    payload = struct.build({"size": 99})
+    parsed = struct.parse(payload)
+    assert parsed["size"] == 99
+
+
+def test_lookup_idl_event_returns_none_for_unknown_program() -> None:
+    body = _idl_body(_PROG_A, [_idl_event("Trade", [{"name": "size", "type": "u64"}])])
+    snap = _snap_with(abis=[SnapshotAbi(id="idl1", name="prog_a", kind="solana_idl", body=body)])
+    r = AbiRegistry()
+    r.refresh(snap)
+
+    assert r.lookup_idl_event_by_discriminator(_PROG_B, _disc_hex("Trade")) is None
+
+
+def test_lookup_idl_event_returns_none_for_unknown_discriminator() -> None:
+    body = _idl_body(_PROG_A, [_idl_event("Trade", [{"name": "size", "type": "u64"}])])
+    snap = _snap_with(abis=[SnapshotAbi(id="idl1", name="prog_a", kind="solana_idl", body=body)])
+    r = AbiRegistry()
+    r.refresh(snap)
+
+    assert r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("DoesNotExist")) is None
+
+
+def test_lookup_idl_event_skips_idl_with_no_metadata_address(caplog) -> None:
+    # IDL body missing `metadata.address` — should be skipped (warning logged)
+    # and yield no index entries.
+    body = {"instructions": [], "events": [_idl_event("Trade", [{"name": "size", "type": "u64"}])]}
+    snap = _snap_with(abis=[SnapshotAbi(id="idl_no_addr", name="orphan", kind="solana_idl", body=body)])
+    r = AbiRegistry()
+    with caplog.at_level("WARNING"):
+        r.refresh(snap)
+
+    assert r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("Trade")) is None
+    assert any("idl_no_program_id" in rec.message for rec in caplog.records)
+
+
+def test_lookup_idl_event_skips_event_with_unsupported_field_type(caplog) -> None:
+    # An IDL with one supported and one unsupported event — only the supported
+    # one should be indexed; the unsupported one should log and be skipped.
+    body = _idl_body(_PROG_A, [
+        _idl_event("Trade", [{"name": "size", "type": "u64"}]),
+        _idl_event("Compound", [{"name": "inner", "type": {"defined": "InnerStruct"}}]),
+    ])
+    snap = _snap_with(abis=[SnapshotAbi(id="idl1", name="prog_a", kind="solana_idl", body=body)])
+    r = AbiRegistry()
+    with caplog.at_level("WARNING"):
+        r.refresh(snap)
+
+    assert r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("Trade")) is not None
+    assert r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("Compound")) is None
+    assert any("idl_event_schema_unsupported" in rec.message for rec in caplog.records)
+
+
+def test_refresh_evicts_idl_index_for_removed_abi() -> None:
+    body_v1 = _idl_body(_PROG_A, [_idl_event("Trade", [{"name": "size", "type": "u64"}])])
+    snap1 = _snap_with(abis=[SnapshotAbi(id="idl1", name="prog_a", kind="solana_idl", body=body_v1)])
+    snap2 = _snap_with(abis=[])  # everything removed
+
+    r = AbiRegistry()
+    r.refresh(snap1)
+    assert r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("Trade")) is not None
+    r.refresh(snap2)
+    assert r.lookup_idl_event_by_discriminator(_PROG_A, _disc_hex("Trade")) is None
+```
+
+> Note on `SnapshotAbi`: in chunk 2 it was defined with `kind: Literal["evm_abi", "solana_idl"]` and `body: dict[str, Any]` — the IDL body shape above is compatible. If the `SnapshotAbi` import line at the top of `test_abi_registry.py` doesn't already exist, add it next to the other `from core.config.snapshot import` imports.
+
+- [ ] **Step 2: Run the failing tests**
+
+```bash
+pytest tests/unit/test_abi_registry.py -v -k idl
+```
+
+Expected: 6 FAIL with `AttributeError: 'AbiRegistry' object has no attribute 'lookup_idl_event_by_discriminator'`.
+
+- [ ] **Step 3: Add the IDL event index to `AbiRegistry`**
+
+Edit `core/abi/registry.py`. In `__init__`, add a third instance attribute alongside the existing `_topic0_index` (added in chunk 4) and `_selector_index` (added in chunk 5):
+
+```python
+        # (program_id_b58, discriminator_hex) → (abi_id, event_name, struct)
+        self._idl_event_index: dict[tuple[str, str], tuple[str, str, Any]] = {}
+```
+
+(`Any` keeps `borsh-construct` out of the public typing surface; the concrete `CStruct` type is recovered inside `_rebuild_idl_event_index` by importing the helpers locally. `borsh-construct` is a hard dep declared in `pyproject.toml` per Task 13.1 Step 1, so there's no extras-conditional import to worry about.)
+
+Add the rebuild helper just below `_rebuild_selector_index` (so all three rebuilds live next to each other):
+
+```python
+    def _rebuild_idl_event_index(self) -> None:
+        from core.abi.decoder import (
+            anchor_event_discriminator,
+            build_anchor_event_struct,
+        )
+
+        idx: dict[tuple[str, str], tuple[str, str, Any]] = {}
+        for abi_id, abi in self._abis.items():
+            if abi.kind != "solana_idl":
+                continue
+            body = abi.body if isinstance(abi.body, dict) else {}
+            program_id = (body.get("metadata") or {}).get("address")
+            if not isinstance(program_id, str) or not program_id:
+                log.warning("abi_registry.idl_no_program_id", abi_id=abi_id)
+                continue
+            for event in body.get("events", []) or []:
+                name = event.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                struct = build_anchor_event_struct(event)
+                if struct is None:
+                    log.warning(
+                        "abi_registry.idl_event_schema_unsupported",
+                        abi_id=abi_id,
+                        program_id=program_id,
+                        event=name,
+                    )
+                    continue
+                disc_hex = anchor_event_discriminator(name).hex()
+                key = (program_id, disc_hex)
+                if key in idx:
+                    log.warning(
+                        "abi_registry.idl_discriminator_collision",
+                        program_id=program_id,
+                        discriminator=disc_hex,
+                        first=idx[key][:2],   # (abi_id, event_name)
+                        second=(abi_id, name),
+                    )
+                    continue  # first-write-wins
+                idx[key] = (abi_id, name, struct)
+        self._idl_event_index = idx
+```
+
+In `refresh()`, add a call to `_rebuild_idl_event_index()` alongside the existing index-rebuild calls:
+
+```python
+        self._rebuild_topic0_index()      # chunk 4
+        self._rebuild_selector_index()    # chunk 5
+        self._rebuild_idl_event_index()   # chunk 13
+        log.info("abi_registry.refreshed", count=len(new_abis))
+```
+
+(The existing `log.info` line stays; the three rebuild calls precede it. Do NOT touch the eviction / hash-comparison block that runs BEFORE the index rebuilds — chunks 2–5 already cover it.)
+
+Finally, add the public lookup method:
+
+```python
+    def lookup_idl_event_by_discriminator(
+        self, program_id: str, discriminator_hex: str
+    ) -> tuple[str, Any, str] | None:
+        """Resolve an Anchor IDL event by (program_id, discriminator).
+
+        ``program_id`` is the base58 pubkey from the surrounding `Program <pid>
+        invoke` log line. ``discriminator_hex`` is the lowercase hex of the
+        first 8 bytes of the `Program data:` payload.
+
+        Returns ``(event_name, borsh_struct, abi_id)`` on hit; ``None`` on miss.
+        """
+        key = (program_id, discriminator_hex.lower())
+        entry = self._idl_event_index.get(key)
+        if entry is None:
+            return None
+        abi_id, event_name, struct = entry
+        return event_name, struct, abi_id
+```
+
+(Type-hint note: returning `Any` for the struct keeps `borsh_construct` out of the public typing surface. Internal callers downcast as needed.)
+
+- [ ] **Step 4: Re-run the tests**
+
+```bash
+pytest tests/unit/test_abi_registry.py -v -k idl
+```
+
+Expected: 6 PASS.
+
+- [ ] **Step 5: Full registry regression**
+
+```bash
+pytest tests/unit/test_abi_registry.py -v
+```
+
+Expected: every chunk-2 through chunk-5 test still PASS + the new IDL tests PASS.
+
+- [ ] **Step 6: Lint + typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean. (If `mypy` complains about `tuple[str, Any, str]` vs more specific types, it's fine — the registry intentionally returns `Any` for the struct to avoid leaking `borsh-construct` into the public type surface.)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core/abi/registry.py tests/unit/test_abi_registry.py
+git commit -m "feat(abi): IDL event discriminator index in AbiRegistry"
+```
+
+---
+
+### Task 13.3: `AnchorIdlEventParser` — log-line walk + invoke-stack scoping
+
+The parser walks `tx.log_messages` once per transaction, maintains a stack of currently-open `Program <pid> invoke` frames, and for every `Program data: <base64>` line emits one `Event` whose program_id is the top of the stack at that moment. The decode path: 8-byte discriminator + body → registry lookup → borsh decode → `kind="event"`. On decode failure for a known schema, emit a downgraded `kind="event"` with the raw base64 in `event.raw`. On unknown program_id or unknown discriminator → no event (silent).
+
+**Stack semantics (Solana RPC log format):**
+- `Program <pid> invoke [N]` opens a new frame at depth N (1-indexed). N is the CPI depth: 1 for top-level instructions, 2+ for cross-program invocations.
+- `Program <pid> success` or `Program <pid> failed: ...` closes the most-recent frame matching that `pid` (in practice the top frame; we tolerate mismatches by popping until the pid matches, then continuing).
+- `Program <pid> consumed N of M compute units` is purely informational and does NOT affect the stack.
+- `Program log:` and `Program data:` lines belong to the program at the TOP of the stack at the moment they appear.
+
+We do NOT need to perfectly mirror the validator's stack semantics — only enough to attribute each `Program data:` line to the correct emitting program. The depth integer in `invoke [N]` is informational; the order of `invoke`/`success`/`failed` lines is what drives our stack.
+
+**Files:**
+- Create: `core/parser/anchor_event.py` — the parser class.
+- Create: `tests/unit/test_anchor_event_parser.py` — 7 unit tests.
+
+- [ ] **Step 1: Write the failing parser tests**
+
+Create `tests/unit/test_anchor_event_parser.py`:
+
+```python
+from __future__ import annotations
+
+import base64
+import hashlib
+
+import pytest
+
+from core.abi.registry import AbiRegistry
+from core.chains.types import (
+    SolanaBlock,
+    SolanaInstruction,
+    SolanaTokenBalance,
+    SolanaTransaction,
+)
+from core.config.snapshot import ConfigSnapshot, SnapshotAbi
+from core.parser.anchor_event import AnchorIdlEventParser
+
+
+# ---- helpers -----------------------------------------------------------
+
+PROG_A = "PrgA11111111111111111111111111111111111111"
+PROG_B = "PrgB22222222222222222222222222222222222222"
+
+
+def _idl_body(program_id: str) -> dict:
+    return {
+        "metadata": {"address": program_id, "name": "test_program", "version": "0.1.0"},
+        "instructions": [],
+        "events": [
+            {
+                "name": "Trade",
+                "fields": [
+                    {"name": "side", "type": "u8"},
+                    {"name": "size", "type": "u64"},
+                ],
+            }
+        ],
+    }
+
+
+def _registry_with(*program_ids: str) -> AbiRegistry:
+    abis = [
+        SnapshotAbi(id=f"idl-{pid[:4]}", name=f"prog_{pid[:4]}", kind="solana_idl", body=_idl_body(pid))
+        for pid in program_ids
+    ]
+    snap = ConfigSnapshot(version=1, chains=[], abis=abis, subscriptions=[], channels=[])
+    r = AbiRegistry()
+    r.refresh(snap)
+    return r
+
+
+def _program_data_b64(side: int, size: int) -> str:
+    # Build a valid Anchor event payload for `Trade {side, size}`.
+    from borsh_construct import CStruct, U8, U64
+    schema = CStruct("side" / U8, "size" / U64)
+    body = schema.build({"side": side, "size": size})
+    disc = hashlib.sha256(b"event:Trade").digest()[:8]
+    return base64.b64encode(disc + body).decode()
+
+
+def _tx_with_logs(logs: list[str], *, signature: str = "SIG") -> SolanaTransaction:
+    return SolanaTransaction(
+        signature=signature, slot=100, success=True, fee=5000,
+        account_keys=[], pre_balances=[], post_balances=[],
+        pre_token_balances=[], post_token_balances=[],
+        log_messages=logs, instructions=[],
+    )
+
+
+def _block(*txs: SolanaTransaction) -> SolanaBlock:
+    return SolanaBlock(
+        slot=100, block_hash="HASH" + "0" * 40,
+        parent_slot=99, block_time=1700000000,
+        transactions=list(txs),
+    )
+
+
+# ---- tests --------------------------------------------------------------
+
+
+def test_parser_emits_event_for_top_level_program_data() -> None:
+    reg = _registry_with(PROG_A)
+    logs = [
+        f"Program {PROG_A} invoke [1]",
+        f"Program data: {_program_data_b64(side=1, size=42)}",
+        f"Program {PROG_A} success",
+    ]
+    block = _block(_tx_with_logs(logs))
+    p = AnchorIdlEventParser(chain_id="sol", registry=reg)
+
+    events = list(p.parse(block))
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "event"
+    assert ev.chain_id == "sol"
+    assert ev.contract == PROG_A           # program_id is in `contract`
+    assert ev.name == "Trade"
+    assert ev.args == {"side": 1, "size": 42}
+    assert ev.tx_hash == "SIG"
+
+
+def test_parser_scopes_program_id_to_innermost_invoke_frame() -> None:
+    # CPI: PROG_B is called from inside PROG_A. The `Program data:` line that
+    # sits between PROG_B's invoke and success must be attributed to PROG_B,
+    # NOT PROG_A.
+    reg = _registry_with(PROG_A, PROG_B)
+    logs = [
+        f"Program {PROG_A} invoke [1]",
+        f"Program {PROG_B} invoke [2]",
+        f"Program data: {_program_data_b64(side=2, size=7)}",
+        f"Program {PROG_B} success",
+        f"Program {PROG_A} success",
+    ]
+    block = _block(_tx_with_logs(logs))
+    p = AnchorIdlEventParser(chain_id="sol", registry=reg)
+
+    events = list(p.parse(block))
+    assert len(events) == 1
+    assert events[0].contract == PROG_B
+    assert events[0].args == {"side": 2, "size": 7}
+
+
+def test_parser_skips_program_data_with_unknown_program_id() -> None:
+    # PROG_B has an IDL, but the data is emitted under PROG_A which we don't
+    # know — silent skip.
+    reg = _registry_with(PROG_B)
+    logs = [
+        f"Program {PROG_A} invoke [1]",
+        f"Program data: {_program_data_b64(side=1, size=1)}",
+        f"Program {PROG_A} success",
+    ]
+    block = _block(_tx_with_logs(logs))
+    p = AnchorIdlEventParser(chain_id="sol", registry=reg)
+
+    assert list(p.parse(block)) == []
+
+
+def test_parser_skips_program_data_with_unknown_discriminator() -> None:
+    # PROG_A is known, but the discriminator doesn't match any indexed event.
+    reg = _registry_with(PROG_A)
+    bogus_body = b"\x00" * 16
+    bogus_disc = hashlib.sha256(b"event:DoesNotExist").digest()[:8]
+    logs = [
+        f"Program {PROG_A} invoke [1]",
+        f"Program data: {base64.b64encode(bogus_disc + bogus_body).decode()}",
+        f"Program {PROG_A} success",
+    ]
+    block = _block(_tx_with_logs(logs))
+    p = AnchorIdlEventParser(chain_id="sol", registry=reg)
+
+    assert list(p.parse(block)) == []
+
+
+def test_parser_downgrades_to_kind_event_on_borsh_decode_failure() -> None:
+    # Known discriminator (`Trade`) but the payload is truncated → decode fails
+    # → emit kind="event" with empty args and raw payload preserved.
+    reg = _registry_with(PROG_A)
+    disc = hashlib.sha256(b"event:Trade").digest()[:8]
+    bad_payload = base64.b64encode(disc + b"\x01").decode()  # missing 8 bytes of u64
+    logs = [
+        f"Program {PROG_A} invoke [1]",
+        f"Program data: {bad_payload}",
+        f"Program {PROG_A} success",
+    ]
+    block = _block(_tx_with_logs(logs))
+    p = AnchorIdlEventParser(chain_id="sol", registry=reg)
+
+    events = list(p.parse(block))
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "event"
+    assert ev.name == "Trade"
+    assert ev.args == {}
+    assert ev.raw["program_data"] == bad_payload
+    assert ev.raw["program_id"] == PROG_A
+    assert ev.raw["discriminator"] == disc.hex()
+
+
+def test_parser_skips_failed_transactions() -> None:
+    reg = _registry_with(PROG_A)
+    logs = [
+        f"Program {PROG_A} invoke [1]",
+        f"Program data: {_program_data_b64(side=1, size=42)}",
+        f"Program {PROG_A} failed: instruction error",
+    ]
+    tx = SolanaTransaction(
+        signature="SIG", slot=100, success=False, fee=5000,  # success=False
+        account_keys=[], pre_balances=[], post_balances=[],
+        pre_token_balances=[], post_token_balances=[],
+        log_messages=logs, instructions=[],
+    )
+    p = AnchorIdlEventParser(chain_id="sol", registry=_registry_with(PROG_A))
+
+    assert list(p.parse(_block(tx))) == []
+
+
+def test_parser_ignores_program_data_with_no_open_invoke_frame() -> None:
+    # Malformed log: `Program data:` appears with no preceding invoke. Skip.
+    reg = _registry_with(PROG_A)
+    logs = [
+        f"Program data: {_program_data_b64(side=1, size=42)}",
+    ]
+    block = _block(_tx_with_logs(logs))
+    p = AnchorIdlEventParser(chain_id="sol", registry=reg)
+
+    assert list(p.parse(block)) == []
+```
+
+- [ ] **Step 2: Run the failing tests**
+
+```bash
+pytest tests/unit/test_anchor_event_parser.py -v
+```
+
+Expected: ImportError on `core.parser.anchor_event` — the module doesn't exist yet.
+
+- [ ] **Step 3: Implement the parser**
+
+Create `core/parser/anchor_event.py`:
+
+```python
+"""Anchor IDL event parser.
+
+Walks each transaction's ``log_messages`` once, attributing every
+``Program data: <base64>`` line to the emitting program_id (via an
+invoke/success stack), and decoding the payload against the IDL event
+schema resolved through ``AbiRegistry.lookup_idl_event_by_discriminator``.
+
+On unknown program_id or unknown discriminator → skip silently (we don't
+own that program's IDL). On borsh decode failure for a known schema →
+emit a downgraded ``kind="event"`` with the raw payload preserved in
+``event.raw`` (spec §4.1 / §8 fallback).
+"""
+from __future__ import annotations
+
+import base64
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+import structlog
+
+from core.abi.errors import DecodeFailed
+from core.chains.types import SolanaBlock, SolanaTransaction
+from core.parser.event import Event
+
+if TYPE_CHECKING:
+    from core.abi.registry import AbiRegistry
+
+
+log = structlog.get_logger(__name__)
+
+
+_PROGRAM_DATA_PREFIX = "Program data: "
+_PROGRAM_INVOKE_PREFIX = "Program "
+_INVOKE_SUFFIX_MARKER = " invoke ["
+_SUCCESS_SUFFIX = " success"
+_FAILED_SUFFIX_MARKER = " failed:"
+
+
+class AnchorIdlEventParser:
+    """Decode Anchor IDL events from Solana transaction log_messages."""
+
+    def __init__(self, chain_id: str, registry: AbiRegistry) -> None:
+        self._chain_id = chain_id
+        self._registry = registry
+
+    def parse(self, block: SolanaBlock) -> Iterable[Event]:
+        for tx in block.transactions:
+            if not tx.success:
+                continue
+            yield from self._parse_tx(block, tx)
+
+    def _parse_tx(
+        self, block: SolanaBlock, tx: SolanaTransaction
+    ) -> Iterable[Event]:
+        stack: list[str] = []   # base58 program_ids, deepest last
+        for line in tx.log_messages:
+            if line.startswith(_PROGRAM_DATA_PREFIX):
+                if not stack:
+                    log.debug(
+                        "anchor_parser.program_data_without_invoke",
+                        signature=tx.signature,
+                    )
+                    continue
+                ev = self._maybe_decode(block, tx, stack[-1], line)
+                if ev is not None:
+                    yield ev
+                continue
+            if line.startswith(_PROGRAM_INVOKE_PREFIX):
+                pid = self._parse_invoke(line)
+                if pid is not None:
+                    stack.append(pid)
+                    continue
+                pid = self._parse_close(line)
+                if pid is not None:
+                    self._pop_to(stack, pid)
+
+    @staticmethod
+    def _parse_invoke(line: str) -> str | None:
+        # "Program <pid> invoke [N]"
+        idx = line.find(_INVOKE_SUFFIX_MARKER)
+        if idx == -1:
+            return None
+        return line[len(_PROGRAM_INVOKE_PREFIX):idx]
+
+    @staticmethod
+    def _parse_close(line: str) -> str | None:
+        # "Program <pid> success" or "Program <pid> failed: ..."
+        if line.endswith(_SUCCESS_SUFFIX):
+            return line[len(_PROGRAM_INVOKE_PREFIX):-len(_SUCCESS_SUFFIX)]
+        idx = line.find(_FAILED_SUFFIX_MARKER)
+        if idx != -1:
+            return line[len(_PROGRAM_INVOKE_PREFIX):idx]
+        return None
+
+    @staticmethod
+    def _pop_to(stack: list[str], pid: str) -> None:
+        # Pop frames until pid matches the top, then pop one more (the matching
+        # frame). If pid never appears, leave the stack alone — best-effort
+        # tolerance for malformed log sequences.
+        for i in range(len(stack) - 1, -1, -1):
+            if stack[i] == pid:
+                del stack[i:]
+                return
+
+    def _maybe_decode(
+        self,
+        block: SolanaBlock,
+        tx: SolanaTransaction,
+        program_id: str,
+        log_line: str,
+    ) -> Event | None:
+        b64 = log_line[len(_PROGRAM_DATA_PREFIX):]
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except ValueError:
+            return None
+        if len(raw) < 8:
+            return None
+        disc, body = raw[:8], raw[8:]
+        disc_hex = disc.hex()
+
+        hit = self._registry.lookup_idl_event_by_discriminator(program_id, disc_hex)
+        if hit is None:
+            return None
+        event_name, struct, abi_id = hit
+
+        try:
+            from core.abi.decoder import decode_anchor_event
+            args = decode_anchor_event(struct, body)
+        except DecodeFailed as exc:
+            log.warning(
+                "anchor_parser.decode_failed",
+                program_id=program_id,
+                event=event_name,
+                abi_id=abi_id,
+                err=str(exc),
+            )
+            return self._build_event(
+                block, tx,
+                program_id=program_id,
+                event_name=event_name,
+                args={},
+                raw={
+                    "program_data": b64,
+                    "program_id": program_id,
+                    "discriminator": disc_hex,
+                    "abi_id": abi_id,
+                },
+            )
+
+        return self._build_event(
+            block, tx,
+            program_id=program_id,
+            event_name=event_name,
+            args=args,
+            raw={"program_data": b64, "abi_id": abi_id},
+        )
+
+    def _build_event(
+        self,
+        block: SolanaBlock,
+        tx: SolanaTransaction,
+        *,
+        program_id: str,
+        event_name: str,
+        args: dict,
+        raw: dict,
+    ) -> Event:
+        return Event(
+            chain_id=self._chain_id,
+            block_number=block.slot,
+            block_hash=block.block_hash,
+            block_timestamp=block.block_time or 0,
+            tx_hash=tx.signature,
+            tx_index=None,
+            log_index=None,
+            kind="event",
+            contract=program_id,
+            name=event_name,
+            args=args,
+            raw=raw,
+        )
+```
+
+> One implementation note for the reviewer-of-the-implementer: the `_pop_to` heuristic is intentionally lenient. A perfectly-formed Solana validator log is balanced — each `invoke` has exactly one matching `success`/`failed`. We tolerate stray closes and missing closes because malformed logs should not break parsing on the happy paths.
+
+- [ ] **Step 4: Re-run the parser tests**
+
+```bash
+pytest tests/unit/test_anchor_event_parser.py -v
+```
+
+Expected: 7 PASS.
+
+- [ ] **Step 5: Lint + typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean. (`TYPE_CHECKING` is used to break the `AbiRegistry → AnchorIdlEventParser → AbiRegistry` import cycle that would arise if the parser imported the registry concretely; mypy still sees the annotation.)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/parser/anchor_event.py tests/unit/test_anchor_event_parser.py
+git commit -m "feat(parser): AnchorIdlEventParser with invoke-stack scoping"
+```
+
+---
+
+### Task 13.4: Wire `AnchorIdlEventParser` into `ChainRunner.start()`
+
+The Solana branch in `ChainRunner.start()` currently builds `[SolNativeTransferParser, SplTransferParser]` (chunks 11 + 12). Task 13.4 appends `AnchorIdlEventParser(chain_id=..., registry=abi_registry)` to that list when an `AbiRegistry` is wired through — exactly mirroring the `AbiEventParser` pattern from chunk 4 (conditional on `abi_registry is not None`).
+
+**Files:**
+- Modify: `apps/worker/chain_runner.py:start` — extend the Solana parser list.
+- Modify: `tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer` — assert the third default parser is present.
+
+- [ ] **Step 1: Tighten the chain_runner Solana test**
+
+In `tests/unit/test_chain_runner.py`, find `test_chain_runner_solana_branch_bypasses_buffer` (chunks 11 + 12). Two edits:
+
+**(a)** The test currently constructs the `ChainRunner` without an `AbiRegistry` (chunks 11 + 12 didn't need one). Anchor parser wiring is conditional on registry presence, so we need to inject one. Add — just after the existing `cp = _FakeCheckpointRepo()` line — a registry fixture for `PROG_A`:
+
+Place the imports at the top of `tests/unit/test_chain_runner.py` (next to the other `from core.*` imports), and put the registry construction inside the test function — just after the existing `cp = _FakeCheckpointRepo()` line:
+
+```python
+# At the top of the file (with the other imports):
+from core.abi.registry import AbiRegistry
+from core.config.snapshot import SnapshotAbi
+
+# Inside test_chain_runner_solana_branch_bypasses_buffer, after `cp = _FakeCheckpointRepo()`:
+_PROG_FOR_TEST = "PrgA11111111111111111111111111111111111111"
+abi_registry = AbiRegistry()
+abi_registry.refresh(ConfigSnapshot(
+    version=1, chains=[], subscriptions=[], channels=[],
+    abis=[SnapshotAbi(
+        id="idl1", name="prog_a", kind="solana_idl",
+        body={
+            "metadata": {"address": _PROG_FOR_TEST, "name": "p", "version": "0.1"},
+            "instructions": [],
+            "events": [{"name": "Trade", "fields": [{"name": "size", "type": "u64"}]}],
+        },
+    )],
+))
+```
+
+Then pass `abi_registry=abi_registry` to the `ChainRunner(...)` call. The kwarg was added in chunk 4 Task 4.5 and preserved through chunk 11's `__init__` rewrite (chunk 11 Task 11.4 Step "replace `__init__`" stores it as `self._abi_registry`).
+
+**(b)** Extend the parser-type assertions (added in chunk 12 Task 12.3 Step 1) to include `AnchorIdlEventParser`. Replace:
+
+```python
+from core.parser.sol_native import SolNativeTransferParser
+from core.parser.spl_transfer import SplTransferParser
+
+assert runner._pipeline is not None
+pipeline_parsers = runner._pipeline._parsers  # type: ignore[attr-defined]
+parser_types = {type(p) for p in pipeline_parsers}
+assert SolNativeTransferParser in parser_types, (
+    "default Solana pipeline must include SolNativeTransferParser"
+)
+assert SplTransferParser in parser_types, (
+    "default Solana pipeline must include SplTransferParser"
+)
+```
+
+with:
+
+```python
+from core.parser.anchor_event import AnchorIdlEventParser
+from core.parser.sol_native import SolNativeTransferParser
+from core.parser.spl_transfer import SplTransferParser
+
+assert runner._pipeline is not None
+pipeline_parsers = runner._pipeline._parsers  # type: ignore[attr-defined]
+parser_types = {type(p) for p in pipeline_parsers}
+assert SolNativeTransferParser in parser_types, (
+    "default Solana pipeline must include SolNativeTransferParser"
+)
+assert SplTransferParser in parser_types, (
+    "default Solana pipeline must include SplTransferParser"
+)
+assert AnchorIdlEventParser in parser_types, (
+    "default Solana pipeline must include AnchorIdlEventParser (registry was wired)"
+)
+```
+
+- [ ] **Step 2: Run the test, expect FAIL**
+
+```bash
+pytest tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer -v
+```
+
+Expected: FAIL — `AnchorIdlEventParser not in parser_types`. Chunk 12's `start()` only constructs the two transfer parsers.
+
+- [ ] **Step 3: Extend the Solana branch in `start()`**
+
+Locate the Solana branch in `ChainRunner.start()` (added in chunk 11 Task 11.4, extended in chunk 12 Task 12.3 Step 3). Replace:
+
+```python
+elif self._chain.kind == "solana":
+    # No buffer for Solana — commitment handles finality (spec §4.6).
+    self._buffer = None
+    self._pipeline = SolanaParserPipeline(
+        self._solana_parsers_override
+        or [
+            SolNativeTransferParser(chain_id=self._chain.id),
+            SplTransferParser(chain_id=self._chain.id),
+        ]
+    )
+```
+
+with:
+
+```python
+elif self._chain.kind == "solana":
+    # No buffer for Solana — commitment handles finality (spec §4.6).
+    self._buffer = None
+    sol_parsers: list[SolanaParser] = [
+        SolNativeTransferParser(chain_id=self._chain.id),
+        SplTransferParser(chain_id=self._chain.id),
+    ]
+    if self._abi_registry is not None:
+        sol_parsers.append(
+            AnchorIdlEventParser(chain_id=self._chain.id, registry=self._abi_registry)
+        )
+    self._pipeline = SolanaParserPipeline(
+        self._solana_parsers_override or sol_parsers
+    )
+```
+
+(The `SolanaParser` type — added in chunk 11 Task 11.2 — needs to be importable here. Add `from core.parser.base import SolanaParser` next to the other `core.parser.*` imports at the top of `chain_runner.py`. `chain_runner.py` does NOT currently import anything from `core.parser.base`, so this is a new line, not an addition to an existing one.)
+
+Add to the imports at the top of `apps/worker/chain_runner.py`:
+
+```python
+from core.parser.anchor_event import AnchorIdlEventParser
+```
+
+(Keep the parser imports alphabetized: `abi_call`, `abi_event`, `anchor_event`, `erc20`, `native`, `pipeline`, `sol_native`, `spl_transfer`.)
+
+- [ ] **Step 4: Re-run the test**
+
+```bash
+pytest tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Full chain_runner regression**
+
+```bash
+pytest tests/unit/test_chain_runner.py -v
+```
+
+Expected: every EVM test still green; the Solana test PASSes with the new assertion.
+
+- [ ] **Step 6: Lint + typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/worker/chain_runner.py tests/unit/test_chain_runner.py
+git commit -m "feat(worker): wire AnchorIdlEventParser into ChainRunner.start()"
+```
+
+---
+
+### Task 13.5: Close-out — full regression, contributor docs
+
+Final sweep. The chunk's intended scope is now fully implemented and unit-tested. Verify the full unit test suite is green and ABI flags / structures are clean.
+
+**Files:**
+- (Verification only — no new files.)
+
+- [ ] **Step 1: Full unit-test sweep**
+
+```bash
+pytest tests/unit -v
+```
+
+Expected: every test green. The Solana segment (chunks 10–13) now contributes:
+
+- `test_solana_types.py` (chunk 10)
+- `test_solana_adapter.py` (chunk 10)
+- `test_sol_native_parser.py` (chunk 11)
+- `test_spl_transfer_parser.py` (chunk 12)
+- `test_anchor_event_decoder.py` (chunk 13, this chunk)
+- `test_anchor_event_parser.py` (chunk 13, this chunk)
+- `test_abi_registry.py` (extended in chunks 4, 5, 13)
+- `test_chain_runner.py` (extended in chunks 11, 12, 13)
+
+…in addition to every EVM-segment test still passing.
+
+- [ ] **Step 2: Lint + typecheck on the full tree**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 3: Confirm `Event.kind` values across the Solana parsers**
+
+Quick sanity-grep to verify the three Solana parsers emit the expected `kind` values:
+
+```bash
+grep -nE 'kind="(native_transfer|token_transfer|event)"' core/parser/sol_native.py core/parser/spl_transfer.py core/parser/anchor_event.py
+```
+
+Expected output:
+- `core/parser/sol_native.py: kind="native_transfer"`
+- `core/parser/spl_transfer.py: kind="token_transfer"`
+- `core/parser/anchor_event.py: kind="event"` (two occurrences — happy path and fallback)
+
+These match spec §4.7 and the post-§4.9 `EventKind` literal set. No drift.
+
+- [ ] **Step 4: Final chunk-13 commit (verification record)**
+
+There are no source changes in Task 13.5 — Tasks 13.1 → 13.4 each committed individually. Use a no-op commit only if you want a clean checkpoint marker; otherwise, skip and proceed to chunk 14.
+
+(If you do want a checkpoint, the message should be `chore: close out M2 chunk 13 (Anchor IDL event parser)`.)
+
+---
+
+**Chunk 13 done.** The Solana parser surface is now complete: native lamport transfers (chunk 11), SPL token transfers (chunk 12), and Anchor IDL events (chunk 13) all flow through the same `SolanaParserPipeline → Matcher → Notifier` path that the EVM segment built. Chunk 14 brings the E2E that exercises the full Solana stack against `solana-test-validator`.

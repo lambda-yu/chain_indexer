@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from core.abi.decoder import event_topic0, function_selector
 from core.abi.errors import AbiNotFound
 from core.abi.registry import AbiRegistry
 from core.config.snapshot import ConfigSnapshot, SnapshotAbi
@@ -76,3 +77,65 @@ def test_registry_decoder_cache_persists_across_refresh_if_body_unchanged() -> N
     r._decoders[("a1", "0xdead")] = sentinel  # type: ignore[index]
     r.refresh(snap)  # body hash unchanged → preserve cache
     assert r._decoders.get(("a1", "0xdead")) is sentinel
+
+
+_FN_TRANSFER = {
+    "type": "function", "name": "transfer",
+    "inputs": [
+        {"name": "to", "type": "address"},
+        {"name": "value", "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+}
+
+
+def test_get_event_decoder_returns_decoder_for_known_topic0() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    decoder = r.get_event_decoder("a1", t0)
+    args = decoder(
+        topics=[
+            t0,
+            "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ],
+        data="0x000000000000000000000000000000000000000000000000000000000000007b",
+    )
+    assert args["from"] == "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert args["value"] == "123"
+
+
+def test_get_event_decoder_raises_for_unknown_topic0() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    with pytest.raises(KeyError):
+        r.get_event_decoder("a1", "0xdeadbeef" + "00" * 28)
+
+
+def test_get_call_decoder_returns_decoder_for_known_selector() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_FN_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    sel = function_selector(_FN_TRANSFER)
+    decoder = r.get_call_decoder("a1", sel)
+    args = decoder(
+        "0xa9059cbb"
+        "000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "00000000000000000000000000000000000000000000000000000000000003e7"
+    )
+    assert args["value"] == "999"
+
+
+def test_decoder_cache_is_reused_for_same_abi_id_and_key() -> None:
+    """Calling get_event_decoder twice for the same (abi_id, topic0) should
+    return the same callable instance (cached)."""
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    d1 = r.get_event_decoder("a1", t0)
+    d2 = r.get_event_decoder("a1", t0)
+    assert d1 is d2

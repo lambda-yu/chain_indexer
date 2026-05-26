@@ -373,3 +373,53 @@ def test_chain_runner_pipeline_includes_abi_event_parser_when_registry_given() -
     assert "AbiEventParser" not in types_without
     assert "NativeTransferParser" in types_with and "NativeTransferParser" in types_without
     assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without
+
+
+@pytest.mark.asyncio
+async def test_chain_runner_dispatches_abi_event_match() -> None:
+    chain = _chain()
+    reg = _AbiRegistry()
+    reg.refresh(ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    ))
+    blocks = [_block_with_erc20_log(n, value=n * 100) for n in (1, 2, 3, 4)]
+    adapter = _FakeAdapter(blocks)
+    coll = _CollectingChannel()
+    snap = ConfigSnapshot(
+        version=1,
+        chains=[chain],
+        subscriptions=[_sub(channel_ids=["c1"], match_kind="event", match_name="Transfer")],
+        channels=[_ch("c1")],
+        abis=[_SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_TRANSFER_ABI])],
+    )
+    cp = _CheckpointStub()
+
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: coll,
+        checkpoint_repo=cp,
+        abi_registry=reg,
+    )
+    await runner.start(snap)
+    task = asyncio.create_task(runner.run())
+    try:
+        for b in blocks:
+            await adapter.push_head(b.header)
+        for _ in range(20):
+            if len(coll.calls) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert len(coll.calls) == 2
+        names = {c["event"]["name"] for c in coll.calls}
+        assert names == {"Transfer"}
+        kinds = {c["event"]["kind"] for c in coll.calls}
+        assert kinds == {"event"}
+        values = {c["event"]["args"]["value"] for c in coll.calls}
+        assert values == {"100", "200"}
+    finally:
+        await runner.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

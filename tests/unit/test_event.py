@@ -18,3 +18,14 @@ def test_event_round_trip_dict() -> None:
     )
     assert e.kind == "native_transfer"
     assert e.args["value"] == "1000"
+
+
+def test_event_kind_literal_contains_event_not_log() -> None:
+    from typing import get_args
+
+    from core.parser.event import EventKind
+
+    kinds = set(get_args(EventKind))
+    assert "event" in kinds
+    assert "log" not in kinds
+    assert {"native_transfer", "token_transfer", "call"}.issubset(kinds)

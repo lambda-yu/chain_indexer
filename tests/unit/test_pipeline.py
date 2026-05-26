@@ -19,7 +19,7 @@ class _FakeParser:
             tx_hash=f"{self._tag}-tx",
             tx_index=None,
             log_index=None,
-            kind="log",
+            kind="event",
             contract=None,
             name=self._tag,
             args={},

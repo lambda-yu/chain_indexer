@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-EventKind = Literal["native_transfer", "token_transfer", "log", "call"]
+EventKind = Literal["native_transfer", "token_transfer", "event", "call"]
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from core.matcher.filters import FilterError, validate as _validate_filter_keys
+
+ArgFilterValue = str | int | bool | list[str | int | bool]
 
 # ---- Chains ---------------------------------------------------------------
 
@@ -63,8 +67,19 @@ class SubscriptionCreate(BaseModel):
     abi_id: str | None = None
     match_kind: Literal["native_transfer", "token_transfer", "event", "call"]
     match_name: str | None = None
-    arg_filters: dict[str, Any] = Field(default_factory=dict)
+    arg_filters: dict[str, ArgFilterValue] = Field(default_factory=dict)
     enabled: bool = True
+
+    @field_validator("arg_filters")
+    @classmethod
+    def _check_operator_grammar(
+        cls, v: dict[str, ArgFilterValue],
+    ) -> dict[str, ArgFilterValue]:
+        try:
+            _validate_filter_keys(v)
+        except FilterError as exc:
+            raise ValueError(str(exc)) from exc
+        return v
 
 
 class SubscriptionOut(BaseModel):

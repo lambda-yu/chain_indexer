@@ -52,11 +52,11 @@ def _sub(channel_ids: list[str], **overrides: Any) -> SnapshotSubscription:
 
 
 def _ch(id_: str = "c1") -> SnapshotChannel:
-    return SnapshotChannel(id=id_, name="hook", type="collect", config={})
+    return SnapshotChannel(id=id_, name="hook", type="collect-runner", config={})
 
 
 class _CollectingChannel(Channel):
-    type = "collect"
+    type = "collect-runner"
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []

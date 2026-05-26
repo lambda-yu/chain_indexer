@@ -8,7 +8,7 @@ from core.parser.event import Event
 
 
 class _StubChannel(Channel):
-    type = "stub"
+    type = "stub-sem"
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.sent: list[dict[str, Any]] = []
@@ -35,7 +35,7 @@ async def test_first_send_binds_sem_to_running_loop(tmp_path: Any) -> None:
         return _StubChannel(cfg.config)
 
     n = Notifier(channel_factory=_factory, max_concurrency=3)
-    await n.start([SnapshotChannel(id="c1", name="c1", type="stub", config={})])
+    await n.start([SnapshotChannel(id="c1", name="c1", type="stub-sem", config={})])
 
     ev = Event(
         chain_id="x", block_number=1, block_hash="0xb", block_timestamp=0,
@@ -47,7 +47,7 @@ async def test_first_send_binds_sem_to_running_loop(tmp_path: Any) -> None:
         match_kind="native_transfer", match_name=None,
         arg_filters={}, enabled=True, channel_ids=["c1"],
     )
-    chan = SnapshotChannel(id="c1", name="c1", type="stub", config={})
+    chan = SnapshotChannel(id="c1", name="c1", type="stub-sem", config={})
 
     await n.dispatch(ev, [(sub, [chan])])
 

@@ -12,7 +12,7 @@ from core.parser.event import Event
 
 
 class _CollectingChannel(Channel):
-    type = "collect"
+    type = "collect-notifier"
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []

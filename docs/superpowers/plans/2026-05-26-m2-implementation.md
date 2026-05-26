@@ -12116,3 +12116,981 @@ There are no source changes in Task 13.5 — Tasks 13.1 → 13.4 each committed 
 ---
 
 **Chunk 13 done.** The Solana parser surface is now complete: native lamport transfers (chunk 11), SPL token transfers (chunk 12), and Anchor IDL events (chunk 13) all flow through the same `SolanaParserPipeline → Matcher → Notifier` path that the EVM segment built. Chunk 14 brings the E2E that exercises the full Solana stack against `solana-test-validator`.
+## Chunk 14: Solana E2E + `m2-complete` tag
+
+The M2 close-out. Drives a real `solana-test-validator` subprocess through the full chain: validator → `SolanaAdapter` → `SolanaParserPipeline` (`SolNativeTransferParser` + `SplTransferParser` from chunks 11 & 12) → `Matcher` → `HttpChannel` → in-process webhook receiver. Two E2E tests: one for a system-program lamport transfer (native SOL), one for an SPL Token Program transfer of a freshly-minted token. After both pass and the full regression sweep is green, the branch is tagged `m2-complete`.
+
+Two facts shape this chunk:
+
+1. **`solana-test-validator` cold-start is 5–10 s** (vs Anvil's <1 s — spec §9.2). The validator fixture is `scope="session"`: one boot per test session, reused across both E2E tests AND the chunk-10/11 integration tests. Function-scoped would 4× the wallclock per `pytest` invocation.
+2. **The chunk-10 fixture lives in `tests/integration/conftest.py`.** pytest's conftest cascade only flows *downward*, so a fixture in `tests/integration/conftest.py` is invisible to `tests/e2e/`. Task 14.1 *promotes* the fixture up to `tests/conftest.py` (the root-level conftest that already hosts `redis_url`) and removes it from `tests/integration/conftest.py`. After the move, the chunk-10/11 ITs see it via cascade; the new chunk-14 E2E tests see it via the same cascade. **One source of truth.**
+
+**Modified files this chunk:**
+- `tests/conftest.py` — promote `solana_validator` fixture + `SolanaValidatorHandle` dataclass + `_free_tcp_port` + `_wait_for_rpc` helpers from `tests/integration/conftest.py`.
+- `tests/integration/conftest.py` — remove the same code (DON'T leave a stale duplicate; pytest will raise `Fixture "solana_validator" already defined` on collection).
+- `tests/e2e/conftest.py` — APPEND Solana E2E helpers: airdrop, native transfer submitter, SPL-via-CLI mint setup, `funded_sender`, `spl_mint` fixtures.
+- `tests/e2e/test_solana_native_e2e.py` — **new**: native SOL transfer → webhook.
+- `tests/e2e/test_solana_spl_e2e.py` — **new**: SPL token transfer → webhook.
+
+**Out of scope this chunk:**
+- Anchor IDL event E2E. Chunk 13's unit tests are authoritative for `AnchorIdlEventParser`; adding an on-validator program deploy + IDL upload would 2× the chunk's complexity for a single extra `kind="event"` assertion. The wire shape (`Event(kind="event", name=<event>, args={...})`) is identical to the EVM ABI event path, which IS covered E2E (chunk 5 unit + ChainRunner integration).
+- Multi-chain (EVM + Solana in one test). The EVM ERC-20 E2E (chunk 9) and the Solana E2E (this chunk) are separate processes by design — sharing a worker between them would just exercise the worker's chain-multiplexing code, not new ground.
+- Reorg E2E for Solana. Solana's `commitment="confirmed"` semantics make a reorg vanishingly rare on the local validator (no forks under load). M1's EVM reorg E2E (against Anvil's `anvil_reorg` RPC) already exercises the `ConfirmationBuffer` logic that matters; Solana's branch bypasses the buffer (`confirmations=0`), so there's no Solana-specific reorg code to E2E.
+- `transferChecked`-only coverage. Chunk 12's `SplTransferParser` unit tests cover both `Transfer` (discriminator 3) and `TransferChecked` (discriminator 12). The E2E here drives whichever `spl-token transfer` emits by default (currently `TransferChecked` for decimaled mints — the CLI picks it). Forcing both ix variants from the CLI is fragile and adds zero coverage over the unit tests.
+
+**Toolchain prerequisite:** the host needs `solana-test-validator` AND `spl-token` on PATH. Both binaries ship with the Anza Solana CLI install (`sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"` — referenced in `docs/dev-setup.md`). If either is missing, the relevant test SKIPs at fixture-entry — same pattern as M1's `anvil` skip and chunk 10's `solana-test-validator` skip.
+
+**Determinism note:** `solana-test-validator` confirms transactions deterministically once a target slot is produced, but slot production is wall-clock driven (~400 ms/slot). The tests below use a 60 s delivery timeout (vs chunk 9's 30 s) because the worker has to round-trip TWO confirmation cycles — slot finalization on the validator side, plus the worker's own poll interval (400 ms). A snappy host typically finishes in 8–15 s; the headroom prevents flakes on busy CI.
+
+**Tag `m2-complete` placement:** the tag lands AFTER Task 14.5's full suite sweep, not after Task 14.4's last test commit. Reason: if a hidden cross-chunk regression surfaces only when EVM + Solana tests run together (different event-loop policies, port collisions, etc.), the tag should sit on a commit where THAT combination is green — not on the SPL test commit which doesn't exercise the EVM suite.
+
+### Task 14.1: Promote `solana_validator` fixture to shared `tests/conftest.py`
+
+The chunk-10 fixture currently lives in `tests/integration/conftest.py`. pytest's conftest cascade is unidirectional: a fixture defined under `tests/integration/` is invisible to `tests/e2e/`. Promoting it to `tests/conftest.py` makes it visible to both subtrees without duplication.
+
+This task is a **pure move** — no behaviour change. The fixture body, the `SolanaValidatorHandle` dataclass, and the two private helpers (`_free_tcp_port`, `_wait_for_rpc`) are removed from `tests/integration/conftest.py` and added verbatim to `tests/conftest.py`. The chunk-10 and chunk-11 ITs continue to see the fixture via the new ancestor location.
+
+**Files:**
+- Modify: `tests/conftest.py` — APPEND the fixture and helpers below the existing `redis_url` fixture.
+- Modify: `tests/integration/conftest.py` — DELETE the fixture and helpers (and the `httpx`, `shutil`, `socket`, `subprocess`, `time`, `dataclass`, `Path`, `Iterator`, `contextlib`, `pytest` imports if no other code in that file still uses them; M1's `db` fixture and its imports stay).
+
+- [ ] **Step 1: Move the fixture and helpers to `tests/conftest.py`**
+
+Append the following to `tests/conftest.py`, **after** the existing `redis_url` fixture (do not touch `redis_url` or its imports):
+
+```python
+# tests/conftest.py  --  APPEND below the existing M1 redis_url fixture
+import contextlib
+import shutil
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+import httpx
+import pytest
+
+
+@dataclass
+class SolanaValidatorHandle:
+    rpc_url: str
+    process: subprocess.Popen
+    ledger_path: Path
+
+
+def _free_tcp_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_rpc(url: str, *, timeout_s: float = 25.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    body = b'{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.post(url, content=body, headers={"content-type": "application/json"}, timeout=2.0)
+            if r.status_code == 200 and r.json().get("result") == "ok":
+                return
+        except (httpx.RequestError, ValueError):
+            pass
+        time.sleep(0.5)
+    raise TimeoutError(f"solana-test-validator did not become healthy at {url}")
+
+
+@pytest.fixture(scope="session")
+def solana_validator(tmp_path_factory) -> Iterator[SolanaValidatorHandle]:
+    """Session-scoped: 5–10 s cold start; subsequent tests reuse the same
+    validator. State accumulates across tests in a session; every consumer
+    in this repo is either read-only or uses fresh keypairs / mints so the
+    shared state is fine."""
+    if shutil.which("solana-test-validator") is None:
+        pytest.skip("solana-test-validator not installed; see docs/dev-setup.md")
+
+    rpc_port = _free_tcp_port()
+    faucet_port = _free_tcp_port()
+    ledger = tmp_path_factory.mktemp("solana-ledger")
+    proc = subprocess.Popen(
+        [
+            "solana-test-validator",
+            "--reset",
+            "--quiet",
+            "--ledger", str(ledger),
+            "--rpc-port", str(rpc_port),
+            "--faucet-port", str(faucet_port),
+            "--bind-address", "127.0.0.1",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    rpc_url = f"http://127.0.0.1:{rpc_port}"
+    try:
+        _wait_for_rpc(rpc_url)
+        yield SolanaValidatorHandle(rpc_url=rpc_url, process=proc, ledger_path=ledger)
+    finally:
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5.0)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+```
+
+(The block above is byte-identical to what chunk 10 placed in `tests/integration/conftest.py` — verify with `git diff` after Step 2.)
+
+- [ ] **Step 2: Remove the same code from `tests/integration/conftest.py`**
+
+Open `tests/integration/conftest.py`. Delete:
+- The `SolanaValidatorHandle` dataclass.
+- The `_free_tcp_port` function.
+- The `_wait_for_rpc` function.
+- The `solana_validator` fixture.
+- Any of these imports that are now unused by the remaining code: `contextlib`, `shutil`, `socket`, `subprocess`, `time`, `dataclass`, `Path`, `Iterator`, `httpx`, `pytest`. (If `pytest` is still used by M1's `db` fixture decorator — check before removing.)
+
+`make lint` will catch unused imports — let ruff drive the cleanup if you're unsure.
+
+- [ ] **Step 3: Verify the chunks 10/11 ITs still see the fixture**
+
+Run the existing Solana ITs:
+
+```bash
+pytest tests/integration/test_solana_adapter.py tests/integration/test_chain_runner_solana.py -v
+```
+
+Expected: all 4 tests PASS (or all 4 SKIP if `solana-test-validator` isn't installed). If you get `fixture 'solana_validator' not found`, the move didn't land in `tests/conftest.py` correctly — re-check the file path.
+
+- [ ] **Step 4: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+
+Expected: clean. If `make lint` flags unused imports in `tests/integration/conftest.py`, remove them per Step 2's note.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/conftest.py tests/integration/conftest.py
+git commit -m "test(conftest): promote solana_validator fixture to tests/conftest.py"
+```
+
+### Task 14.2: Solana E2E helpers in `tests/e2e/conftest.py`
+
+Appends the Solana-specific helper layer to the existing E2E conftest. Three pieces:
+
+1. **Async RPC helpers** mirroring chunk-11 Task 11.5: `_solana_airdrop`, `_solana_latest_blockhash`, `_solana_send_native_transfer`, `_solana_wait_for_signature`. Centralised here so the two new test files don't duplicate the JSON-RPC boilerplate.
+2. **An `spl-token` CLI wrapper** + helpers to write a `solders.Keypair` to a CLI-compatible JSON file (`_write_keypair_file`) and to skip cleanly when `spl-token` isn't on PATH (`_require_spl_token_cli`). `spl-token` is the bundled Solana CLI tool that creates mints/ATAs and mints/transfers tokens; rebuilding those instructions from raw `solders` would add ~200 lines for zero correctness gain.
+3. **Two pytest fixtures**: `funded_sender` (function-scoped — fresh keypair + airdrop per test) and `spl_mint` (function-scoped — fresh mint, ATA, and pre-minted balance per test). Per-test scoping avoids cross-test interference even though the validator process is shared.
+
+The `spl-token` CLI is invoked as a subprocess. Its output is line-prefixed (`Creating token <pubkey>`, `Creating account <pubkey>`, `Signature: <sig>`) and parsed with simple `splitlines` + `startswith` — no regexes. If a future `spl-token` release reshapes the output, the helpers will raise `RuntimeError` with the full stdout/stderr in the message, making the failure mode obvious.
+
+**Files:**
+- Modify: `tests/e2e/conftest.py` — APPEND below M1's `anvil` / `webhook_receiver` and chunk-9's `erc20_token` fixtures.
+
+- [ ] **Step 1: Append the Solana helpers to `tests/e2e/conftest.py`**
+
+Add at the bottom of the existing file (do NOT remove or modify the M1 / chunk-9 fixtures):
+
+```python
+# tests/e2e/conftest.py  --  APPEND below the existing fixtures
+# (M1 conftest already imports `asyncio`, `contextlib`, `shutil`, `subprocess`,
+# `pytest`, `pytest_asyncio`, `httpx`, `dataclass` at module top — reuse them;
+# do NOT re-import.)
+
+import base64
+import json
+from pathlib import Path
+from typing import NamedTuple
+
+from solders.hash import Hash
+from solders.keypair import Keypair
+from solders.message import Message
+from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer as system_transfer
+from solders.transaction import Transaction
+
+
+# -- async Solana RPC helpers (signed-tx & airdrop) --------------------------
+
+async def _solana_airdrop(rpc_url: str, recipient: Pubkey, lamports: int) -> None:
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "requestAirdrop",
+        "params": [str(recipient), lamports],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(rpc_url, json=body)
+    r.raise_for_status()
+    assert "result" in r.json(), r.text
+
+
+async def _solana_latest_blockhash(rpc_url: str) -> str:
+    body = {"jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(rpc_url, json=body)
+    r.raise_for_status()
+    return r.json()["result"]["value"]["blockhash"]
+
+
+async def _solana_wait_for_signature(
+    rpc_url: str, sig: str, *, timeout_s: float = 25.0
+) -> None:
+    """Poll `getSignatureStatuses` until `confirmationStatus` reaches
+    `confirmed` (or `finalized`). Raises `TimeoutError` on miss."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+        "params": [[sig], {"searchTransactionHistory": True}],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while asyncio.get_running_loop().time() < deadline:
+            r = await client.post(rpc_url, json=body)
+            statuses = r.json().get("result", {}).get("value", [None])[0]
+            if statuses and statuses.get("confirmationStatus") in ("confirmed", "finalized"):
+                return
+            await asyncio.sleep(0.5)
+    raise TimeoutError(f"signature {sig} did not confirm within {timeout_s}s")
+
+
+async def _solana_send_native_transfer(
+    rpc_url: str, sender: Keypair, recipient: Pubkey, lamports: int
+) -> str:
+    """Build, sign, and submit a System Program transfer. Returns the base58
+    signature. Waits for confirmation before returning so the caller can
+    safely assert the tx exists in the canonical chain right after the call."""
+    ix = system_transfer(TransferParams(
+        from_pubkey=sender.pubkey(),
+        to_pubkey=recipient,
+        lamports=lamports,
+    ))
+    blockhash_str = await _solana_latest_blockhash(rpc_url)
+    recent_blockhash = Hash.from_string(blockhash_str)
+    msg = Message.new_with_blockhash([ix], sender.pubkey(), recent_blockhash)
+    tx = Transaction([sender], msg, recent_blockhash)
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+        "params": [base64.b64encode(bytes(tx)).decode(), {"encoding": "base64"}],
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(rpc_url, json=body)
+    r.raise_for_status()
+    sig = r.json()["result"]
+    await _solana_wait_for_signature(rpc_url, sig)
+    return sig
+
+
+# -- spl-token CLI wrapper ---------------------------------------------------
+
+def _require_spl_token_cli() -> None:
+    """Skip cleanly if `spl-token` isn't on PATH. Called from fixtures that
+    invoke the CLI."""
+    if shutil.which("spl-token") is None:
+        pytest.skip(
+            "spl-token CLI not installed (ships with the Anza Solana CLI); "
+            "see docs/dev-setup.md"
+        )
+
+
+def _write_keypair_file(kp: Keypair, path: Path) -> None:
+    """The Solana CLI expects a keypair as a JSON array of 64 bytes
+    (`[123,45,...]`). `solders.Keypair` serialises to the same 64-byte secret
+    via `bytes(kp)`; convert and write."""
+    path.write_text(json.dumps(list(bytes(kp))))
+
+
+def _spl_token(args: list[str], *, rpc_url: str, fee_payer: Path) -> str:
+    """Invoke `spl-token` once and return its stdout. Raises `RuntimeError`
+    with full stdout+stderr on non-zero exit so test failures point at the
+    actual CLI message instead of a generic CalledProcessError."""
+    cmd = [
+        "spl-token", "--url", rpc_url, "--fee-payer", str(fee_payer),
+        *args,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"spl-token CLI failed (rc={proc.returncode}):\n"
+            f"  cmd:    {' '.join(cmd)}\n"
+            f"  stdout: {proc.stdout!r}\n"
+            f"  stderr: {proc.stderr!r}"
+        )
+    return proc.stdout
+
+
+def _parse_cli_line(out: str, prefix: str) -> str:
+    """Extract the pubkey at the end of a line that starts with `prefix`.
+
+    Example: parses `Creating token Es9vMFrza...` → `Es9vMFrza...` when called
+    with `prefix="Creating token"`. Raises `RuntimeError` (with the full
+    stdout) if no such line exists — that means the CLI changed its output
+    shape, which is a real test-infra failure worth investigating.
+    """
+    for line in out.splitlines():
+        if line.startswith(prefix):
+            parts = line.split()
+            if len(parts) >= len(prefix.split()) + 1:
+                return parts[-1]
+    raise RuntimeError(f"spl-token output had no `{prefix}` line: {out!r}")
+
+
+# -- fixtures ----------------------------------------------------------------
+
+@dataclass
+class SolanaSenderHandle:
+    keypair: Keypair
+    keypair_path: Path
+    pubkey_b58: str
+
+
+@pytest_asyncio.fixture
+async def funded_sender(solana_validator, tmp_path) -> SolanaSenderHandle:
+    """Fresh keypair, airdropped 1 SOL, persisted to a CLI-compatible JSON
+    file. Function-scoped so each test gets a clean account (no carry-over
+    nonce, no leftover token balances)."""
+    kp = Keypair()
+    await _solana_airdrop(solana_validator.rpc_url, kp.pubkey(), 1_000_000_000)  # 1 SOL
+    # Airdrops are usually confirmed within a slot (~400 ms) on the local
+    # validator, but cold-start hosts can be slower. Wait briefly so the
+    # subsequent `spl-token` calls actually see the lamports.
+    await asyncio.sleep(2.0)
+
+    kp_path = tmp_path / "sender.json"
+    _write_keypair_file(kp, kp_path)
+    return SolanaSenderHandle(
+        keypair=kp,
+        keypair_path=kp_path,
+        pubkey_b58=str(kp.pubkey()),
+    )
+
+
+class SplMintHandle(NamedTuple):
+    mint_address: str
+    sender_keypair: Keypair
+    sender_keypair_path: Path
+    recipient_keypair: Keypair
+    recipient_pubkey_b58: str
+
+
+@pytest_asyncio.fixture
+async def spl_mint(
+    solana_validator, funded_sender, tmp_path
+) -> SplMintHandle:
+    """Mints a fresh SPL token (6 decimals), creates a token account for the
+    sender, mints 1_000_000 base units to it, and prepares (but does NOT
+    create on-chain) a recipient keypair. The first SPL transfer in the test
+    will create the recipient ATA via `--fund-recipient`."""
+    _require_spl_token_cli()
+    rpc = solana_validator.rpc_url
+
+    # 1) Create the mint. `--mint-authority` defaults to fee-payer.
+    out = _spl_token(
+        ["create-token", "--decimals", "6"],
+        rpc_url=rpc, fee_payer=funded_sender.keypair_path,
+    )
+    mint_address = _parse_cli_line(out, "Creating token")
+
+    # 2) Create the sender's ATA for that mint.
+    out = _spl_token(
+        ["create-account", mint_address],
+        rpc_url=rpc, fee_payer=funded_sender.keypair_path,
+    )
+    # `Creating account <ATA>` — captured but not returned; spl-token uses the
+    # sender's ATA implicitly for subsequent `mint` and `transfer` calls.
+    _parse_cli_line(out, "Creating account")
+
+    # 3) Mint 1_000_000 base units (1 token at 6 decimals) to the sender.
+    _spl_token(
+        ["mint", mint_address, "1"],
+        rpc_url=rpc, fee_payer=funded_sender.keypair_path,
+    )
+
+    # 4) Prepare a recipient keypair (no on-chain account yet — the first
+    #    `--fund-recipient` transfer will create the ATA).
+    recipient = Keypair()
+    return SplMintHandle(
+        mint_address=mint_address,
+        sender_keypair=funded_sender.keypair,
+        sender_keypair_path=funded_sender.keypair_path,
+        recipient_keypair=recipient,
+        recipient_pubkey_b58=str(recipient.pubkey()),
+    )
+
+
+async def _spl_transfer_one(
+    rpc_url: str, fee_payer: Path, mint: str, amount_decimal: str, recipient_b58: str,
+) -> str:
+    """Issue ONE `spl-token transfer` and return the returned signature.
+    `--fund-recipient` auto-creates the recipient's ATA if missing (and
+    `--allow-unfunded-recipient` lets us pay for that account creation from
+    the sender's lamports). The first call in a test typically funds the ATA
+    (taking ~0.002 SOL); subsequent calls reuse it."""
+    out = _spl_token(
+        [
+            "transfer", mint, amount_decimal, recipient_b58,
+            "--fund-recipient",
+            "--allow-unfunded-recipient",
+        ],
+        rpc_url=rpc_url, fee_payer=fee_payer,
+    )
+    return _parse_cli_line(out, "Signature:")
+```
+
+- [ ] **Step 2: Collect-only smoke**
+
+```bash
+python -m pytest tests/e2e/conftest.py --collect-only -q
+```
+
+Expected: no import errors. If `solders` isn't installed, the import will fail — `solders` was added in chunk 10 Task 10.1, so this is a sanity check that chunks 10+ all landed cleanly.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/e2e/conftest.py
+git commit -m "test(e2e): solana helpers — airdrop, native send, spl-token CLI wrapper"
+```
+
+### Task 14.3: E2E test — native SOL transfer → webhook
+
+Mirrors chunk 9 Task 9.5's structure. Drives the API to create a Solana chain, an HTTP channel, and a `native_transfer` subscription scoped to a specific recipient pubkey. Starts the worker in-process, airdrops then transfers SOL between two fresh keypairs N times, and asserts N webhook payloads arrived with `kind="native_transfer"`.
+
+**Subscription scoping:** `address=None` (native transfers are chain-wide, not contract-scoped) + `arg_filters={"to": <recipient_pubkey_b58>}`. The `arg_filters` keeps the test deterministic — the validator's internal vote txs, plus the funded_sender's airdrop, also generate balance diffs the parser may pick up, but those won't have `to == <our recipient>` so they don't match the subscription. (Confirmed by the chunk 12 case-folding fix: base58 pubkeys are matched case-sensitively, so a typo in the recipient pubkey would surface as zero matches rather than spurious matches.)
+
+**Why N=2 (not 3 like chunk 9):** each Solana transfer settles in ~400 ms, but the validator's slot-production cadence means consecutive transfers can land in the same slot. N=2 with a short gap ensures different slots, which exercises the worker's polling loop more meaningfully than a single tx without inflating wallclock.
+
+**Files:**
+- Create: `tests/e2e/test_solana_native_e2e.py`
+
+- [ ] **Step 1: Write the test**
+
+```python
+# tests/e2e/test_solana_native_e2e.py
+"""Solana native SOL transfer E2E.
+
+Drives:
+    solana-test-validator
+        -> SolanaAdapter (chunk 10)
+        -> SolanaParserPipeline (SolNativeTransferParser from chunk 11)
+        -> Matcher (chunk-12 case-aware case-folding)
+        -> Notifier
+        -> HttpChannel
+        -> in-process webhook receiver (M1 fixture)
+
+Asserts payload conforms to spec §8 with `kind="native_transfer"`.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from solders.keypair import Keypair
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from apps.worker.main import run_worker
+from core.bus.redis_bus import RedisBus
+from core.config.db import Database
+from core.config.models import Base
+from core.settings import Settings
+
+from tests.e2e.conftest import _solana_send_native_transfer  # type: ignore[attr-defined]
+
+pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
+
+
+TRANSFER_COUNT = 2
+LAMPORTS_PER_TRANSFER = 1_000_000  # 0.001 SOL each
+DELIVERY_TIMEOUT_S = 60.0
+
+
+@pytest_asyncio.fixture
+async def db_url(tmp_path) -> str:
+    return f"sqlite+aiosqlite:///{tmp_path / 'e2e_sol_native.sqlite'}"
+
+
+@pytest_asyncio.fixture
+async def initialised_db(db_url: str) -> AsyncIterator[Database]:
+    d = Database(db_url)
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield d
+    await d.disconnect()
+
+
+async def test_solana_native_transfer_to_webhook(
+    solana_validator, webhook_receiver, funded_sender,
+    initialised_db, db_url, redis_url,
+) -> None:
+    """Native SOL transfers from `funded_sender` to a fresh recipient land
+    as `kind="native_transfer"` webhook deliveries with chain_id="sol-local".
+    """
+    recipient = Keypair()
+    settings = Settings(
+        database={"url": db_url},
+        redis={"url": redis_url},
+    )
+
+    # 1) Seed config via the real API.
+    bus_writer = RedisBus(url=redis_url)
+    await bus_writer.connect()
+    try:
+        app = create_app(lifespan=None)
+        app.dependency_overrides[get_db] = lambda: initialised_db
+        app.dependency_overrides[get_bus] = lambda: bus_writer
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as c:
+            r = await c.post("/api/chains", json={
+                "id": "sol-local",
+                "kind": "solana",
+                "rpc_http": solana_validator.rpc_url,
+                "rpc_ws": None,
+                "confirmations": 0,
+                "commitment": "confirmed",
+                "poll_interval_ms": 400,
+                "enabled": True,
+            })
+            assert r.status_code == 201, r.text
+
+            r = await c.post("/api/channels", json={
+                "name": "e2e-sol-native-hook", "type": "http",
+                "config": {"url": webhook_receiver.url, "method": "POST"},
+            })
+            assert r.status_code == 201
+            channel_id = r.json()["id"]
+
+            r = await c.post("/api/subscriptions", json={
+                "name": "watch-recipient-native",
+                "chain_id": "sol-local",
+                "address": None,                  # native transfers are chain-wide
+                "abi_id": None,
+                "match_kind": "native_transfer",
+                "match_name": None,
+                "arg_filters": {"to": str(recipient.pubkey())},  # case-sensitive
+                "enabled": True,
+            })
+            assert r.status_code == 201, r.text
+            sub_id = r.json()["id"]
+
+            r = await c.post(f"/api/subscriptions/{sub_id}/channels",
+                             json={"channel_id": channel_id})
+            assert r.status_code == 204
+    finally:
+        await bus_writer.disconnect()
+
+    # 2) Start the worker. Give it a moment to hot-load the snapshot and
+    #    register the Solana chain runner.
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(run_worker(settings, stop_event))
+    await asyncio.sleep(2.0)
+
+    # 3) Submit N native transfers from `funded_sender` to `recipient`.
+    submitted_sigs: list[str] = []
+    try:
+        for _ in range(TRANSFER_COUNT):
+            sig = await _solana_send_native_transfer(
+                solana_validator.rpc_url,
+                funded_sender.keypair,
+                recipient.pubkey(),
+                LAMPORTS_PER_TRANSFER,
+            )
+            submitted_sigs.append(sig)
+            # Force a tiny gap so the two transfers land in distinct slots
+            # — Solana slots are ~400 ms.
+            await asyncio.sleep(0.6)
+
+        # 4) Wait for the receiver to collect N payloads.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DELIVERY_TIMEOUT_S
+        timed_out = False
+        while True:
+            matches = [
+                p for p in webhook_receiver.received
+                if p.get("event", {}).get("args", {}).get("to") == str(recipient.pubkey())
+            ]
+            if len(matches) >= TRANSFER_COUNT:
+                break
+            if loop.time() > deadline:
+                timed_out = True
+                break
+            await asyncio.sleep(0.5)
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(worker_task, timeout=3.0)
+
+    matches = [
+        p for p in webhook_receiver.received
+        if p.get("event", {}).get("args", {}).get("to") == str(recipient.pubkey())
+    ]
+    if timed_out:
+        pytest.fail(
+            f"only {len(matches)}/{TRANSFER_COUNT} native-transfer payloads received "
+            f"within {DELIVERY_TIMEOUT_S}s (total deliveries: {len(webhook_receiver.received)})"
+        )
+
+    # 5) Assert payload shape per spec §8 with kind=native_transfer.
+    sample = matches[0]
+    assert sample["subscription_id"] == sub_id
+    assert sample["subscription_name"] == "watch-recipient-native"
+    assert sample["chain_id"] == "sol-local"
+    assert "delivery_id" in sample
+    assert "delivered_at" in sample
+
+    ev = sample["event"]
+    assert ev["kind"] == "native_transfer"
+    # native_transfer has no contract address on Solana (system program is implicit).
+    assert ev.get("address") in (None, "")
+    assert isinstance(ev["block_number"], int) and ev["block_number"] >= 1
+    # Solana block_hash is base58, NOT 0x-prefixed hex (chunk 12 case-folding fix).
+    assert isinstance(ev["block_hash"], str) and len(ev["block_hash"]) > 0
+    assert not ev["block_hash"].startswith("0x")
+    # tx_hash on Solana is the base58 signature; chunk-11 parser sets it directly.
+    assert isinstance(ev["tx_hash"], str) and len(ev["tx_hash"]) > 0
+    assert ev["tx_hash"] in submitted_sigs
+
+    assert "from" in ev["args"] and "to" in ev["args"] and "value" in ev["args"]
+    assert ev["args"]["from"] == str(funded_sender.keypair.pubkey())
+    assert ev["args"]["to"] == str(recipient.pubkey())
+    assert ev["args"]["value"] == str(LAMPORTS_PER_TRANSFER)
+```
+
+- [ ] **Step 2: Run the test**
+
+```bash
+pytest tests/e2e/test_solana_native_e2e.py -v -m e2e
+```
+
+Expected on a host with `solana-test-validator` installed: 1 PASS in ~20–40 s (5–10 s validator boot + 2 s airdrop + ~2 × 0.5 s transfers + worker poll headroom). On a host without the validator: 1 SKIP.
+
+If the test fails with `BlockhashNotFound`, the airdrop hasn't fully settled — increase `await asyncio.sleep(2.0)` after airdrop in `funded_sender` to 4 s.
+
+If the test fails with "0/2 native-transfer payloads received", check:
+1. `RedisBus` ping passing (worker started cleanly).
+2. The `chains` API call accepted `commitment="confirmed"` (chunk 10 schema must have landed).
+3. `arg_filters={"to": str(recipient.pubkey())}` matches the parser's `args["to"]` (chunk 11's parser stringifies the pubkey via `str(...)`).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/e2e/test_solana_native_e2e.py
+git commit -m "test(e2e): solana native-transfer validator → worker → webhook"
+```
+
+### Task 14.4: E2E test — SPL token transfer → webhook
+
+Same skeleton as Task 14.3, but the subscription is scoped to a freshly-minted SPL token (`address=<mint_b58>`, `match_kind="token_transfer"`). The `spl_mint` fixture handles all the upfront token setup; the test body issues N `spl-token transfer` CLI calls and asserts N webhook deliveries with `kind="token_transfer"` and `event.args.mint` matching the mint address.
+
+**Why `address=<mint>` is the right scope:** chunk 12's `SplTransferParser` sets `event.contract=<mint base58>`. The matcher maps `subscription.address` against `event.contract`, so `address=<mint>` filters on the specific mint. We do NOT also set `arg_filters={"mint": ...}` — that would be a redundant double-filter; `address` already does the work.
+
+**Decimals note:** the mint in `spl_mint` is created with `--decimals 6` (six decimal places). When `spl-token transfer <mint> <amount> <to>` runs with a *human-readable* amount like `0.1`, the on-chain `Transfer`/`TransferChecked` ix sees the raw base-units integer `100000`. The chunk-12 parser emits `args.value=str(base_units_int)`, so the E2E expects `"100000"`, not `"0.1"`.
+
+**Files:**
+- Create: `tests/e2e/test_solana_spl_e2e.py`
+
+- [ ] **Step 1: Write the test**
+
+```python
+# tests/e2e/test_solana_spl_e2e.py
+"""Solana SPL token transfer E2E.
+
+Drives:
+    solana-test-validator (with spl-token CLI building the mint+ATA setup)
+        -> SolanaAdapter (chunk 10)
+        -> SolanaParserPipeline (SplTransferParser from chunk 12)
+        -> Matcher (case-sensitive on base58 mint, chunk-12 fix)
+        -> Notifier
+        -> HttpChannel
+        -> in-process webhook receiver
+
+Asserts payload conforms to spec §8 with `kind="token_transfer"` and
+`event.args.mint == <freshly-minted mint pubkey>`.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from apps.worker.main import run_worker
+from core.bus.redis_bus import RedisBus
+from core.config.db import Database
+from core.config.models import Base
+from core.settings import Settings
+
+from tests.e2e.conftest import _spl_transfer_one  # type: ignore[attr-defined]
+
+pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
+
+
+TRANSFER_COUNT = 2
+# 0.1 token at 6 decimals == 100000 base units. spl-token's CLI takes the
+# decimal form; the parser sees and emits the base-units integer.
+TRANSFER_DECIMAL_AMOUNT = "0.1"
+TRANSFER_BASE_UNITS = 100_000
+DELIVERY_TIMEOUT_S = 60.0
+
+
+@pytest_asyncio.fixture
+async def db_url(tmp_path) -> str:
+    return f"sqlite+aiosqlite:///{tmp_path / 'e2e_sol_spl.sqlite'}"
+
+
+@pytest_asyncio.fixture
+async def initialised_db(db_url: str) -> AsyncIterator[Database]:
+    d = Database(db_url)
+    await d.connect()
+    async with d.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield d
+    await d.disconnect()
+
+
+async def test_solana_spl_transfer_to_webhook(
+    solana_validator, webhook_receiver, spl_mint,
+    initialised_db, db_url, redis_url,
+) -> None:
+    """SPL token transfers from `spl_mint.sender` to `spl_mint.recipient` land
+    as `kind="token_transfer"` webhook deliveries with the mint pubkey echoed
+    in `event.address` (case-sensitive).
+    """
+    settings = Settings(
+        database={"url": db_url},
+        redis={"url": redis_url},
+    )
+
+    # 1) Seed config via the real API.
+    bus_writer = RedisBus(url=redis_url)
+    await bus_writer.connect()
+    try:
+        app = create_app(lifespan=None)
+        app.dependency_overrides[get_db] = lambda: initialised_db
+        app.dependency_overrides[get_bus] = lambda: bus_writer
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test",
+        ) as c:
+            r = await c.post("/api/chains", json={
+                "id": "sol-local",
+                "kind": "solana",
+                "rpc_http": solana_validator.rpc_url,
+                "rpc_ws": None,
+                "confirmations": 0,
+                "commitment": "confirmed",
+                "poll_interval_ms": 400,
+                "enabled": True,
+            })
+            assert r.status_code == 201, r.text
+
+            r = await c.post("/api/channels", json={
+                "name": "e2e-sol-spl-hook", "type": "http",
+                "config": {"url": webhook_receiver.url, "method": "POST"},
+            })
+            assert r.status_code == 201
+            channel_id = r.json()["id"]
+
+            r = await c.post("/api/subscriptions", json={
+                "name": "spl-on-mint",
+                "chain_id": "sol-local",
+                "address": spl_mint.mint_address,        # case-sensitive base58
+                "abi_id": None,
+                "match_kind": "token_transfer",
+                "match_name": None,
+                "arg_filters": {},
+                "enabled": True,
+            })
+            assert r.status_code == 201, r.text
+            sub_id = r.json()["id"]
+
+            r = await c.post(f"/api/subscriptions/{sub_id}/channels",
+                             json={"channel_id": channel_id})
+            assert r.status_code == 204
+    finally:
+        await bus_writer.disconnect()
+
+    # 2) Start the worker.
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(run_worker(settings, stop_event))
+    await asyncio.sleep(2.0)
+
+    # 3) Submit N SPL transfers via the CLI.
+    submitted_sigs: list[str] = []
+    try:
+        for _ in range(TRANSFER_COUNT):
+            sig = await asyncio.get_running_loop().run_in_executor(
+                None,
+                _spl_transfer_one,
+                solana_validator.rpc_url,
+                spl_mint.sender_keypair_path,
+                spl_mint.mint_address,
+                TRANSFER_DECIMAL_AMOUNT,
+                spl_mint.recipient_pubkey_b58,
+            )
+            submitted_sigs.append(sig)
+            # spl-token transfer is blocking + slot-driven; small inter-call gap
+            # keeps consecutive transfers in distinct slots.
+            await asyncio.sleep(0.6)
+
+        # 4) Wait for the receiver.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DELIVERY_TIMEOUT_S
+        timed_out = False
+        while True:
+            matches = [
+                p for p in webhook_receiver.received
+                if p.get("event", {}).get("kind") == "token_transfer"
+                and p.get("event", {}).get("args", {}).get("mint") == spl_mint.mint_address
+            ]
+            if len(matches) >= TRANSFER_COUNT:
+                break
+            if loop.time() > deadline:
+                timed_out = True
+                break
+            await asyncio.sleep(0.5)
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(worker_task, timeout=3.0)
+
+    matches = [
+        p for p in webhook_receiver.received
+        if p.get("event", {}).get("kind") == "token_transfer"
+        and p.get("event", {}).get("args", {}).get("mint") == spl_mint.mint_address
+    ]
+    if timed_out:
+        pytest.fail(
+            f"only {len(matches)}/{TRANSFER_COUNT} token-transfer payloads received "
+            f"within {DELIVERY_TIMEOUT_S}s (total deliveries: {len(webhook_receiver.received)})"
+        )
+
+    # 5) Assert payload shape per spec §8 with kind=token_transfer.
+    sample = matches[0]
+    assert sample["subscription_id"] == sub_id
+    assert sample["subscription_name"] == "spl-on-mint"
+    assert sample["chain_id"] == "sol-local"
+
+    ev = sample["event"]
+    assert ev["kind"] == "token_transfer"
+    # On Solana, `event.address` is the mint pubkey (base58, case-sensitive).
+    assert ev["address"] == spl_mint.mint_address
+    assert isinstance(ev["block_number"], int) and ev["block_number"] >= 1
+    assert isinstance(ev["tx_hash"], str) and ev["tx_hash"] in submitted_sigs
+
+    assert {"from", "to", "value", "mint"}.issubset(ev["args"].keys())
+    assert ev["args"]["mint"] == spl_mint.mint_address
+    assert ev["args"]["from"] == str(spl_mint.sender_keypair.pubkey())
+    assert ev["args"]["to"] == spl_mint.recipient_pubkey_b58
+    assert ev["args"]["value"] == str(TRANSFER_BASE_UNITS)
+```
+
+- [ ] **Step 2: Run the test**
+
+```bash
+pytest tests/e2e/test_solana_spl_e2e.py -v -m e2e
+```
+
+Expected on a host with `solana-test-validator` AND `spl-token` installed: 1 PASS in ~30–50 s. On a host missing either tool: 1 SKIP.
+
+Common failure modes:
+- `spl-token CLI failed (rc=1) … insufficient funds for rent`: the `funded_sender` airdrop wasn't large enough to cover mint creation + ATA rent + N transfer ATAs. Increase the airdrop from `1_000_000_000` to `2_000_000_000` lamports in `funded_sender`.
+- `0/2 token-transfer payloads received`: confirm chunk 12's case-folding fix landed. The mint address is base58 and case-sensitive; the seeded `subscription.address` and the parser's `event.contract` must match byte-for-byte. If they don't, the matcher silently rejects.
+- `KeyError: 'mint'`: chunk 12's `SplTransferParser` is supposed to populate `args["mint"]` for both `Transfer` and `TransferChecked`. If only `TransferChecked` populates it, the CLI may be emitting `Transfer` here; revisit chunk 12's mint resolution path (`meta.post_token_balances` for `Transfer`).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/e2e/test_solana_spl_e2e.py
+git commit -m "test(e2e): solana spl-token transfer validator → worker → webhook"
+```
+
+### Task 14.5: Close-out — full regression + tag `m2-complete`
+
+The M2 close-out. Same skeleton as chunk 9 Task 9.6, with one extra step: every chunk-1-through-14 test runs together to surface any cross-chunk regressions before the tag lands.
+
+- [ ] **Step 1: Run the full unit suite**
+
+```bash
+make test
+```
+
+Expected: every chunk 1–14 unit + integration test passes. Solana ITs (chunks 10, 11) SKIP on hosts without `solana-test-validator`; everything else runs.
+
+If a unit test fails, fix it BEFORE proceeding. The tag must sit on green.
+
+- [ ] **Step 2: Run the full E2E suite**
+
+```bash
+make test-e2e
+```
+
+Expected: four E2E tests PASS:
+1. `tests/e2e/test_native_transfer_e2e.py` (M1 — Anvil native ETH transfer).
+2. `tests/e2e/test_evm_erc20_e2e.py` (chunk 9 — Anvil ERC-20 transfer).
+3. `tests/e2e/test_solana_native_e2e.py` (chunk 14 Task 14.3).
+4. `tests/e2e/test_solana_spl_e2e.py` (chunk 14 Task 14.4).
+
+Total wallclock on a warm host: ~2–3 min (solana-test-validator cold-start dominates the Solana side; both Solana tests share the session-scoped validator).
+
+On a host without `solana-test-validator`: tests 3 & 4 SKIP, total wallclock ~1 min.
+On a host without `spl-token`: test 4 SKIPs, test 3 still passes.
+
+- [ ] **Step 3: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+
+Expected: clean. No new lints from the chunk-14 additions; no new mypy errors.
+
+- [ ] **Step 4: Verify `git status` is clean**
+
+```bash
+git status
+```
+
+Expected: `working tree clean`. If anything is uncommitted, decide whether it belongs in a follow-up commit (`git add ... && git commit`) or should be reverted (`git restore ...`). The tag must sit on a clean tree.
+
+- [ ] **Step 5: Tag `m2-complete`**
+
+```bash
+git tag m2-complete
+git tag -l m2-complete   # verify
+```
+
+The `m2-complete` tag marks the end of M2: every spec §4 deliverable shipped (ERC-20 / ABI event / ABI call / Anchor IDL parsers; MQ / WS channels; Solana native + SPL parsers; hardened arg_filters; full EVM + Solana E2E).
+
+`m2-complete` is informational — future chunks (M3 onward) don't read it. The tag exists so a human can `git checkout m2-complete` and find a known-good state: EVM + Solana both fully wired, two E2E tests for each chain, and every unit / integration suite green.
+
+- [ ] **Step 6: Final commit (only if cleanup landed)**
+
+If Step 4 surfaced anything worth committing (e.g. a trailing TODO or doc tweak found while writing the close-out), commit it now BEFORE the tag — `git tag` attaches to whatever HEAD points at, so a forgotten file becomes "post-tag" and the tag no longer reflects the working state.
+
+If Step 4 was already clean, this step is a no-op.
+
+```bash
+git status   # final sanity
+```
+
+**Chunk 14 done. M2 complete.** Branch `feat/m2-design` is ready for review and merge to `main`. The merge should be a `--no-ff` merge (or squash, per repo convention) so the chunk history is preserved as a single logical M2 unit. Post-merge, push the `m2-complete` tag (`git push origin m2-complete`) so it's visible to other clones.

@@ -934,3 +934,1222 @@ Expected: clean.
 
 ---
 
+## Chunk 2: ABI Entity + Registry + Decoder Cache
+
+Introduces the cross-cutting `core/abi/` package that backs the three new ABI-driven parsers in chunks 3-5 (ERC-20, AbiEvent, AbiCall) and chunk 13 (AnchorIdlEvent). The `Abi` ORM table is already in M1 (`core/config/models.py:78`) — this chunk adds **only** the API surface (`/api/abis` CRUD), the snapshot integration, and the runtime registry that compiles and caches decoders.
+
+**Spec §4.1 scope:**
+- `AbiRegistry`: constructed once per worker, takes a `Database` handle, refreshes on `config_changed`.
+- `Decoder` cache: keyed by `(abi_id, key)` where `key` is `topic0` (event) / 4-byte selector (call) / 8-byte discriminator (Anchor IDL).
+- Decoders compiled lazily on first request, then memoized.
+- API: `POST /api/abis`, `GET /api/abis`, `GET /api/abis/{id}`, `DELETE /api/abis/{id}` (no PATCH — ABIs are immutable; update = delete + create with a new id).
+- Side effect: every write bumps `config_version` via `bump_and_publish`.
+
+**New files this chunk:**
+- `core/abi/__init__.py`
+- `core/abi/errors.py`
+- `core/abi/registry.py`
+- `core/abi/decoder.py` (EVM event/call paths only; Anchor IDL path lands in chunk 13)
+- `apps/web/routers/abis.py`
+- `tests/unit/test_abi_registry.py`
+- `tests/unit/test_abi_decoder.py`
+- `tests/integration/test_abi_api.py`
+
+**Modified files this chunk:**
+- `apps/web/main.py` — include `abis` router.
+- `apps/web/schemas.py` — `AbiCreate`, `AbiOut` schemas.
+- `core/config/repositories.py` — `AbiRepo` CRUD.
+- `core/config/snapshot.py` — `SnapshotAbi`, `load_snapshot` reads `abis`.
+
+**Out of scope this chunk:**
+- Wiring `AbiRegistry` into any parser (chunks 3-5, 13 do that).
+- Anchor IDL discriminator path in `decoder.py` (chunk 13).
+- Refresh-on-`config_changed` hook in the worker (deferred to chunk 4 where the first ABI parser ships and the wiring becomes load-bearing).
+
+**Dependency / version pin:**
+- `eth-abi` ships as a transitive of `web3>=6` (already in `pyproject.toml`). Verify with `pip show eth-abi` — no new top-level dep needed.
+
+### Task 2.1: AbiRepo — add `delete` method
+
+`AbiRepo` already exists in M1 at `core/config/repositories.py:162` with `create`, `get`, and `list_all` already implemented (M1 needed `Abi` rows for FK targets even though no parser consumed them yet). The only gap is `delete` — needed by the `DELETE /api/abis/{id}` route in Task 2.3.
+
+**Files:**
+- Modify: `core/config/repositories.py` (extend existing `AbiRepo` with `delete`)
+- Test: `tests/integration/test_repositories.py` (append AbiRepo cases)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/integration/test_repositories.py`:
+
+```python
+# tests/integration/test_repositories.py — append
+from core.config.models import AbiKind
+from core.config.repositories import AbiRepo
+
+
+_ERC20_TRANSFER_EVENT = {
+    "name": "Transfer", "type": "event", "inputs": [
+        {"name": "from", "type": "address", "indexed": True},
+        {"name": "to",   "type": "address", "indexed": True},
+        {"name": "value","type": "uint256", "indexed": False},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_abi_repo_create_get_list(db) -> None:
+    """Sanity check that M1's create/get/list_all still work — guards against
+    any accidental signature drift introduced by the delete patch."""
+    async with db.session() as s:
+        row = await AbiRepo(s).create(
+            name="erc20", kind=AbiKind.evm_abi, body=[_ERC20_TRANSFER_EVENT],
+        )
+        await s.commit()
+        abi_id = row.id
+        assert abi_id
+
+    async with db.session() as s:
+        got = await AbiRepo(s).get(abi_id)
+        assert got is not None
+        assert got.name == "erc20"
+        assert got.kind == AbiKind.evm_abi
+        rows = await AbiRepo(s).list_all()
+        assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_abi_repo_delete_removes_row(db) -> None:
+    async with db.session() as s:
+        row = await AbiRepo(s).create(
+            name="erc20", kind=AbiKind.evm_abi, body=[_ERC20_TRANSFER_EVENT],
+        )
+        await s.commit()
+        abi_id = row.id
+
+    async with db.session() as s:
+        await AbiRepo(s).delete(abi_id)
+        await s.commit()
+
+    async with db.session() as s:
+        assert await AbiRepo(s).get(abi_id) is None
+
+
+@pytest.mark.asyncio
+async def test_abi_repo_delete_unknown_id_is_noop(db) -> None:
+    """delete() on a non-existent id must NOT raise — the router layer is
+    responsible for 404 surfacing (Task 2.3 does a get-first guard)."""
+    async with db.session() as s:
+        await AbiRepo(s).delete("no-such-id")
+        await s.commit()
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/integration/test_repositories.py -k abi_repo -v`
+Expected: `test_abi_repo_delete_removes_row` and `test_abi_repo_delete_unknown_id_is_noop` fail with `AttributeError: 'AbiRepo' object has no attribute 'delete'`; `test_abi_repo_create_get_list` may pass already.
+
+- [ ] **Step 3: Add `delete` to the existing `AbiRepo`**
+
+Edit `core/config/repositories.py`: locate the existing `AbiRepo` class (around line 162, immediately above `CheckpointRepo`). Append the `delete` method, mirroring `SubscriptionRepo.delete` at line 156:
+
+```python
+    async def delete(self, abi_id: str) -> None:
+        a = await self.get(abi_id)
+        if a is not None:
+            await self.s.delete(a)
+```
+
+Do NOT touch the existing `create`/`get`/`list_all` methods. Do NOT change the `body: Any` signature on `create` (changing it would invalidate M1 callers).
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/integration/test_repositories.py -k abi_repo -v`
+Expected: all 3 PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/config/repositories.py tests/integration/test_repositories.py
+git commit -m "feat(config): AbiRepo.delete"
+```
+
+### Task 2.2: AbiCreate / AbiOut Pydantic schemas
+
+**Files:**
+- Modify: `apps/web/schemas.py` (append)
+
+- [ ] **Step 1: Append schemas**
+
+```python
+# apps/web/schemas.py — append
+
+# ---- ABIs -----------------------------------------------------------------
+
+
+class AbiCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    kind: Literal["evm_abi", "solana_idl"]
+    body: dict[str, Any] | list[Any]
+
+
+class AbiOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    kind: str
+    body: dict[str, Any] | list[Any]
+```
+
+- [ ] **Step 2: Run schema imports for sanity**
+
+Run: `python -c "from apps.web.schemas import AbiCreate, AbiOut; print('ok')"`
+Expected: `ok`.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add apps/web/schemas.py
+git commit -m "feat(web): AbiCreate/AbiOut schemas"
+```
+
+### Task 2.3: /api/abis router
+
+**Files:**
+- Create: `apps/web/routers/abis.py`
+- Modify: `apps/web/main.py` (include router)
+- Test: `tests/integration/test_abi_api.py`
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/integration/test_abi_api.py
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from apps.web.deps import get_bus, get_db
+from apps.web.main import create_app
+from core.config.db import Database
+from core.config.models import Base
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+
+# Mirrors `_FakeBus` from tests/unit/test_web_chains.py — captures
+# (channel, payload) tuples so the test can assert publish side effects.
+class _FakeBus:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, dict[str, Any]]] = []
+
+    async def ping(self) -> bool:
+        return True
+
+    async def publish(self, channel: str, payload: dict[str, Any]) -> None:
+        self.published.append((channel, payload))
+
+
+# `db` is provided by tests/integration/conftest.py (M1) — file-backed memory SQLite
+# with Base.metadata.create_all already run.
+
+
+@pytest_asyncio.fixture
+async def fake_bus() -> _FakeBus:
+    return _FakeBus()
+
+
+@pytest.fixture
+def erc20_body() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "Transfer", "type": "event",
+            "inputs": [
+                {"name": "from", "type": "address", "indexed": True},
+                {"name": "to",   "type": "address", "indexed": True},
+                {"name": "value","type": "uint256", "indexed": False},
+            ],
+        }
+    ]
+
+
+async def test_abi_crud_round_trip(db: Database, fake_bus: _FakeBus, erc20_body) -> None:
+    app = create_app(lifespan=None)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_bus] = lambda: fake_bus
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        # CREATE
+        r = await c.post("/api/abis", json={
+            "name": "erc20", "kind": "evm_abi", "body": erc20_body,
+        })
+        assert r.status_code == 201, r.text
+        abi_id = r.json()["id"]
+        assert r.json()["name"] == "erc20"
+        assert r.json()["kind"] == "evm_abi"
+
+        # GET single
+        r = await c.get(f"/api/abis/{abi_id}")
+        assert r.status_code == 200
+        assert r.json()["body"] == erc20_body
+
+        # GET 404 for unknown
+        r = await c.get("/api/abis/no-such-id")
+        assert r.status_code == 404
+
+        # LIST
+        r = await c.get("/api/abis")
+        assert r.status_code == 200
+        ids = [x["id"] for x in r.json()]
+        assert abi_id in ids
+
+        # DELETE
+        r = await c.delete(f"/api/abis/{abi_id}")
+        assert r.status_code == 204
+
+        r = await c.get(f"/api/abis/{abi_id}")
+        assert r.status_code == 404
+
+    # Verify config_version bumped via fake_bus's recorded publishes.
+    # `bump_and_publish` posts to the "config_changed" channel with an
+    # {"entity": "abi", "id": ..., "action": "create|delete"} payload.
+    actions = [payload["action"] for _, payload in fake_bus.published]
+    assert "create" in actions
+    assert "delete" in actions
+
+
+async def test_abi_create_accepts_empty_body(db: Database, fake_bus: _FakeBus) -> None:
+    app = create_app(lifespan=None)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_bus] = lambda: fake_bus
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.post("/api/abis", json={"name": "x", "kind": "evm_abi", "body": []})
+        # Empty body is allowed at API level; downstream decoder cache will be a no-op.
+        # This test just ensures we don't fail-fast on empty arrays.
+        assert r.status_code == 201
+
+
+async def test_abi_create_rejects_invalid_kind(db: Database, fake_bus: _FakeBus) -> None:
+    app = create_app(lifespan=None)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_bus] = lambda: fake_bus
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.post("/api/abis", json={"name": "x", "kind": "yaml", "body": {}})
+        assert r.status_code == 422
+```
+
+Note: `AbiRepo.delete` is intentionally permissive (no-op on unknown id — see Task 2.1). The router layer adds a `get`-then-404 guard before calling `delete`, so the test's 404 expectation passes through the router check, not the repo.
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/integration/test_abi_api.py -v`
+Expected: all three FAIL with 404 (no `/api/abis` route mounted yet).
+
+- [ ] **Step 3: Implement the router**
+
+```python
+# apps/web/routers/abis.py
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from apps.web.deps import get_bus, get_session
+from apps.web.routers._common import bump_and_publish
+from apps.web.schemas import AbiCreate, AbiOut
+from core.bus.redis_bus import RedisBus
+from core.config.models import AbiKind
+from core.config.repositories import AbiRepo
+
+router = APIRouter(prefix="/api/abis", tags=["abis"])
+
+
+@router.post("", response_model=AbiOut, status_code=status.HTTP_201_CREATED)
+async def create_abi(
+    payload: AbiCreate,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> AbiOut:
+    row = await AbiRepo(session).create(
+        name=payload.name,
+        kind=AbiKind(payload.kind),
+        body=payload.body,
+    )
+    await bump_and_publish(session, bus, entity="abi", entity_id=row.id, action="create")
+    return AbiOut.model_validate(row)
+
+
+@router.get("", response_model=list[AbiOut])
+async def list_abis(
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> list[AbiOut]:
+    rows = await AbiRepo(session).list_all()
+    return [AbiOut.model_validate(r) for r in rows]
+
+
+@router.get("/{abi_id}", response_model=AbiOut)
+async def get_abi(
+    abi_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> AbiOut:
+    row = await AbiRepo(session).get(abi_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="abi not found")
+    return AbiOut.model_validate(row)
+
+
+@router.delete("/{abi_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_abi(
+    abi_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> None:
+    repo = AbiRepo(session)
+    row = await repo.get(abi_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="abi not found")
+    await repo.delete(abi_id)
+    await bump_and_publish(session, bus, entity="abi", entity_id=abi_id, action="delete")
+```
+
+- [ ] **Step 4: Wire the router into the app**
+
+Edit `apps/web/main.py`'s `create_app` function. The existing router-import / include block already imports `chains`, `channels`, `subscriptions`. Add **exactly two new lines** alongside them — do not delete or reorder the existing entries:
+
+1. After the existing `from apps.web.routers import chains as chains_router` import line, add:
+
+```python
+    from apps.web.routers import abis as abis_router  # noqa: E402
+```
+
+2. After the existing `app.include_router(chains_router.router)` call, add:
+
+```python
+    app.include_router(abis_router.router)
+```
+
+Keep the existing chains / channels / subscriptions imports and includes unchanged.
+
+- [ ] **Step 5: Run, expect PASS.**
+
+Run: `pytest tests/integration/test_abi_api.py -v`
+Expected: all 3 PASS.
+
+- [ ] **Step 6: Run full integration suite**
+
+Run: `pytest tests/integration -v`
+Expected: no regressions in M1 routers.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/web/routers/abis.py apps/web/main.py tests/integration/test_abi_api.py
+git commit -m "feat(web): /api/abis CRUD with config_version bump"
+```
+
+### Task 2.4: SnapshotAbi + load_snapshot integration
+
+The worker boots a `ConfigSnapshot` once per `config_changed`. ABIs need to be in that snapshot so the registry can refresh on reload without an extra DB round-trip.
+
+**Files:**
+- Modify: `core/config/snapshot.py` (add `SnapshotAbi`, extend `load_snapshot`, add `ConfigSnapshot.abis`)
+- Test: `tests/integration/test_snapshot_abis.py`
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/integration/test_snapshot_abis.py
+from __future__ import annotations
+
+import pytest
+
+from core.config.db import Database
+from core.config.models import AbiKind
+from core.config.repositories import AbiRepo
+from core.config.snapshot import load_snapshot
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+
+async def test_load_snapshot_includes_abis(db: Database) -> None:
+    async with db.session() as s:
+        await AbiRepo(s).create(
+            name="erc20", kind=AbiKind.evm_abi,
+            body=[{"type": "event", "name": "Transfer", "inputs": []}],
+        )
+        await s.commit()
+
+    async with db.session() as s:
+        snap = await load_snapshot(s)
+
+    assert len(snap.abis) == 1
+    assert snap.abis[0].name == "erc20"
+    assert snap.abis[0].kind == "evm_abi"
+    assert snap.abis[0].body[0]["name"] == "Transfer"
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/integration/test_snapshot_abis.py -v`
+Expected: `AttributeError: 'ConfigSnapshot' object has no attribute 'abis'`.
+
+- [ ] **Step 3: Extend snapshot**
+
+Edit `core/config/snapshot.py`. Add the `SnapshotAbi` dataclass and the `abis: list[SnapshotAbi]` field on `ConfigSnapshot`; update `load_snapshot` to fetch ABIs.
+
+```python
+@dataclass(frozen=True)
+class SnapshotAbi:
+    id: str
+    name: str
+    kind: str
+    body: dict[str, Any] | list[Any]
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """Read-only snapshot. The `list[...]` fields are mutable-typed but treat as immutable;
+    rebuild a new snapshot rather than mutating in place."""
+    version: int
+    subscriptions: list[SnapshotSubscription]
+    channels: list[SnapshotChannel]
+    chains: list[SnapshotChain] = field(default_factory=list)
+    abis: list[SnapshotAbi] = field(default_factory=list)
+
+    # ... existing methods unchanged ...
+
+    def abi_by_id(self, abi_id: str) -> SnapshotAbi | None:
+        for a in self.abis:
+            if a.id == abi_id:
+                return a
+        return None
+```
+
+In `load_snapshot`, add ABI loading. The `AbiRepo` import goes alongside the existing repo imports at the top of the file:
+
+```python
+from core.config.repositories import (
+    AbiRepo,
+    ChainRepo,
+    ConfigVersionRepo,
+    SubscriptionRepo,
+)
+
+async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
+    """Build a ConfigSnapshot from the database in a single transaction."""
+    version = await ConfigVersionRepo(session).get()
+    chains_rows = await ChainRepo(session).list_enabled()
+    abi_rows = await AbiRepo(session).list_all()
+    sub_bindings = await SubscriptionRepo(session).list_enabled_with_channels()
+
+    # ... existing snap_chains, snap_subs, snap_channels build ...
+
+    snap_abis = [
+        SnapshotAbi(id=a.id, name=a.name, kind=a.kind.value, body=a.body)
+        for a in abi_rows
+    ]
+    return ConfigSnapshot(
+        version=version,
+        chains=snap_chains,
+        subscriptions=snap_subs,
+        channels=snap_channels,
+        abis=snap_abis,
+    )
+```
+
+(The exact placement of `snap_abis` and the existing snapshot build calls depends on M1's load_snapshot body; the patch is additive — do not delete existing logic.)
+
+- [ ] **Step 4: Run, expect PASS**
+
+Run: `pytest tests/integration/test_snapshot_abis.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Run all snapshot tests for regression.**
+
+Run: `pytest tests/ -k snapshot -v`
+Expected: M1 snapshot tests still green; the new ABI test passes.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/config/snapshot.py tests/integration/test_snapshot_abis.py
+git commit -m "feat(snapshot): include abis in ConfigSnapshot"
+```
+
+### Task 2.5: AbiRegistry — load + cache by abi_id
+
+`AbiRegistry` is the single source of truth for "given an `abi_id`, what does its body decode?" It owns the LRU cache, refreshes from a `ConfigSnapshot`, and exposes typed lookup methods that the parsers in chunks 3-5 will call. The cache invalidation strategy: hash the body bytes of each ABI, and rebuild any compiled decoder whose hash changed.
+
+**Files:**
+- Create: `core/abi/__init__.py`, `core/abi/errors.py`, `core/abi/registry.py`
+- Test: `tests/unit/test_abi_registry.py`
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/unit/test_abi_registry.py
+from __future__ import annotations
+
+import pytest
+
+from core.abi.errors import AbiNotFound
+from core.abi.registry import AbiRegistry
+from core.config.snapshot import ConfigSnapshot, SnapshotAbi
+
+
+_ERC20_TRANSFER = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from", "type": "address", "indexed": True},
+        {"name": "to",   "type": "address", "indexed": True},
+        {"name": "value","type": "uint256", "indexed": False},
+    ],
+}
+
+
+def _snap_with(*abis: SnapshotAbi) -> ConfigSnapshot:
+    return ConfigSnapshot(
+        version=1, subscriptions=[], channels=[], chains=[], abis=list(abis),
+    )
+
+
+def test_registry_returns_body_by_abi_id() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    body = r.get_body("a1")
+    assert body == [_ERC20_TRANSFER]
+
+
+def test_registry_raises_for_unknown_abi() -> None:
+    r = AbiRegistry()
+    r.refresh(_snap_with())
+    with pytest.raises(AbiNotFound):
+        r.get_body("does-not-exist")
+
+
+def test_refresh_evicts_deleted_abis() -> None:
+    snap1 = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    snap2 = _snap_with()  # a1 deleted
+    r = AbiRegistry()
+    r.refresh(snap1)
+    assert r.get_body("a1") == [_ERC20_TRANSFER]
+    r.refresh(snap2)
+    with pytest.raises(AbiNotFound):
+        r.get_body("a1")
+
+
+def test_refresh_replaces_body_when_hash_changes() -> None:
+    body_v1 = [_ERC20_TRANSFER]
+    body_v2 = [{**_ERC20_TRANSFER, "name": "TransferV2"}]
+    snap_v1 = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=body_v1))
+    snap_v2 = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=body_v2))
+    r = AbiRegistry()
+    r.refresh(snap_v1)
+    assert r.get_body("a1") == body_v1
+    r.refresh(snap_v2)
+    assert r.get_body("a1") == body_v2
+
+
+def test_registry_decoder_cache_persists_across_refresh_if_body_unchanged() -> None:
+    """When an ABI's body hash is unchanged across two refreshes, _evict
+    is not called for that abi_id, so any prior decoder entries in
+    `_decoders[(abi_id, *)]` should survive. We prove this by poking a
+    sentinel into `_decoders` and confirming refresh preserves it; the
+    real-decoder identity check lives in Task 2.7
+    (test_decoder_cache_is_reused_for_same_abi_id_and_key)."""
+    body = [_ERC20_TRANSFER]
+    snap = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=body))
+    r = AbiRegistry()
+    r.refresh(snap)
+    sentinel = object()
+    # Prime the internal decoder dict with a sentinel under a fake key.
+    r._decoders[("a1", "0xdead")] = sentinel  # type: ignore[index]
+    r.refresh(snap)  # body hash unchanged → preserve cache
+    assert r._decoders.get(("a1", "0xdead")) is sentinel
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_registry.py -v`
+Expected: `ImportError`s (no `core.abi` package yet).
+
+- [ ] **Step 3: Implement `errors.py`**
+
+```python
+# core/abi/__init__.py
+```
+
+```python
+# core/abi/errors.py
+from __future__ import annotations
+
+
+class AbiError(Exception):
+    """Base for all AbiRegistry / decoder errors."""
+
+
+class AbiNotFound(AbiError):
+    """No ABI is registered under the given id."""
+
+
+class DecodeFailed(AbiError):
+    """An ABI was found but decoding the input failed (malformed log/calldata)."""
+```
+
+- [ ] **Step 4: Implement `registry.py`**
+
+```python
+# core/abi/registry.py
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any
+
+import structlog
+
+from core.abi.errors import AbiNotFound
+from core.config.snapshot import ConfigSnapshot, SnapshotAbi
+
+log = structlog.get_logger(__name__)
+
+
+def _hash_body(body: Any) -> str:
+    """Stable content hash for a body. Used to decide whether to drop a
+    cached decoder when an ABI is republished with the same id."""
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+class AbiRegistry:
+    """In-memory registry of ABIs by id.
+
+    Responsibilities:
+      - `refresh(snapshot)`: replace internal `{abi_id → SnapshotAbi}` map.
+      - `get_body(abi_id)`: return the raw ABI body for downstream decode.
+      - decoder cache: `_decoders[(abi_id, key)] → compiled decoder`. Caller
+        (parsers in chunks 3-5) populate this via `get_event_decoder` /
+        `get_call_decoder` (added in Task 2.6).
+      - On refresh, evict decoders for any abi whose body hash changed; keep
+        decoders for unchanged abis to avoid recompiling on every snapshot
+        bump.
+    """
+
+    def __init__(self) -> None:
+        self._abis: dict[str, SnapshotAbi] = {}
+        self._hashes: dict[str, str] = {}
+        self._decoders: dict[tuple[str, str], Any] = {}
+
+    def refresh(self, snap: ConfigSnapshot) -> None:
+        new_abis: dict[str, SnapshotAbi] = {a.id: a for a in snap.abis}
+        # Drop decoders for deleted or changed abis.
+        for abi_id in list(self._hashes.keys()):
+            if abi_id not in new_abis:
+                self._evict(abi_id)
+                continue
+            new_hash = _hash_body(new_abis[abi_id].body)
+            if new_hash != self._hashes[abi_id]:
+                self._evict(abi_id)
+        # Record fresh state.
+        self._abis = new_abis
+        self._hashes = {aid: _hash_body(a.body) for aid, a in new_abis.items()}
+        log.info("abi_registry.refreshed", count=len(new_abis))
+
+    def _evict(self, abi_id: str) -> None:
+        for key in list(self._decoders.keys()):
+            if key[0] == abi_id:
+                self._decoders.pop(key, None)
+        self._hashes.pop(abi_id, None)
+
+    def get_body(self, abi_id: str) -> dict[str, Any] | list[Any]:
+        a = self._abis.get(abi_id)
+        if a is None:
+            raise AbiNotFound(abi_id)
+        return a.body
+
+    def get(self, abi_id: str) -> SnapshotAbi:
+        a = self._abis.get(abi_id)
+        if a is None:
+            raise AbiNotFound(abi_id)
+        return a
+```
+
+- [ ] **Step 5: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_registry.py -v`
+Expected: 5 PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/abi/__init__.py core/abi/errors.py core/abi/registry.py tests/unit/test_abi_registry.py
+git commit -m "feat(abi): AbiRegistry with content-hash-aware decoder cache"
+```
+
+### Task 2.6: Decoder cache — EVM event + call
+
+Builds the compiled-decoder cache on top of `AbiRegistry`. Uses `eth-abi` directly (transitive dep of web3). Decoders are keyed by `(abi_id, key)` where `key` is the topic0 hash for events or the 4-byte selector for calls.
+
+Both `topic0` and selector are derived from `keccak256(<canonical signature>)` (e.g. `keccak256("Transfer(address,address,uint256)")` for the ERC-20 event). `eth_utils` provides `function_signature_to_4byte_selector` and `event_signature_to_log_topic`; both are transitive deps of web3.
+
+**Files:**
+- Create: `core/abi/decoder.py`
+- Test: `tests/unit/test_abi_decoder.py`
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/unit/test_abi_decoder.py
+from __future__ import annotations
+
+import pytest
+
+from core.abi.decoder import (
+    canonical_event_signature,
+    canonical_function_signature,
+    decode_event,
+    decode_function_call,
+    event_topic0,
+    function_selector,
+)
+from core.abi.errors import DecodeFailed
+
+
+_ERC20_TRANSFER_EVENT = {
+    "type": "event", "name": "Transfer",
+    "inputs": [
+        {"name": "from", "type": "address", "indexed": True},
+        {"name": "to",   "type": "address", "indexed": True},
+        {"name": "value","type": "uint256", "indexed": False},
+    ],
+}
+
+_TRANSFER_FN = {
+    "type": "function", "name": "transfer",
+    "inputs": [
+        {"name": "to",    "type": "address"},
+        {"name": "value", "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+    "stateMutability": "nonpayable",
+}
+
+
+def test_canonical_signatures() -> None:
+    assert canonical_event_signature(_ERC20_TRANSFER_EVENT) == "Transfer(address,address,uint256)"
+    assert canonical_function_signature(_TRANSFER_FN) == "transfer(address,uint256)"
+
+
+def test_event_topic0_is_keccak() -> None:
+    t = event_topic0(_ERC20_TRANSFER_EVENT)
+    # ERC-20 Transfer canonical topic0:
+    assert t == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def test_function_selector_is_first_4_bytes_of_keccak() -> None:
+    s = function_selector(_TRANSFER_FN)
+    # `transfer(address,uint256)` 4-byte selector:
+    assert s == "0xa9059cbb"
+
+
+def test_decode_event_extracts_indexed_and_data() -> None:
+    """Decoded args dict contains all fields with addresses lowercased and
+    big ints as decimal strings (matches Event.args convention)."""
+    topics = [
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",  # topic0
+        "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  # from
+        "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",  # to
+    ]
+    # uint256(123) encoded:
+    data = "0x000000000000000000000000000000000000000000000000000000000000007b"
+    args = decode_event(_ERC20_TRANSFER_EVENT, topics, data)
+    assert args == {
+        "from":  "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "to":    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "value": "123",
+    }
+
+
+def test_decode_event_fails_on_topic_count_mismatch() -> None:
+    with pytest.raises(DecodeFailed, match="topic count"):
+        decode_event(_ERC20_TRANSFER_EVENT, ["0xddf2..."], "0x")
+
+
+def test_decode_function_call_extracts_args() -> None:
+    # transfer(0xbbbb...bbb, 999)
+    calldata = (
+        "0xa9059cbb"
+        "000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "00000000000000000000000000000000000000000000000000000000000003e7"
+    )
+    args = decode_function_call(_TRANSFER_FN, calldata)
+    assert args == {
+        "to":    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "value": "999",
+    }
+
+
+def test_decode_function_call_fails_on_wrong_selector() -> None:
+    bad = "0xdeadbeef" + ("00" * 32)
+    with pytest.raises(DecodeFailed, match="selector"):
+        decode_function_call(_TRANSFER_FN, bad)
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_decoder.py -v`
+Expected: ImportError (no `decoder.py` yet).
+
+- [ ] **Step 3: Implement `decoder.py`**
+
+```python
+# core/abi/decoder.py
+"""EVM ABI decoders backed by eth-abi + eth-utils. Solana Anchor IDL decoders
+land in chunk 13 via `borsh-construct` and live in this same module."""
+from __future__ import annotations
+
+from typing import Any
+
+from eth_abi import decode as eth_abi_decode
+from eth_utils import (
+    event_signature_to_log_topic,
+    function_signature_to_4byte_selector,
+)
+
+from core.abi.errors import DecodeFailed
+
+
+def canonical_event_signature(event_abi: dict[str, Any]) -> str:
+    """Build `Name(type,type,...)` from a JSON ABI event entry."""
+    inputs = event_abi.get("inputs", [])
+    types = ",".join(_canonical_type(i) for i in inputs)
+    return f"{event_abi['name']}({types})"
+
+
+def canonical_function_signature(fn_abi: dict[str, Any]) -> str:
+    """Build `name(type,type,...)` from a JSON ABI function entry."""
+    inputs = fn_abi.get("inputs", [])
+    types = ",".join(_canonical_type(i) for i in inputs)
+    return f"{fn_abi['name']}({types})"
+
+
+def _canonical_type(input_entry: dict[str, Any]) -> str:
+    """Render a single ABI input's canonical type, including tuples.
+
+    Recursive on `components` for tuple types: a `tuple` with components
+    `[uint256, address]` renders as `(uint256,address)`. Array suffixes
+    (`[]`, `[3]`) are preserved.
+    """
+    t = input_entry["type"]
+    if t.startswith("tuple"):
+        comps = input_entry.get("components", [])
+        inner = ",".join(_canonical_type(c) for c in comps)
+        suffix = t[len("tuple"):]
+        return f"({inner}){suffix}"
+    return t
+
+
+def event_topic0(event_abi: dict[str, Any]) -> str:
+    sig = canonical_event_signature(event_abi)
+    return "0x" + event_signature_to_log_topic(sig).hex()
+
+
+def function_selector(fn_abi: dict[str, Any]) -> str:
+    sig = canonical_function_signature(fn_abi)
+    return "0x" + function_signature_to_4byte_selector(sig).hex()
+
+
+def _split_indexed(event_abi: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    indexed: list[dict[str, Any]] = []
+    not_indexed: list[dict[str, Any]] = []
+    for inp in event_abi.get("inputs", []):
+        if inp.get("indexed"):
+            indexed.append(inp)
+        else:
+            not_indexed.append(inp)
+    return indexed, not_indexed
+
+
+def _normalize_value(t: str, v: Any) -> Any:
+    """Match the `Event.args` convention: addresses are 0x-lowercase strings;
+    big ints (uint*/int*) are decimal strings; bytes are 0x-hex strings.
+
+    Array / tuple element-wise normalisation is deferred: ABI decode for
+    `uint256[]` returns a tuple of Python ints. JSON serialisation in the
+    delivery payload (Task 9.x) will widen the contract: parser-side fields
+    must already be `Event.args`-compatible (scalar address/int/bytes). Array
+    element coercion for ABI-event parsers lands with the AbiEventParser in
+    chunk 4 where it actually matters.
+    """
+    if t == "address":
+        # eth-abi returns address as a checksum-cased str.
+        return v.lower() if isinstance(v, str) else "0x" + v.hex().lower()
+    if t.startswith(("uint", "int")) and not t.endswith("]"):
+        return str(int(v))
+    if t.startswith("bytes") and not t.endswith("]"):
+        return "0x" + v.hex() if isinstance(v, (bytes, bytearray)) else v
+    return v
+
+
+def decode_event(
+    event_abi: dict[str, Any], topics: list[str], data: str
+) -> dict[str, Any]:
+    """Decode an event log per spec §5.2. Returns a `{name: value}` dict
+    aligned with `Event.args` conventions."""
+    indexed, not_indexed = _split_indexed(event_abi)
+    expected_topic_count = 1 + len(indexed)  # topic0 + indexed inputs
+    if len(topics) != expected_topic_count:
+        raise DecodeFailed(
+            f"topic count {len(topics)} != expected {expected_topic_count} "
+            f"for {event_abi.get('name')}"
+        )
+
+    args: dict[str, Any] = {}
+
+    # Indexed topics: each topic is the 32-byte abi-encoded value (or hash for
+    # dynamic types per Solidity ABI rules). For value types we re-decode.
+    for inp, topic_hex in zip(indexed, topics[1:], strict=True):
+        t = _canonical_type(inp)
+        if t in ("string", "bytes") or t.endswith("]") or t.startswith("("):
+            # Reference types: Solidity hashes the value into the topic, so we
+            # can't recover the plaintext. Surface as the raw hash hex.
+            args[inp["name"]] = topic_hex
+            continue
+        raw = bytes.fromhex(topic_hex.removeprefix("0x"))
+        decoded = eth_abi_decode([t], raw)[0]
+        args[inp["name"]] = _normalize_value(t, decoded)
+
+    # Non-indexed: concatenated abi-encoded in `data`.
+    if not_indexed:
+        types = [_canonical_type(i) for i in not_indexed]
+        raw = bytes.fromhex(data.removeprefix("0x"))
+        try:
+            decoded_tuple = eth_abi_decode(types, raw)
+        except Exception as exc:
+            raise DecodeFailed(f"data decode failed: {exc}") from exc
+        for inp, val in zip(not_indexed, decoded_tuple, strict=True):
+            args[inp["name"]] = _normalize_value(_canonical_type(inp), val)
+
+    return args
+
+
+def decode_function_call(fn_abi: dict[str, Any], calldata: str) -> dict[str, Any]:
+    """Decode a function-call `input` per spec §5.2 (kind=call)."""
+    expected = function_selector(fn_abi)
+    raw = bytes.fromhex(calldata.removeprefix("0x"))
+    if len(raw) < 4:
+        raise DecodeFailed("calldata shorter than selector")
+    sel = "0x" + raw[:4].hex()
+    if sel != expected:
+        raise DecodeFailed(
+            f"selector {sel} != expected {expected} for {fn_abi.get('name')}"
+        )
+
+    types = [_canonical_type(i) for i in fn_abi.get("inputs", [])]
+    try:
+        decoded_tuple = eth_abi_decode(types, raw[4:])
+    except Exception as exc:
+        raise DecodeFailed(f"calldata decode failed: {exc}") from exc
+
+    out: dict[str, Any] = {}
+    for inp, val in zip(fn_abi.get("inputs", []), decoded_tuple, strict=True):
+        out[inp["name"]] = _normalize_value(_canonical_type(inp), val)
+    return out
+```
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_decoder.py -v`
+Expected: 7 PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/abi/decoder.py tests/unit/test_abi_decoder.py
+git commit -m "feat(abi): EVM event + call decoders (eth-abi backed)"
+```
+
+### Task 2.7: Wire registry-level event/call decoder lookup
+
+The parsers in chunks 3-5 will call `registry.get_event_decoder(abi_id, topic0)` and `registry.get_call_decoder(abi_id, selector)`. The registry builds a topic0-keyed event map and a selector-keyed call map on demand, caches the entries, and invalidates them in `_evict`.
+
+**Files:**
+- Modify: `core/abi/registry.py`
+- Test: extend `tests/unit/test_abi_registry.py`
+
+- [ ] **Step 1: Append failing tests**
+
+```python
+# tests/unit/test_abi_registry.py — append
+from core.abi.decoder import event_topic0, function_selector
+
+_FN_TRANSFER = {
+    "type": "function", "name": "transfer",
+    "inputs": [
+        {"name": "to", "type": "address"},
+        {"name": "value", "type": "uint256"},
+    ],
+    "outputs": [{"name": "", "type": "bool"}],
+}
+
+
+def test_get_event_decoder_returns_decoder_for_known_topic0() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    decoder = r.get_event_decoder("a1", t0)
+    args = decoder(
+        topics=[
+            t0,
+            "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ],
+        data="0x000000000000000000000000000000000000000000000000000000000000007b",
+    )
+    assert args["from"] == "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert args["value"] == "123"
+
+
+def test_get_event_decoder_raises_for_unknown_topic0() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    with pytest.raises(KeyError):
+        r.get_event_decoder("a1", "0xdeadbeef" + "00" * 28)
+
+
+def test_get_call_decoder_returns_decoder_for_known_selector() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_FN_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    sel = function_selector(_FN_TRANSFER)
+    decoder = r.get_call_decoder("a1", sel)
+    args = decoder(
+        "0xa9059cbb"
+        "000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "00000000000000000000000000000000000000000000000000000000000003e7"
+    )
+    assert args["value"] == "999"
+
+
+def test_decoder_cache_is_reused_for_same_abi_id_and_key() -> None:
+    """Calling get_event_decoder twice for the same (abi_id, topic0) should
+    return the same callable instance (cached)."""
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    t0 = event_topic0(_ERC20_TRANSFER)
+    d1 = r.get_event_decoder("a1", t0)
+    d2 = r.get_event_decoder("a1", t0)
+    assert d1 is d2
+```
+
+- [ ] **Step 2: Run, expect FAIL.**
+
+Run: `pytest tests/unit/test_abi_registry.py -v`
+Expected: 4 new failures.
+
+- [ ] **Step 3: Extend `AbiRegistry` with decoder lookup**
+
+Add to `core/abi/registry.py`:
+
+```python
+from collections.abc import Callable
+from typing import Any as _Any
+
+from core.abi.decoder import (
+    decode_event,
+    decode_function_call,
+    event_topic0,
+    function_selector,
+)
+
+
+EventDecoder = Callable[..., dict[str, _Any]]
+CallDecoder = Callable[[str], dict[str, _Any]]
+
+
+class AbiRegistry:
+    # ... existing __init__, refresh, _evict, get_body unchanged ...
+
+    def get_event_decoder(self, abi_id: str, topic0: str) -> EventDecoder:
+        key = (abi_id, topic0.lower())
+        cached = self._decoders.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
+        a = self._abis.get(abi_id)
+        if a is None:
+            raise AbiNotFound(abi_id)
+
+        body = a.body if isinstance(a.body, list) else [a.body]
+        for entry in body:
+            if entry.get("type") != "event":
+                continue
+            if event_topic0(entry).lower() == topic0.lower():
+                event_abi = entry
+                def _decoder(*, topics: list[str], data: str, _ev=event_abi) -> dict[str, _Any]:
+                    return decode_event(_ev, topics, data)
+                self._decoders[key] = _decoder
+                return _decoder
+        raise KeyError(f"no event with topic0 {topic0} in abi {abi_id}")
+
+    def get_call_decoder(self, abi_id: str, selector: str) -> CallDecoder:
+        key = (abi_id, selector.lower())
+        cached = self._decoders.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
+        a = self._abis.get(abi_id)
+        if a is None:
+            raise AbiNotFound(abi_id)
+
+        body = a.body if isinstance(a.body, list) else [a.body]
+        for entry in body:
+            if entry.get("type") != "function":
+                continue
+            if function_selector(entry).lower() == selector.lower():
+                fn_abi = entry
+                def _decoder(calldata: str, _fn=fn_abi) -> dict[str, _Any]:
+                    return decode_function_call(_fn, calldata)
+                self._decoders[key] = _decoder
+                return _decoder
+        raise KeyError(f"no function with selector {selector} in abi {abi_id}")
+```
+
+The default-argument `_ev=event_abi` / `_fn=fn_abi` pattern is the standard Python idiom for "capture the loop variable at closure creation time" — without it the closure would always see the last entry of `body`.
+
+- [ ] **Step 4: Run, expect PASS.**
+
+Run: `pytest tests/unit/test_abi_registry.py -v`
+Expected: all 9 PASS (5 from Task 2.5 + 4 new).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add core/abi/registry.py tests/unit/test_abi_registry.py
+git commit -m "feat(abi): registry-level event/call decoder lookup with cache"
+```
+
+### Task 2.8: Chunk 2 close-out
+
+- [ ] **Step 1: Run the full test suite**
+
+Run: `pytest tests/ -v`
+Expected: all M1 tests + chunk-1 tests + chunk-2 tests pass.
+
+- [ ] **Step 2: Lint / type check**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+---
+

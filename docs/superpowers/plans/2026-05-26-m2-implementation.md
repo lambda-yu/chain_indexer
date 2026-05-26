@@ -9976,3 +9976,868 @@ git status
 If `git status` is empty, this step is a no-op. No tag for chunk 11 — chunk 14 is the M2 close-out tag.
 
 ---
+## Chunk 12: `SplTransferParser` + chain-aware case-folding
+
+Two M2 deliverables in one chunk:
+
+1. **`SplTransferParser`** — parses SPL Token Program (legacy) and Token-2022 Program `Transfer` (discriminator 3) and `TransferChecked` (discriminator 12) instructions; emits `kind="token_transfer"` with `{from, to, value, mint}`; resolves the mint via the instruction's accounts (TransferChecked) or via `meta.post_token_balances` (Transfer).
+2. **Chain-aware case-folding fix in `Matcher` and `filters._norm`** — M1's blanket `.lower()` on subscription addresses and arg values corrupts Solana base58 (case-sensitive). The fix: only lowercase strings that start with `0x` (EVM hex shape). M2 follow-up #11 (deferred from chunk 11) is closed by this task.
+
+Order matters: the matcher fix lands FIRST (Task 12.1) so that Task 12.2's SPL parser tests can use `contract=<base58 mint>` and exercise case-sensitive matching without lower-casing the mint pubkey.
+
+**Why no IT in this chunk:** the end-to-end Solana proof (native + SPL transfers reaching a real webhook) is chunk 14's job. Doing it here would either duplicate chunk 14 or split SPL coverage between two chunks. Keeping chunk 12 unit-test only also keeps it under the 1000-line target.
+
+**Modified files this chunk:**
+- `core/matcher/matcher.py` — replace `.lower()` calls with a shape-aware `_norm` helper.
+- `core/matcher/filters.py` — same `_norm` change, applied to `eq` and `_in` operators.
+- `core/parser/spl_transfer.py` — **new**.
+- `apps/worker/chain_runner.py:start` — add `SplTransferParser` to the Solana default parser list (alongside `SolNativeTransferParser`).
+- `tests/unit/test_matcher.py` — extend with two Solana-side tests (case-sensitive mint match + base58 arg filter).
+- `tests/unit/test_filters.py` — extend with case-sensitivity assertions for base58 strings.
+- `tests/unit/test_spl_transfer_parser.py` — **new**.
+- `tests/unit/test_chain_runner.py` — extend `test_chain_runner_solana_branch_bypasses_buffer` to assert the runner's default Solana pipeline now includes BOTH `SolNativeTransferParser` and `SplTransferParser`.
+
+**Out of scope this chunk:**
+- `transferWithFee` (Token-2022 extension instruction with fee discriminator) — rare in current production traffic; flagged as M2 follow-up #12.
+- Multi-signer Transfer (`accounts[2..]` contains multisig signers) — parser still emits one Event; signers are not exposed in `event.args` (they're in `raw` already).
+- Approve / Revoke / MintTo / Burn — these would be `kind="event"` or `kind="call"`-style; explicitly out of M2 (spec §4.7).
+- Pre-balance/Post-balance reconciliation as a sanity check on the decoded `amount` — the on-chain decoded amount IS the source of truth; adding a reconciliation would just add fragility.
+
+**Naming pin:** `SplTransferParser` (singular). Constants `SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"` and `SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"` live in `core/parser/spl_transfer.py` and are *not* re-exported (no downstream module imports them in M2; chunk 13's `AnchorIdlEventParser` keys on different IDs). Both IDs are 43 base58 chars and decode to valid 32-byte Ed25519 pubkeys — verify with `solders.pubkey.Pubkey.from_string(...)` if you doubt the bytes; a typo here silently mismatches every prod tx.
+
+**Case-folding rule:** A string is "EVM-hex-shaped" iff it `startswith("0x")`. We don't tighten further (e.g., to length 42) because M1 tests deliberately use short `0xAAA`-style hex stubs; tightening would regress unit-test ergonomics. Base58 pubkeys never start with `0x`, so the rule is safe.
+
+### Task 12.1: Chain-aware case-folding in `Matcher` and `filters._norm`
+
+The M1 matcher blindly lowercases every string in `sub.address` / `event.contract` and every comparand inside `filters.evaluate`. That worked for EVM (where addresses are case-insensitive hex per EIP-55) but corrupts Solana base58 pubkeys, which are case-sensitive. The fix is shape-based: lowercase only strings that start with `0x`.
+
+**Files:**
+- Modify: `core/matcher/matcher.py` — replace `.lower()` on `sub.address`/`event.contract` with a `_norm` helper.
+- Modify: `core/matcher/filters.py:22-24` — tighten `_norm` to skip non-`0x` strings.
+- Modify: `tests/unit/test_matcher.py` — add two Solana case-sensitivity tests.
+- Modify: `tests/unit/test_filters.py` — add a base58 case-sensitivity assertion to the existing eq and `_in` tests.
+
+- [ ] **Step 1: Write the failing tests (matcher)**
+
+Append to `tests/unit/test_matcher.py`:
+
+```python
+def test_address_match_case_sensitive_for_solana_base58() -> None:
+    """Base58 pubkeys are case-sensitive — the matcher must NOT lowercase them.
+
+    Reproducer: a Solana subscription with the canonical mint address
+    `Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB` (USDC) must NOT match an
+    event with `contract='es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnyb'`.
+    Pre-fix, the M1 matcher's `.lower()` collapsed both sides, mis-matching.
+    """
+    sub = _sub(
+        chain_id="sol",
+        match_kind="token_transfer",
+        address="Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    )
+    m = Matcher(_snap([sub], [_ch()]))
+    ev = Event(
+        chain_id="sol",
+        block_number=1, block_hash="H1", block_timestamp=0,
+        tx_hash="SIG", tx_index=None, log_index=None,
+        kind="token_transfer",
+        contract="es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnyb",  # wrong case
+        name=None, args={"to": "B", "value": "1"}, raw={},
+    )
+    assert list(m.match(ev)) == []
+
+
+def test_address_match_case_sensitive_match_for_solana_base58() -> None:
+    """The same subscription DOES match the canonical-case mint."""
+    canonical = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    sub = _sub(chain_id="sol", match_kind="token_transfer", address=canonical)
+    m = Matcher(_snap([sub], [_ch()]))
+    ev = Event(
+        chain_id="sol",
+        block_number=1, block_hash="H1", block_timestamp=0,
+        tx_hash="SIG", tx_index=None, log_index=None,
+        kind="token_transfer",
+        contract=canonical,
+        name=None, args={"to": "B", "value": "1"}, raw={},
+    )
+    assert len(list(m.match(ev))) == 1
+```
+
+- [ ] **Step 2: Write the failing tests (filters)**
+
+Append to `tests/unit/test_filters.py`:
+
+```python
+def test_eq_string_case_sensitive_for_non_hex() -> None:
+    """`{to: "B"}` must NOT match `{to: "b"}` — only EVM-hex strings fold."""
+    assert evaluate({"to": "B"}, {"to": "b"}) is False
+    assert evaluate({"to": "B"}, {"to": "B"}) is True
+
+
+def test_eq_string_case_insensitive_for_evm_hex() -> None:
+    """Preserve M1 EVM-hex case-folding: `0xABC` == `0xabc`."""
+    assert evaluate({"to": "0xABC"}, {"to": "0xabc"}) is True
+
+
+def test_in_filter_case_sensitive_for_base58() -> None:
+    """`{address_in: [<base58>]}` must NOT fold."""
+    canonical = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    lowered = canonical.lower()
+    assert evaluate({"address_in": [canonical]}, {"address": lowered}) is False
+    assert evaluate({"address_in": [canonical]}, {"address": canonical}) is True
+```
+
+(Verify the existing `tests/unit/test_filters.py` has the `evaluate` import at the top — `from core.matcher.filters import evaluate`. If not, add it.)
+
+- [ ] **Step 3: Run both test files, expect FAIL**
+
+```bash
+pytest tests/unit/test_matcher.py::test_address_match_case_sensitive_for_solana_base58 \
+       tests/unit/test_matcher.py::test_address_match_case_sensitive_match_for_solana_base58 \
+       tests/unit/test_filters.py::test_eq_string_case_sensitive_for_non_hex \
+       tests/unit/test_filters.py::test_in_filter_case_sensitive_for_base58 -v
+```
+
+Expected: the two `case_sensitive` tests FAIL (M1 lowercases both sides, so the mismatched-case event wrongly matches); the two `case_insensitive_match` and `evm_hex` tests PASS even before the fix (they exercise the lowercased path).
+
+- [ ] **Step 4: Implement `_norm` in `core/matcher/filters.py`**
+
+Replace lines 22-24 of `core/matcher/filters.py`:
+
+```python
+def _norm(v: Any) -> Any:
+    """Equality folding is restricted to EVM-shape hex (starts with ``0x``).
+
+    EVM addresses are case-insensitive per EIP-55 — `0xABC` and `0xabc` are
+    the same account. Solana base58 pubkeys (and any other case-sensitive
+    string) must NOT be folded; they're returned verbatim.
+
+    The heuristic is conservative: `startswith("0x")` is enough because
+    base58 has no leading-zero canonicalization (zero-byte → `1`), so no
+    Solana address ever starts with `0x`.
+    """
+    if isinstance(v, str) and v.startswith("0x"):
+        return v.lower()
+    return v
+```
+
+- [ ] **Step 5: Implement chain-aware comparison in `core/matcher/matcher.py`**
+
+Replace the `_matches` body (lines 45-52):
+
+```python
+def _matches(self, sub: SnapshotSubscription, event: Event) -> bool:
+    if sub.address is not None:
+        if event.contract is None:
+            return False
+        if _addr_norm(sub.address) != _addr_norm(event.contract):
+            return False
+    if sub.match_name is not None and event.name != sub.match_name:
+        return False
+    return evaluate(sub.arg_filters or {}, event.args)
+```
+
+And add the module-private helper above the `Matcher` class (right below the imports — the docstring at the top of the helper makes the rule explicit so a future reader doesn't try to "fix" the asymmetry):
+
+```python
+def _addr_norm(s: str) -> str:
+    """Lowercase EVM-hex addresses; preserve case for everything else.
+
+    See ``core.matcher.filters._norm`` for the same rule applied to arg
+    values. Kept separate (rather than importing) to avoid a circular
+    import via ``filters``; the rule is tiny enough to duplicate.
+    """
+    return s.lower() if s.startswith("0x") else s
+```
+
+(The `_norm` and `_addr_norm` duplication is intentional and called out in the docstring — `filters` is imported by `matcher`, so re-importing `_norm` from `filters` would be fine, but the matcher comparison is exclusively about addresses while `filters._norm` works on arbitrary arg values. Keeping them separate documents intent.)
+
+- [ ] **Step 6: Re-run the test selection, all four PASS**
+
+```bash
+pytest tests/unit/test_matcher.py::test_address_match_case_sensitive_for_solana_base58 \
+       tests/unit/test_matcher.py::test_address_match_case_sensitive_match_for_solana_base58 \
+       tests/unit/test_filters.py::test_eq_string_case_sensitive_for_non_hex \
+       tests/unit/test_filters.py::test_in_filter_case_sensitive_for_base58 -v
+```
+
+Expected: 4 PASS.
+
+- [ ] **Step 7: Full matcher + filters regression**
+
+```bash
+pytest tests/unit/test_matcher.py tests/unit/test_filters.py -v
+```
+
+Expected: every M1 test still passes — the M1 `test_address_match_case_insensitive` uses `0xAAA` / `0xaaa` (still hex-shaped → still folded) and `test_arg_filter_range_applied` doesn't exercise string folding.
+
+- [ ] **Step 8: Lint / typecheck**
+
+Run: `make lint typecheck`
+Expected: clean.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add core/matcher/matcher.py core/matcher/filters.py \
+        tests/unit/test_matcher.py tests/unit/test_filters.py
+git commit -m "fix(matcher): case-fold EVM hex only; preserve case for Solana base58"
+```
+
+### Task 12.2: `SplTransferParser` (Red → Green)
+
+Parses SPL Token Program (legacy + 2022) `Transfer` and `TransferChecked` instructions.
+
+**Encoding reference** (per SPL Token program docs, identical for legacy and 2022):
+
+| Variant | Disc | Data length | Data layout |
+|---------|------|-------------|-------------|
+| `Transfer` | 3 | 9 bytes | `[u8 disc][u64 LE amount]` |
+| `TransferChecked` | 12 | 10 bytes | `[u8 disc][u64 LE amount][u8 decimals]` |
+
+| Variant | Accounts |
+|---------|----------|
+| `Transfer` | `[source_token_account, dest_token_account, owner_or_multisig, ...optional_signers]` |
+| `TransferChecked` | `[source_token_account, mint, dest_token_account, owner_or_multisig, ...optional_signers]` |
+
+For `Transfer`, the mint is NOT in the instruction accounts — it must be looked up from the transaction's `post_token_balances` by finding the `SolanaTokenBalance` whose `account_index` matches the source token account's position in `tx.account_keys`. (`post_token_balances` is the canonical source even though `pre_token_balances` would also work; using post is conventional in indexer code because it survives account creation.)
+
+For `TransferChecked`, the mint is `accounts[1]` directly.
+
+**Stack-depth policy:** the parser accepts BOTH top-level (`stack_depth == 1`) AND inner CPI (`stack_depth >= 2`) SPL transfers. This is intentional and differs from `SolNativeTransferParser` (which top-only): SPL transfers via CPI are first-class user-observable events for indexer use cases (DEX swaps, programs forwarding to users, vault withdrawals all manifest as CPI'd SPL Transfers).
+
+**Failed-tx policy:** same as native — skip if `tx.success is False`.
+
+**Self-transfer policy:** if source == dest token account (rare but legal), emit one Event. The pre/post balances would be identical in that case, but the on-chain instruction did fire, so the indexer reports it.
+
+**Files:**
+- Create: `core/parser/spl_transfer.py`.
+- Create: `tests/unit/test_spl_transfer_parser.py`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/unit/test_spl_transfer_parser.py
+"""SplTransferParser:
+- decodes Transfer (disc 3) with mint resolved from post_token_balances
+- decodes TransferChecked (disc 12) with mint from accounts[1]
+- recognizes BOTH legacy Token Program and Token-2022 Program IDs
+- ignores instructions on non-Token programs
+- emits inner-CPI transfers (stack_depth >= 2) — they're first-class
+- skips failed transactions
+- ignores malformed payloads (wrong length, wrong discriminator)
+- if Transfer's source account isn't in post_token_balances, the parser
+  drops the instruction silently (rare — only happens if the indexer is
+  served a partial block by the RPC node)
+"""
+from __future__ import annotations
+
+import struct
+
+import base58
+
+from core.chains.types import (
+    SolanaBlock,
+    SolanaInstruction,
+    SolanaTokenBalance,
+    SolanaTransaction,
+)
+from core.parser.spl_transfer import (
+    SPL_TOKEN_2022_PROGRAM_ID,
+    SPL_TOKEN_PROGRAM_ID,
+    SplTransferParser,
+)
+
+
+def _transfer_data(amount: int) -> str:
+    """Transfer (disc 3): [u8 3][u64 LE amount]."""
+    return base58.b58encode(b"\x03" + struct.pack("<Q", amount)).decode()
+
+
+def _transfer_checked_data(amount: int, decimals: int) -> str:
+    """TransferChecked (disc 12): [u8 12][u64 LE amount][u8 decimals]."""
+    return base58.b58encode(b"\x0c" + struct.pack("<Q", amount) + bytes([decimals])).decode()
+
+
+def _tb(account_index: int, mint: str, amount: int, decimals: int = 6) -> SolanaTokenBalance:
+    return SolanaTokenBalance(
+        account_index=account_index, mint=mint, owner=None,
+        amount=amount, decimals=decimals,
+    )
+
+
+def _tx(
+    *,
+    signature: str = "SIG",
+    success: bool = True,
+    account_keys: list[str] | None = None,
+    post_token_balances: list[SolanaTokenBalance] | None = None,
+    instructions: list[SolanaInstruction] | None = None,
+) -> SolanaTransaction:
+    return SolanaTransaction(
+        signature=signature, slot=100, success=success, fee=5000,
+        account_keys=account_keys or ["SRC", "DST", "OWNER", "TOKEN_PROG"],
+        pre_balances=[0, 0, 10**9, 0],
+        post_balances=[0, 0, 10**9 - 5000, 0],
+        pre_token_balances=[],
+        post_token_balances=post_token_balances or [],
+        log_messages=[],
+        instructions=instructions or [],
+    )
+
+
+def _block(txs: list[SolanaTransaction]) -> SolanaBlock:
+    return SolanaBlock(
+        slot=100, block_hash="H100", parent_slot=99,
+        block_time=1_700_000_000, transactions=txs,
+    )
+
+
+def test_decodes_transfer_with_mint_from_post_token_balances() -> None:
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(123_456_789),
+        stack_depth=1,
+    )
+    tx = _tx(
+        instructions=[ix],
+        post_token_balances=[_tb(account_index=0, mint="MintA", amount=1)],
+    )
+    [event] = list(SplTransferParser(chain_id="sol").parse(_block([tx])))
+    assert event.kind == "token_transfer"
+    assert event.contract == "MintA"
+    assert event.args == {
+        "from": "SRC", "to": "DST", "value": "123456789", "mint": "MintA",
+    }
+    assert event.tx_hash == "SIG"
+    assert event.block_number == 100
+
+
+def test_decodes_transfer_checked_with_mint_from_accounts() -> None:
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "MintB", "DST", "OWNER"],
+        data_b58=_transfer_checked_data(1_000_000, decimals=6),
+        stack_depth=1,
+    )
+    tx = _tx(
+        account_keys=["SRC", "MintB", "DST", "OWNER", "TOKEN_PROG"],
+        instructions=[ix],
+        # Deliberately NO post_token_balances — TransferChecked doesn't need them.
+        post_token_balances=[],
+    )
+    [event] = list(SplTransferParser(chain_id="sol").parse(_block([tx])))
+    assert event.contract == "MintB"
+    assert event.args == {
+        "from": "SRC", "to": "DST", "value": "1000000", "mint": "MintB",
+    }
+
+
+def test_recognizes_token_2022_program_id() -> None:
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_2022_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(42),
+        stack_depth=1,
+    )
+    tx = _tx(
+        instructions=[ix],
+        post_token_balances=[_tb(0, "Mint2022", 1)],
+    )
+    [event] = list(SplTransferParser(chain_id="sol").parse(_block([tx])))
+    assert event.contract == "Mint2022"
+    assert event.args["value"] == "42"
+
+
+def test_ignores_non_token_programs() -> None:
+    ix = SolanaInstruction(
+        program_id="11111111111111111111111111111111",  # System Program
+        accounts=["A", "B", "C"],
+        data_b58=_transfer_data(99),
+        stack_depth=1,
+    )
+    tx = _tx(instructions=[ix])
+    assert list(SplTransferParser(chain_id="sol").parse(_block([tx]))) == []
+
+
+def test_emits_inner_cpi_transfer() -> None:
+    """Inner-CPI SPL transfers (stack_depth >= 2) ARE first-class for SPL."""
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(10),
+        stack_depth=3,  # nested two programs deep
+    )
+    tx = _tx(
+        instructions=[ix],
+        post_token_balances=[_tb(0, "MintA", 1)],
+    )
+    [event] = list(SplTransferParser(chain_id="sol").parse(_block([tx])))
+    assert event.args["value"] == "10"
+
+
+def test_skips_failed_transactions() -> None:
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(1),
+        stack_depth=1,
+    )
+    tx = _tx(
+        success=False,
+        instructions=[ix],
+        post_token_balances=[_tb(0, "MintA", 1)],
+    )
+    assert list(SplTransferParser(chain_id="sol").parse(_block([tx]))) == []
+
+
+def test_ignores_malformed_transfer_payload() -> None:
+    """Length != 9 for Transfer or != 10 for TransferChecked → silent skip."""
+    short = base58.b58encode(b"\x03\x00").decode()  # disc 3 but only 2 bytes
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=short,
+        stack_depth=1,
+    )
+    tx = _tx(
+        instructions=[ix],
+        post_token_balances=[_tb(0, "MintA", 1)],
+    )
+    assert list(SplTransferParser(chain_id="sol").parse(_block([tx]))) == []
+
+
+def test_drops_transfer_when_source_account_missing_from_post_token_balances() -> None:
+    """Transfer (disc 3) without a matching post_token_balances entry → skip."""
+    ix = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(7),
+        stack_depth=1,
+    )
+    # post_token_balances references a DIFFERENT account_index (1, not 0).
+    tx = _tx(
+        instructions=[ix],
+        post_token_balances=[_tb(account_index=1, mint="MintX", amount=1)],
+    )
+    assert list(SplTransferParser(chain_id="sol").parse(_block([tx]))) == []
+
+
+def test_emits_one_event_per_instruction_within_a_tx() -> None:
+    ix1 = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(100),
+        stack_depth=1,
+    )
+    ix2 = SolanaInstruction(
+        program_id=SPL_TOKEN_PROGRAM_ID,
+        accounts=["SRC", "DST", "OWNER"],
+        data_b58=_transfer_data(200),
+        stack_depth=1,
+    )
+    tx = _tx(
+        instructions=[ix1, ix2],
+        post_token_balances=[_tb(0, "MintA", 1)],
+    )
+    events = list(SplTransferParser(chain_id="sol").parse(_block([tx])))
+    assert [e.args["value"] for e in events] == ["100", "200"]
+```
+
+- [ ] **Step 2: Run, expect FAIL on import**
+
+```bash
+pytest tests/unit/test_spl_transfer_parser.py -v
+```
+
+Expected: `ImportError: cannot import name 'SplTransferParser' from 'core.parser.spl_transfer'`.
+
+(If you see `ModuleNotFoundError: No module named 'base58'`, chunk 11 Task 11.3 Step 1 was skipped — `base58` is already a project dep from that chunk. Verify with `python -c "import base58"`.)
+
+- [ ] **Step 3: Implement `SplTransferParser`**
+
+```python
+# core/parser/spl_transfer.py
+"""SplTransferParser: parses SPL Token Program (legacy + 2022) Transfer
+and TransferChecked instructions.
+
+Per spec §4.7, the emitted Event shape is `kind="token_transfer"`,
+`contract=<mint base58>`, `args={"from", "to", "value", "mint"}`. This
+mirrors the EVM `Erc20TransferParser` field set so the matcher's
+`arg_filters` are chain-portable across `to`/`from`/`value`.
+
+Mint resolution:
+- TransferChecked (disc 12) — mint is `instruction.accounts[1]` directly.
+- Transfer (disc 3)         — mint is looked up in `tx.post_token_balances`
+                              by matching `account_index` against the source
+                              account's position in `tx.account_keys`. If
+                              the source isn't found, the instruction is
+                              dropped silently (RPC partial-block edge case).
+
+Stack depth:
+- Both top-level and inner-CPI SPL transfers are emitted (unlike System
+  Program transfers, which we restrict to top-level only). SPL transfers
+  through CPI ARE the usual interaction shape for DEX swaps, vault
+  withdrawals, etc. — first-class for indexer use cases.
+"""
+from __future__ import annotations
+
+import struct
+from collections.abc import Iterable
+
+import base58
+import structlog
+
+from core.chains.types import (
+    SolanaBlock,
+    SolanaInstruction,
+    SolanaTransaction,
+)
+from core.parser.event import Event
+
+log = structlog.get_logger(__name__)
+
+
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+_TOKEN_PROGRAM_IDS = frozenset({SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID})
+
+_TRANSFER_DISC = 3
+_TRANSFER_CHECKED_DISC = 12
+
+
+class SplTransferParser:
+    def __init__(self, chain_id: str) -> None:
+        self._chain_id = chain_id
+
+    def parse(self, block: SolanaBlock) -> Iterable[Event]:
+        for tx in block.transactions:
+            if not tx.success:
+                continue
+            for ix in tx.instructions:
+                if ix.program_id not in _TOKEN_PROGRAM_IDS:
+                    continue
+                event = self._maybe_decode(block, tx, ix)
+                if event is not None:
+                    yield event
+
+    def _maybe_decode(
+        self,
+        block: SolanaBlock,
+        tx: SolanaTransaction,
+        ix: SolanaInstruction,
+    ) -> Event | None:
+        try:
+            raw = base58.b58decode(ix.data_b58)
+        except ValueError:
+            return None
+        if not raw:
+            return None
+        disc = raw[0]
+        if disc == _TRANSFER_DISC:
+            return self._decode_transfer(block, tx, ix, raw)
+        if disc == _TRANSFER_CHECKED_DISC:
+            return self._decode_transfer_checked(block, tx, ix, raw)
+        return None
+
+    def _decode_transfer(
+        self,
+        block: SolanaBlock,
+        tx: SolanaTransaction,
+        ix: SolanaInstruction,
+        raw: bytes,
+    ) -> Event | None:
+        if len(raw) != 9 or len(ix.accounts) < 3:
+            return None
+        (amount,) = struct.unpack("<Q", raw[1:9])
+        src = ix.accounts[0]
+        dst = ix.accounts[1]
+        mint = _resolve_mint_from_balances(tx, src)
+        if mint is None:
+            # RPC served a tx without post_token_balances coverage for this
+            # source — rare, but skipping is safer than emitting a half-event.
+            return None
+        return self._build_event(block, tx, src=src, dst=dst, amount=amount, mint=mint)
+
+    def _decode_transfer_checked(
+        self,
+        block: SolanaBlock,
+        tx: SolanaTransaction,
+        ix: SolanaInstruction,
+        raw: bytes,
+    ) -> Event | None:
+        if len(raw) != 10 or len(ix.accounts) < 4:
+            return None
+        (amount,) = struct.unpack("<Q", raw[1:9])
+        # raw[9] is `decimals`; we ignore it (the mint's on-chain decimals is
+        # authoritative; the value here is just a cross-check the program does).
+        src = ix.accounts[0]
+        mint = ix.accounts[1]
+        dst = ix.accounts[2]
+        return self._build_event(block, tx, src=src, dst=dst, amount=amount, mint=mint)
+
+    def _build_event(
+        self,
+        block: SolanaBlock,
+        tx: SolanaTransaction,
+        *,
+        src: str,
+        dst: str,
+        amount: int,
+        mint: str,
+    ) -> Event:
+        return Event(
+            chain_id=self._chain_id,
+            block_number=block.slot,
+            block_hash=block.block_hash,
+            block_timestamp=block.block_time or 0,
+            tx_hash=tx.signature,
+            tx_index=None,
+            log_index=None,
+            kind="token_transfer",
+            contract=mint,
+            name=None,
+            args={
+                "from": src,
+                "to": dst,
+                "value": str(amount),
+                "mint": mint,
+            },
+            raw={"signature": tx.signature, "slot": block.slot},
+        )
+
+
+def _resolve_mint_from_balances(tx: SolanaTransaction, source_account: str) -> str | None:
+    """Find the mint for `source_account` by looking up its index in
+    `tx.account_keys` and matching that against `tx.post_token_balances`."""
+    try:
+        idx = tx.account_keys.index(source_account)
+    except ValueError:
+        return None
+    for tb in tx.post_token_balances:
+        if tb.account_index == idx:
+            return tb.mint
+    return None
+```
+
+- [ ] **Step 4: Re-run the tests**
+
+```bash
+pytest tests/unit/test_spl_transfer_parser.py -v
+```
+
+Expected: 9 PASS.
+
+- [ ] **Step 5: Lint / typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/parser/spl_transfer.py tests/unit/test_spl_transfer_parser.py
+git commit -m "feat(parser): SplTransferParser (legacy Token Program + Token-2022)"
+```
+
+### Task 12.3: Wire `SplTransferParser` into `ChainRunner`'s default Solana pipeline
+
+Adds `SplTransferParser(chain_id=self._chain.id)` to the Solana parser list in `ChainRunner.start()`, so that every Solana-kind chain runs BOTH the native parser (chunk 11) and the SPL parser (chunk 12) out of the box.
+
+**Files:**
+- Modify: `apps/worker/chain_runner.py:start` — extend the Solana parser list.
+- Modify: `tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer` — assert both default parsers are present.
+
+- [ ] **Step 1: Tighten the existing chunk-11 chain_runner test**
+
+In `tests/unit/test_chain_runner.py`, find `test_chain_runner_solana_branch_bypasses_buffer` (added in chunk 11 Task 11.4). Make two edits:
+
+**(a)** Replace the line:
+
+```python
+# Inject the Solana parser before start() so the runner's auto-built
+# pipeline picks it up (start() consults `chain.kind`).
+runner._solana_parsers_override = [_FakeSolParser()]  # type: ignore[attr-defined]
+```
+
+with:
+
+```python
+# Leave `_solana_parsers_override = None` so `start()` builds the DEFAULT
+# Solana parser list. We then assert that list is BOTH SolNativeTransferParser
+# and SplTransferParser (Task 12.3 wiring).
+```
+
+**(b)** Delete the now-orphaned `class _FakeSolParser:` block defined inside the same test function (chunk 11 Task 11.4 Step 4 added it). With the override removed in (a) it has no remaining references and would linger as dead code. The exact block to delete is — verbatim from chunk 11:
+
+```python
+class _FakeSolParser:
+    def parse(self, block: SolanaBlock) -> Iterable[Event]:
+        yield Event(
+            chain_id="sol", block_number=block.slot, block_hash=block.block_hash,
+            block_timestamp=block.block_time or 0,
+            tx_hash="SIG", tx_index=None, log_index=None,
+            kind="native_transfer", contract=None, name=None,
+            args={"from": "A", "to": "B", "value": "1000"}, raw={},
+        )
+```
+
+The class sits immediately above the `dispatched: list[Event] = []` line. Delete the entire `class _FakeSolParser:` definition (including its `parse` method and the `yield Event(...)` body). After deletion, the next line in the test function should be `dispatched: list[Event] = []`.
+
+If — and ONLY if — the `Event` and/or `Iterable` and/or `SolanaBlock` imports at the top of `tests/unit/test_chain_runner.py` are now unused, also remove them. (`Event` is likely still used by the `dispatched` type annotation; `Iterable` and `SolanaBlock` may be removable. Let `ruff`/`make lint` flag what's actually unused.)
+
+And add — AFTER `await runner.start(snap)` — these assertions (right above the existing `assert fake_adapter.connect_calls == 1`):
+
+```python
+from core.parser.sol_native import SolNativeTransferParser
+from core.parser.spl_transfer import SplTransferParser
+
+assert runner._pipeline is not None
+pipeline_parsers = runner._pipeline._parsers  # type: ignore[attr-defined]
+parser_types = {type(p) for p in pipeline_parsers}
+assert SolNativeTransferParser in parser_types, (
+    "default Solana pipeline must include SolNativeTransferParser"
+)
+assert SplTransferParser in parser_types, (
+    "default Solana pipeline must include SplTransferParser"
+)
+```
+
+Also adjust the `dispatched` assertion at the bottom — without the `_FakeSolParser` injection, no event will be produced from the empty `instructions=[]` test transaction, so:
+
+```python
+assert len(dispatched) == 0, (
+    "no SPL/System Program instructions in the test tx AND no subscriptions "
+    "in the snapshot — either alone would zero dispatched"
+)
+```
+
+(replaces the previous "no subscriptions in the snapshot" wording — still accurate, but now the test exercises the real default parser list).
+
+- [ ] **Step 2: Run the test, expect FAIL**
+
+```bash
+pytest tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer -v
+```
+
+Expected: FAIL — `SplTransferParser not in parser_types`. The chunk-11 `start()` only constructs `SolNativeTransferParser`.
+
+- [ ] **Step 3: Extend `start()` in `apps/worker/chain_runner.py`**
+
+Locate the Solana branch in `ChainRunner.start()` (added in chunk 11 Task 11.4). Replace:
+
+```python
+elif self._chain.kind == "solana":
+    # No buffer for Solana — commitment handles finality (spec §4.6).
+    self._buffer = None
+    self._pipeline = SolanaParserPipeline(
+        self._solana_parsers_override
+        or [SolNativeTransferParser(chain_id=self._chain.id)]
+    )
+```
+
+with:
+
+```python
+elif self._chain.kind == "solana":
+    # No buffer for Solana — commitment handles finality (spec §4.6).
+    self._buffer = None
+    self._pipeline = SolanaParserPipeline(
+        self._solana_parsers_override
+        or [
+            SolNativeTransferParser(chain_id=self._chain.id),
+            SplTransferParser(chain_id=self._chain.id),
+        ]
+    )
+```
+
+And add to the imports at the top of `apps/worker/chain_runner.py`:
+
+```python
+from core.parser.spl_transfer import SplTransferParser
+```
+
+(Keep the imports alphabetized in the parser block: `native`, `pipeline`, `sol_native`, `spl_transfer`.)
+
+- [ ] **Step 4: Re-run the test**
+
+```bash
+pytest tests/unit/test_chain_runner.py::test_chain_runner_solana_branch_bypasses_buffer -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Full chain_runner regression**
+
+```bash
+pytest tests/unit/test_chain_runner.py -v
+```
+
+Expected: every EVM test still green; the Solana test PASSes with the new assertions.
+
+- [ ] **Step 6: Lint / typecheck**
+
+```bash
+make lint typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/worker/chain_runner.py tests/unit/test_chain_runner.py
+git commit -m "feat(runner): include SplTransferParser in default Solana parser list"
+```
+
+### Task 12.4: Close-out
+
+- [ ] **Step 1: Full suite**
+
+```bash
+make test
+```
+
+Expected: every chunk 1–12 unit + IT test passes. Solana ITs SKIP on hosts without `solana-test-validator`.
+
+- [ ] **Step 2: Lint + typecheck**
+
+```bash
+make lint && make typecheck
+```
+
+Expected: clean.
+
+- [ ] **Step 3: M2 follow-up bookkeeping**
+
+Open `docs/superpowers/plans/2026-05-26-m2-implementation.md`, find the "M2 follow-ups" list (at the top of the plan or in chunk 1, wherever it lives), and mark follow-up #11 (matcher case-folding for base58) as **DONE**: Task 12.1 closed it. If a `transferWithFee` line doesn't exist as #12, add it now (one-line entry).
+
+Run:
+
+```bash
+rg -n "^- \[ \].*matcher.*lower\(\)" docs/
+rg -n "^- \[x\].*matcher.*case-folding" docs/
+```
+
+Expected: the first returns nothing (or only mentions that have nothing to do with the bug); the second returns the bookkeeping line you just toggled. (If the follow-ups list isn't checkbox-styled, just edit the prose to read "✅ M2 c12".)
+
+- [ ] **Step 4: Commit any bookkeeping edits**
+
+```bash
+git status
+```
+
+If `git status` shows the plan file modified, commit:
+
+```bash
+git add docs/superpowers/plans/2026-05-26-m2-implementation.md
+git commit -m "docs(plan): mark M2 follow-up #11 (matcher case-folding) DONE"
+```
+
+If `git status` is empty, this step is a no-op. No tag for chunk 12 — chunk 14 is the M2 close-out tag.
+
+---

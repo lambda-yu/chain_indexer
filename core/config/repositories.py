@@ -39,12 +39,16 @@ class ChainRepo:
         enabled: bool,
         commitment: str | None = None,
         trace_internal_calls: bool = False,
+        log_query_range_blocks: int = 100,
+        slot_query_range_blocks: int = 1000,
     ) -> Chain:
         c = Chain(
             id=id, kind=kind, rpc_http=rpc_http, rpc_ws=rpc_ws,
             confirmations=confirmations, poll_interval_ms=poll_interval_ms,
             enabled=enabled, commitment=commitment,
             trace_internal_calls=trace_internal_calls,
+            log_query_range_blocks=log_query_range_blocks,
+            slot_query_range_blocks=slot_query_range_blocks,
         )
         self.s.add(c)
         await self.s.flush()

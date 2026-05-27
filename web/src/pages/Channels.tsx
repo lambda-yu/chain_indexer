@@ -38,12 +38,13 @@ export default function Channels() {
       </div>
       {isLoading ? <p className="text-gray-500">加载中...</p> : (
         <table className="w-full text-sm border-collapse">
-          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">名称</th><th className="py-2 px-2">类型</th><th className="py-2 px-2">配置</th><th className="py-2 px-2">操作</th></tr></thead>
+          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">名称</th><th className="py-2 px-2">类型</th><th className="py-2 px-2">状态</th><th className="py-2 px-2">配置</th><th className="py-2 px-2">操作</th></tr></thead>
           <tbody>{channels.map(c => (
             <tr key={c.id} className="border-b hover:bg-gray-50">
               <td className="py-2 px-2 font-medium">{c.name}</td>
               <td className="py-2 px-2"><span className={`px-2 py-0.5 rounded text-xs font-medium ${BADGE(c.type)}`}>{driverLabel(c.type)}</span></td>
-              <td className="py-2 px-2 font-mono text-xs truncate max-w-64">{JSON.stringify(c.config)}</td>
+              <td className="py-2 px-2"><HealthDot channelId={c.id} /></td>
+              <td className="py-2 px-2 font-mono text-xs truncate max-w-48">{JSON.stringify(c.config)}</td>
               <td className="py-2 px-2 flex gap-2">
                 <button onClick={() => { setEditing(c); setShowForm(true) }} className="text-blue-500 hover:text-blue-700"><Pencil size={14} /></button>
                 <button onClick={() => delMut.mutate(c.id)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button>
@@ -194,5 +195,24 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
     </div>
+  )
+}
+
+function HealthDot({ channelId }: { channelId: string }) {
+  const { data, isLoading } = useQuery<{ status: string; detail: string }>({
+    queryKey: ['channel-health', channelId],
+    queryFn: () => api.get(`/channels/${channelId}/health`),
+    staleTime: 30000,
+    retry: false,
+  })
+  if (isLoading) return <span className="inline-block w-2 h-2 rounded-full bg-gray-300" title="检测中..." />
+  if (!data) return <span className="inline-block w-2 h-2 rounded-full bg-gray-300" title="未知" />
+  const ok = data.status === 'ok'
+  return (
+    <span className="flex items-center gap-1 text-xs">
+      <span className={`inline-block w-2 h-2 rounded-full ${ok ? 'bg-green-500' : 'bg-red-500'}`} />
+      <span className={ok ? 'text-green-600' : 'text-red-600'}>{ok ? '连通' : '异常'}</span>
+      {!ok && <span className="text-gray-400 text-[10px] truncate max-w-24" title={data.detail}>{data.detail.slice(0, 30)}</span>}
+    </span>
   )
 }

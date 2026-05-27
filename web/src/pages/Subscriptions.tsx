@@ -13,6 +13,7 @@ export default function Subscriptions() {
   const [testingSub, setTestingSub] = useState<Sub | null>(null)
   const { data: subs = [], isLoading } = useQuery<Sub[]>({ queryKey: ['subscriptions'], queryFn: () => api.get('/subscriptions') })
   const { data: abis = [] } = useQuery<AbiItem[]>({ queryKey: ['abis'], queryFn: () => api.get('/abis') })
+  const { data: allChannels = [] } = useQuery<{ id: string; name: string; type: string }[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/subscriptions/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['subscriptions'] }) })
 
   const abiNameMap = useMemo(() => Object.fromEntries(abis.map(a => [a.id, a.name])), [abis])
@@ -27,7 +28,7 @@ export default function Subscriptions() {
         <table className="w-full text-sm border-collapse">
           <thead><tr className="border-b text-left text-gray-500">
             <th className="py-2 px-2">名称</th><th className="py-2 px-2">链</th><th className="py-2 px-2">类型</th>
-            <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">起始块</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
+            <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">渠道</th><th className="py-2 px-2">起始块</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
           </tr></thead>
           <tbody>{subs.map(s => (
             <tr key={s.id} className="border-b hover:bg-gray-50">
@@ -36,6 +37,7 @@ export default function Subscriptions() {
               <td className="py-2 px-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100">{s.match_kind}</span></td>
               <td className="py-2 px-2 text-xs">{s.abi_id ? (abiNameMap[s.abi_id] ?? s.abi_id.slice(0, 8)) : '—'}</td>
               <td className="py-2 px-2">{s.match_name ?? '—'}</td>
+              <td className="py-2 px-2"><SubChannelBadges subId={s.id} allChannels={allChannels} /></td>
               <td className="py-2 px-2 font-mono text-xs">{s.start_block?.toLocaleString() ?? '—'}</td>
               <td className="py-2 px-2">{s.enabled ? <span className="text-green-600">是</span> : <span className="text-gray-400">否</span>}</td>
               <td className="py-2 px-2 flex gap-2">
@@ -261,6 +263,24 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         </div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
+    </div>
+  )
+}
+
+function SubChannelBadges({ subId, allChannels }: { subId: string; allChannels: { id: string; name: string; type: string }[] }) {
+  const { data } = useQuery<{ channel_ids: string[] }>({
+    queryKey: ['sub-channels', subId],
+    queryFn: () => api.get(`/subscriptions/${subId}`),
+    staleTime: 30000,
+  })
+  if (!data?.channel_ids?.length) return <span className="text-gray-400 text-xs">—</span>
+  const chMap = Object.fromEntries(allChannels.map(c => [c.id, c]))
+  return (
+    <div className="flex flex-wrap gap-0.5">
+      {data.channel_ids.map(cid => {
+        const ch = chMap[cid]
+        return ch ? <span key={cid} className="px-1 py-0.5 rounded text-[10px] bg-gray-100">{ch.name}</span> : null
+      })}
     </div>
   )
 }

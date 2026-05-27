@@ -77,3 +77,40 @@ async def get_channel(
     if row is None:
         raise HTTPException(status_code=404, detail="channel not found")
     return ChannelOut.model_validate(row)
+
+
+@router.get("/{channel_id}/health")
+async def channel_health(
+    channel_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> dict:
+    row = await ChannelRepo(session).get(channel_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="channel not found")
+    cls = CHANNEL_REGISTRY.get(row.type.value)
+    if cls is None:
+        return {"channel_id": channel_id, "status": "error", "detail": f"unknown type: {row.type}"}
+    try:
+        ch = cls(config=row.config, bus=bus)
+        await ch.start()
+        if hasattr(ch, '_client') and hasattr(ch, '_url'):
+            try:
+                resp = await ch._client.request("HEAD", ch._url, timeout=5.0)
+            except Exception as exc:
+                await ch.stop()
+                return {"channel_id": channel_id, "status": "error", "detail": repr(exc)}
+            await ch.stop()
+            return {"channel_id": channel_id, "status": "ok", "detail": f"HTTP {resp.status_code}"}
+        if hasattr(ch, '_bus') and ch._bus is not None:
+            try:
+                await ch._bus.client.ping()
+            except Exception as exc:
+                await ch.stop()
+                return {"channel_id": channel_id, "status": "error", "detail": repr(exc)}
+            await ch.stop()
+            return {"channel_id": channel_id, "status": "ok", "detail": "redis ping ok"}
+        await ch.stop()
+        return {"channel_id": channel_id, "status": "ok", "detail": "connected"}
+    except Exception as exc:
+        return {"channel_id": channel_id, "status": "error", "detail": repr(exc)}

@@ -27,7 +27,7 @@ chain-indexer-worker = "apps.worker.main:main"
 chain-indexer-web    = "apps.web.main:main"  # populated in Chunk 9
 
 [project.optional-dependencies]
-postgres = ["asyncpg>=0.29"]
+postgres = ["asyncpg>=0.29", "psycopg2-binary>=2.9"]
 mysql = ["asyncmy>=0.2.9"]
 dev = [
     "pytest>=8.0",

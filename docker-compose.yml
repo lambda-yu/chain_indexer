@@ -2,7 +2,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6378:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -17,7 +17,7 @@ services:
       POSTGRES_PASSWORD: indexer
       POSTGRES_DB: chain_indexer
     ports:
-      - "5432:5432"
+      - "5431:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -29,7 +29,7 @@ services:
     build: .
     command: uv run alembic upgrade head
     environment:
-      CHAIN_INDEXER_DATABASE__URL: postgresql+asyncpg://indexer:indexer@db:5432/chain_indexer
+      ALEMBIC_DATABASE_URL: postgresql+asyncpg://indexer:indexer@db:5432/chain_indexer
     depends_on:
       db:
         condition: service_healthy

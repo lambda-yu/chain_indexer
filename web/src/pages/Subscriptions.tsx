@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
 import { Plus, Trash2, Pencil, FlaskConical } from 'lucide-react'
 
-interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null }
+interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null; last_processed_block: number | null }
 interface AbiItem { id: string; name: string; kind: string; body: unknown }
 
 export default function Subscriptions() {
@@ -28,7 +28,7 @@ export default function Subscriptions() {
         <table className="w-full text-sm border-collapse">
           <thead><tr className="border-b text-left text-gray-500">
             <th className="py-2 px-2">名称</th><th className="py-2 px-2">链</th><th className="py-2 px-2">类型</th>
-            <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">渠道</th><th className="py-2 px-2">起始块</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
+            <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">渠道</th><th className="py-2 px-2">进度</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
           </tr></thead>
           <tbody>{subs.map(s => (
             <tr key={s.id} className="border-b hover:bg-gray-50">
@@ -38,7 +38,10 @@ export default function Subscriptions() {
               <td className="py-2 px-2 text-xs">{s.abi_id ? (abiNameMap[s.abi_id] ?? s.abi_id.slice(0, 8)) : '—'}</td>
               <td className="py-2 px-2">{s.match_name ?? '—'}</td>
               <td className="py-2 px-2"><SubChannelBadges subId={s.id} allChannels={allChannels} /></td>
-              <td className="py-2 px-2 font-mono text-xs">{s.start_block?.toLocaleString() ?? '—'}</td>
+              <td className="py-2 px-2 text-xs font-mono">
+                {s.last_processed_block ? <span className="text-green-600">{s.last_processed_block.toLocaleString()}</span> : <span className="text-gray-400">—</span>}
+                {s.start_block ? <span className="text-gray-400 ml-1">/ 起始 {s.start_block.toLocaleString()}</span> : null}
+              </td>
               <td className="py-2 px-2">{s.enabled ? <span className="text-green-600">是</span> : <span className="text-gray-400">否</span>}</td>
               <td className="py-2 px-2 flex gap-2">
                 <button onClick={() => setTestingSub(s)} className="text-orange-500 hover:text-orange-700" title="测试"><FlaskConical size={14} /></button>

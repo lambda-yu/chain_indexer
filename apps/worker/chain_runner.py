@@ -61,6 +61,8 @@ class ChainRunner:
         notifier_max_concurrency: int = 50,
         abi_registry: AbiRegistry | None = None,
         on_send_failure: Any = None,
+        on_send_success: Any = None,
+        on_block_processed: Any = None,
     ) -> None:
         self._chain = chain
         self._adapter_factory = adapter_factory
@@ -69,6 +71,8 @@ class ChainRunner:
         self._notifier_max_concurrency = notifier_max_concurrency
         self._abi_registry = abi_registry
         self._on_send_failure = on_send_failure
+        self._on_send_success = on_send_success
+        self._on_block_processed = on_block_processed
 
         self._adapter: Any = None
         self._buffer: ConfirmationBuffer | None = None
@@ -132,6 +136,7 @@ class ChainRunner:
             channel_factory=self._channel_factory,
             max_concurrency=self._notifier_max_concurrency,
             on_failure=self._on_send_failure,
+            on_success=self._on_send_success,
         )
         await self._notifier.start(snap.channels)
         self._current_snap = snap
@@ -332,10 +337,13 @@ class ChainRunner:
 
         # 优化2: 所有 event dispatch 并发而非串行
         dispatch_tasks: list[asyncio.Task[None]] = []
+        matched_sub_ids: set[str] = set()
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
             if hits:
                 dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+                for sub, _ in hits:
+                    matched_sub_ids.add(sub.id)
 
         if self._chain.trace_internal_calls and self._abi_registry is not None:
             trace_fn = getattr(self._adapter, "trace_block", None)
@@ -352,6 +360,11 @@ class ChainRunner:
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
 
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
+        if self._on_block_processed and matched_sub_ids:
+            try:
+                await self._on_block_processed(matched_sub_ids, block.header.number)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _process_solana_slot(self, slot: int) -> None:
         assert self._adapter is not None and self._solana_pipeline is not None
@@ -365,13 +378,21 @@ class ChainRunner:
         events = list(self._solana_pipeline.run(block))
         # 优化: 并发 dispatch
         dispatch_tasks: list[asyncio.Task[None]] = []
+        matched_sub_ids: set[str] = set()
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
             if hits:
                 dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+                for sub, _ in hits:
+                    matched_sub_ids.add(sub.id)
         if dispatch_tasks:
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
         await self._cp.save(self._chain.id, block.slot, block.block_hash)
+        if self._on_block_processed and matched_sub_ids:
+            try:
+                await self._on_block_processed(matched_sub_ids, block.slot)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def stop(self) -> None:
         self._stop.set()

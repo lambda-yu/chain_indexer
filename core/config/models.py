@@ -105,6 +105,7 @@ class Subscription(Base, TimestampMixin):
     arg_filters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     start_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
+    last_processed_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
 
 
 class Channel(Base, TimestampMixin):
@@ -151,12 +152,13 @@ class ConfigVersion(Base):
 
 
 class DeliveryStatus(enum.StrEnum):
+    success = "success"
     failed = "failed"
     retrying = "retrying"
     resolved = "resolved"
 
 
-class FailedDelivery(Base):
+class DeliveryRecord(Base):
     __tablename__ = "failed_deliveries"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -164,10 +166,10 @@ class FailedDelivery(Base):
     channel_id: Mapped[str] = mapped_column(String(36), nullable=False)
     chain_id: Mapped[str] = mapped_column(String(64), nullable=False)
     event_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    error: Mapped[str] = mapped_column(Text, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[DeliveryStatus] = mapped_column(
-        SAEnum(DeliveryStatus, name="delivery_status"), nullable=False, default=DeliveryStatus.failed
+        SAEnum(DeliveryStatus, name="delivery_status"), nullable=False, default=DeliveryStatus.success
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

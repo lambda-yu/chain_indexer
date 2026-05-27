@@ -108,6 +108,7 @@ class SubscriptionOut(BaseModel):
     match_name: str | None
     arg_filters: dict[str, Any]
     start_block: int | None
+    last_processed_block: int | None
     enabled: bool
 
 

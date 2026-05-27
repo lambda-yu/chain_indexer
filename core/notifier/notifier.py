@@ -31,12 +31,14 @@ class Notifier:
         channel_factory: Callable[[SnapshotChannel], Channel] = _default_factory,
         max_concurrency: int = 50,
         on_failure: FailureCallback = None,
+        on_success: FailureCallback = None,
     ) -> None:
         self._factory = channel_factory
         self._max_concurrency = max_concurrency
         self._sem: asyncio.Semaphore | None = None
         self._channels: dict[str, Channel] = {}
         self._on_failure = on_failure
+        self._on_success = on_success
 
     def _get_sem(self) -> asyncio.Semaphore:
         if self._sem is None:
@@ -85,6 +87,15 @@ class Notifier:
         async with self._get_sem():
             try:
                 await ch.send(payload)
+                if self._on_success:
+                    try:
+                        await self._on_success(
+                            subscription_id, channel_id,
+                            payload.get("chain_id", ""),
+                            payload, None,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as exc:  # noqa: BLE001
                 log.error(
                     "notifier.send_failed",

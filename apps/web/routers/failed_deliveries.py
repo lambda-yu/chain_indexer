@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.web.deps import get_bus, get_session
 from core.bus.redis_bus import RedisBus
-from core.config.repositories import FailedDeliveryRepo
+from core.config.repositories import DeliveryRecordRepo
 from core.notifier.channel import CHANNEL_REGISTRY
 
 router = APIRouter(prefix="/api/failed-deliveries", tags=["failed-deliveries"])
@@ -32,7 +32,7 @@ class FailedDeliveryOut(BaseModel):
 async def list_failed_deliveries(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[FailedDeliveryOut]:
-    rows = await FailedDeliveryRepo(session).list_all(limit=200)
+    rows = await DeliveryRecordRepo(session).list_all(limit=200)
     return [FailedDeliveryOut.model_validate(r) for r in rows]
 
 
@@ -42,7 +42,7 @@ async def retry_delivery(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     bus: RedisBus = Depends(get_bus),  # noqa: B008
 ) -> dict[str, str]:
-    repo = FailedDeliveryRepo(session)
+    repo = DeliveryRecordRepo(session)
     row = await repo.get(delivery_id)
     if row is None:
         raise HTTPException(status_code=404, detail="delivery not found")
@@ -76,7 +76,7 @@ async def resolve_delivery(
     delivery_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> dict[str, str]:
-    repo = FailedDeliveryRepo(session)
+    repo = DeliveryRecordRepo(session)
     row = await repo.get(delivery_id)
     if row is None:
         raise HTTPException(status_code=404, detail="delivery not found")
@@ -90,7 +90,7 @@ async def delete_delivery(
     delivery_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> None:
-    repo = FailedDeliveryRepo(session)
+    repo = DeliveryRecordRepo(session)
     row = await repo.get(delivery_id)
     if row is None:
         raise HTTPException(status_code=404, detail="delivery not found")

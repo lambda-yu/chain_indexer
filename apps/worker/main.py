@@ -110,19 +110,49 @@ class _Worker:
         self, subscription_id: str, channel_id: str, chain_id: str,
         payload: dict, error: str,
     ) -> None:
-        from core.config.repositories import FailedDeliveryRepo
+        from core.config.repositories import DeliveryRecordRepo
         try:
             async with self._db.session() as s:
-                await FailedDeliveryRepo(s).create(
+                await DeliveryRecordRepo(s).create(
                     subscription_id=subscription_id,
                     channel_id=channel_id,
                     chain_id=chain_id,
                     event_payload=payload,
                     error=error,
+                    status="failed",
                 )
                 await s.commit()
         except Exception as exc:  # noqa: BLE001
             log.error("worker.failed_delivery_save_error", error=repr(exc))
+
+    async def _on_delivery_success(
+        self, subscription_id: str, channel_id: str, chain_id: str,
+        payload: dict, _error: str | None,
+    ) -> None:
+        from core.config.repositories import DeliveryRecordRepo
+        try:
+            async with self._db.session() as s:
+                await DeliveryRecordRepo(s).create(
+                    subscription_id=subscription_id,
+                    channel_id=channel_id,
+                    chain_id=chain_id,
+                    event_payload=payload,
+                    status="success",
+                )
+                await s.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _on_block_processed(self, sub_ids: set[str], block_number: int) -> None:
+        from core.config.repositories import SubscriptionRepo
+        try:
+            async with self._db.session() as s:
+                repo = SubscriptionRepo(s)
+                for sid in sub_ids:
+                    await repo.update(sid, last_processed_block=block_number)
+                await s.commit()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def start(self) -> None:
         log.info("worker.starting", worker_id=self._worker_id)
@@ -199,6 +229,8 @@ class _Worker:
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,
                     on_send_failure=self._on_delivery_failure,
+                    on_send_success=self._on_delivery_success,
+                    on_block_processed=self._on_block_processed,
                 )
                 try:
                     await runner.start(snap)

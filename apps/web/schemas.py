@@ -27,6 +27,8 @@ class ChainCreate(BaseModel):
     poll_interval_ms: int = Field(ge=100, le=60_000, default=3000)
     commitment: Literal["confirmed", "finalized"] | None = None
     trace_internal_calls: bool = False
+    log_query_range_blocks: int = Field(ge=1, le=10_000, default=100)
+    slot_query_range_blocks: int = Field(ge=1, le=500_000, default=1000)
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -49,6 +51,8 @@ class ChainOut(BaseModel):
     poll_interval_ms: int
     commitment: str | None
     trace_internal_calls: bool | None
+    log_query_range_blocks: int
+    slot_query_range_blocks: int
     enabled: bool
 
 

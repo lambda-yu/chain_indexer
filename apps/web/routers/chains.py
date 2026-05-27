@@ -32,6 +32,8 @@ async def create_chain(
         enabled=payload.enabled,
         commitment=payload.commitment,
         trace_internal_calls=payload.trace_internal_calls,
+        log_query_range_blocks=payload.log_query_range_blocks,
+        slot_query_range_blocks=payload.slot_query_range_blocks,
     )
     await bump_and_publish(session, bus, entity="chain", entity_id=row.id, action="create")
     return ChainOut.model_validate(row)
@@ -57,6 +59,8 @@ async def update_chain(
         enabled=payload.enabled,
         commitment=payload.commitment,
         trace_internal_calls=payload.trace_internal_calls,
+        log_query_range_blocks=payload.log_query_range_blocks,
+        slot_query_range_blocks=payload.slot_query_range_blocks,
     )
     await bump_and_publish(session, bus, entity="chain", entity_id=chain_id, action="update")
     await session.refresh(row)

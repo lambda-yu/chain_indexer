@@ -216,18 +216,23 @@ assert filter is not None
 start_n = last_block + 1
 while start_n <= safe_tip:
     end_n = min(start_n + range_blocks - 1, safe_tip)
-    if filter.skip_logs:
-        logs_by_block: dict[int, list[Log]] = {}
-    else:
-        logs_by_block = await self._fetch_logs_with_degrade(
-            start_n, end_n, filter,
-        )
-    for n in range(start_n, end_n + 1):
-        if self._stop.is_set():
-            return
-        await self._process_block_with_prefetched_logs(
-            n, logs_by_block.get(n, []), matcher=matcher, notifier=notifier,
-        )
+    try:
+        if filter.skip_logs:
+            logs_by_block: dict[int, list[Log]] = {}
+        else:
+            logs_by_block = await self._fetch_logs_with_degrade(
+                start_n, end_n, filter,
+            )
+        for n in range(start_n, end_n + 1):
+            if self._stop.is_set():
+                return
+            await self._process_block_with_prefetched_logs(
+                n, logs_by_block.get(n, []), matcher=matcher, notifier=notifier,
+            )
+    except Exception:  # noqa: BLE001 — preserves existing _catchup_evm break-on-error
+        log.error("chain_runner.catchup_window_failed",
+                  chain_id=self._chain.id, start=start_n, end=end_n)
+        break
     start_n = end_n + 1
 ```
 
@@ -269,7 +274,17 @@ async def _fetch_logs_with_degrade(
         raise
 ```
 
-`_bucket_by_block` derives `block_number` from each `Log`. **Schema dependency**: `Log` does not currently carry `block_number` — we must add it. Audit shows `Log` (in `core/chains/types.py`) has `tx_hash, log_index, address, topics, data`. Need to:
+`_bucket_by_block` derives `block_number` from each `Log`:
+
+```python
+def _bucket_by_block(logs: list[Log]) -> dict[int, list[Log]]:
+    out: dict[int, list[Log]] = {}
+    for lg in logs:
+        out.setdefault(lg.block_number, []).append(lg)
+    return out
+```
+
+**Schema dependency**: `Log` does not currently carry `block_number` — we must add it. Audit shows `Log` (in `core/chains/types.py`) has `tx_hash, log_index, address, topics, data`. Need to:
 
 - Extend `Log` with `block_number: int`.
 - Update `EvmAdapter.fetch_logs` parsing to populate `block_number` from `lg["blockNumber"]`.
@@ -304,20 +319,39 @@ async def get_blocks(self, start_slot: int, end_slot: int) -> list[int]:
 **Catchup change** (`_catchup_solana`):
 
 ```python
+SOL_RANGE_TOO_LARGE_HINTS = ("exceeds maximum", "too large", "limit exceeded")
+
+async def _get_blocks_classified(self, start: int, end: int) -> list[int]:
+    """Wrap adapter.get_blocks, classify errors:
+       - size-limit class (hint match) → raise (config error)
+       - other transient errors → log + return dense range as fallback
+    """
+    try:
+        return await self._adapter.get_blocks(start, end)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if any(h in msg for h in SOL_RANGE_TOO_LARGE_HINTS):
+            log.error("chain_runner.get_blocks_range_too_large",
+                      chain_id=self._chain.id, start=start, end=end)
+            raise  # config error: operator must lower slot_query_range_blocks
+        log.warning("chain_runner.get_blocks_failed",
+                    chain_id=self._chain.id, start=start, end=end, error=str(exc))
+        return list(range(start, end + 1))  # dense fallback
+
 range_slots = self._chain.slot_query_range_blocks  # default 1000
 start_s = last_slot + 1
 while start_s <= tip:
     end_s = min(start_s + range_slots - 1, tip)
-    try:
-        valid = await self._adapter.get_blocks(start_s, end_s)
-    except Exception:
-        log.warning("chain_runner.get_blocks_failed", chain_id=..., start=start_s, end=end_s)
-        # Degrade to full range iteration for safety
-        valid = list(range(start_s, end_s + 1))
+    valid = await self._get_blocks_classified(start_s, end_s)
     for s in valid:
         if self._stop.is_set():
             return
-        await self._process_solana_slot(s)
+        try:
+            await self._process_solana_slot(s)
+        except Exception:  # match existing per-slot error tolerance
+            log.error("chain_runner.catchup_slot_failed",
+                      chain_id=self._chain.id, slot=s)
+            continue
     start_s = end_s + 1
 ```
 
@@ -361,7 +395,8 @@ Each step is independently committable, testable, and adds no broken state in be
 1. **Schema migration + model**
    - Alembic `0006_rpc_range_config.py`
    - `Chain` model: `log_query_range_blocks` (Integer NOT NULL DEFAULT 100), `slot_query_range_blocks` (Integer NOT NULL DEFAULT 1000)
-   - Default values applied to existing rows on migration
+   - **Migration MUST use `server_default="100"` / `server_default="1000"` on `op.add_column(...)`** (mirroring the pattern in `0003_failed_deliveries.py`). Without `server_default`, adding a NOT NULL column to an existing populated table fails on both SQLite and Postgres because SQLAlchemy `default=` is Python-side only and does not produce DDL. The Python-side `default=` is also kept on the model so new in-Python instantiations work.
+   - Default values applied to existing rows on migration via `server_default`
 2. **Snapshot + repos + web schema wiring**
    - `SnapshotChain` propagates both fields
    - `ChainRepo` reads/writes
@@ -369,7 +404,14 @@ Each step is independently committable, testable, and adds no broken state in be
    - `apps/web/routers/chains.py` accepts on POST/PATCH
    - `web/src/pages/Chains.tsx` form input (optional; API-only is enough for first cut)
 3. **`Log.block_number` field**
-   - Add to dataclass, populate in `EvmAdapter.fetch_logs`, audit consumers (grep `Log(` across codebase)
+   - Add to dataclass as a **required field** (no default — we want a hard invariant that any constructed `Log` knows its origin block).
+   - Populate in `EvmAdapter.fetch_logs` from `lg["blockNumber"]` (web3.py returns it as int).
+   - **Audit and update ALL `Log(...)` call sites** (both production and test). Known affected test files (grep for `Log(` in `tests/`):
+     - `tests/unit/test_chain_runner.py`
+     - `tests/unit/test_erc20_parser.py`
+     - `tests/unit/test_abi_event_parser.py`
+     - `tests/unit/test_chain_types.py`
+   - Each test fixture must supply a sensible `block_number` (typically matches the block header's number). This is mechanical work but cannot be skipped.
 4. **`EvmLogFilterSet` + builder**
    - New file + unit tests
 5. **`EvmAdapter.fetch_logs` topics parameter**
@@ -378,7 +420,8 @@ Each step is independently committable, testable, and adds no broken state in be
    - Build filter in `start` / `apply_snapshot`; use in `_process_confirmed_block`
    - Verify existing tests still pass
 7. **`ChainRunner._catchup_evm` range query + degradation**
-   - Bucket helper + degrade helper + main loop refactor
+   - `_bucket_by_block` helper + `_fetch_logs_with_degrade` helper + main catchup loop refactor
+   - **Also restructures `_process_confirmed_block` per the refactoring contract**: splits out `_process_block_with_prefetched_logs(n, prefetched_logs, ...)` as the inner helper; head-following entrypoint owns the fetch concurrency
    - New unit tests
 8. **`SolanaAdapter.get_blocks`**
    - Method + unit test

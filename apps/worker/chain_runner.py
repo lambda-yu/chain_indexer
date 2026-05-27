@@ -261,14 +261,21 @@ class ChainRunner:
             chain_id=self._chain.id, from_block=last_block + 1,
             to_block=safe_tip, gap=gap,
         )
-        matcher = self._matcher
-        notifier = self._notifier
-        log_filter = self._evm_filter
         range_blocks = self._chain.log_query_range_blocks
 
         processed = 0
         start_n = last_block + 1
         while start_n <= safe_tip:
+            # Re-read snapshot-derived state per window so apply_snapshot()
+            # mid-catchup takes effect at the next window boundary instead of
+            # being deferred until catchup completes. Reads are atomic (Python
+            # GIL); a torn (matcher_v1, filter_v2) read at worst delays new
+            # subscriptions by one window — never violates correctness for
+            # already-active subscriptions.
+            matcher = self._matcher
+            notifier = self._notifier
+            log_filter = self._evm_filter
+            assert matcher is not None and notifier is not None and log_filter is not None
             end_n = min(start_n + range_blocks - 1, safe_tip)
             try:
                 if log_filter.skip_logs:

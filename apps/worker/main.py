@@ -179,7 +179,7 @@ class _Worker:
         # subscribe_heads() with no traffic.
         await runner.stop()
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
         log.info("worker.chain_runner_stopped", chain_id=chain_id)
 

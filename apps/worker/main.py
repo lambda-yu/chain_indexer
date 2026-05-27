@@ -123,6 +123,8 @@ class _Worker:
     async def start(self) -> None:
         await self._db.connect()
         await self._bus.connect()
+        from core.logging import set_log_redis_client
+        set_log_redis_client(self._bus.client)
         self._watcher = ConfigWatcher(
             bus=self._bus,
             session_factory=self._db.session,

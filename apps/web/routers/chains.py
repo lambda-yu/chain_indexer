@@ -80,3 +80,21 @@ async def get_chain(
     if row is None:
         raise HTTPException(status_code=404, detail="chain not found")
     return ChainOut.model_validate(row)
+
+
+@router.get("/{chain_id}/status")
+async def chain_status(
+    chain_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict:
+    from core.config.repositories import CheckpointRepo
+    chain = await ChainRepo(session).get(chain_id)
+    if chain is None:
+        raise HTTPException(status_code=404, detail="chain not found")
+    cp = await CheckpointRepo(session).get(chain_id)
+    return {
+        "chain_id": chain_id,
+        "enabled": chain.enabled,
+        "latest_block": cp.last_block if cp else None,
+        "latest_block_hash": cp.last_block_hash if cp else None,
+    }

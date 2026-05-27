@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
 import { Plus, Trash2, Pencil } from 'lucide-react'
@@ -62,10 +62,18 @@ function extractAbiNames(body: unknown, type: 'event' | 'function'): string[] {
   return []
 }
 
+interface ChannelItem { id: string; name: string; type: string }
+
 function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiItem[]; onClose: () => void }) {
   const qc = useQueryClient()
   const isEdit = initial !== null
   const { data: chains = [] } = useQuery<{ id: string }[]>({ queryKey: ['chains'], queryFn: () => api.get('/chains') })
+  const { data: allChannels = [] } = useQuery<ChannelItem[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
+  const { data: subDetail } = useQuery<{ channel_ids: string[] }>({
+    queryKey: ['sub-detail', initial?.id],
+    queryFn: () => api.get(`/subscriptions/${initial?.id}`),
+    enabled: isEdit,
+  })
   const createMut = useMutation({ mutationFn: (d: Record<string, unknown>) => api.post('/subscriptions', d), onSuccess: () => { qc.invalidateQueries({ queryKey: ['subscriptions'] }); onClose() } })
   const updateMut = useMutation({ mutationFn: (d: Record<string, unknown>) => api.put(`/subscriptions/${initial?.id}`, d), onSuccess: () => { qc.invalidateQueries({ queryKey: ['subscriptions'] }); onClose() } })
   const mut = isEdit ? updateMut : createMut
@@ -74,6 +82,8 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
   const [abiId, setAbiId] = useState(initial?.abi_id ?? '')
   const [matchName, setMatchName] = useState(initial?.match_name ?? '')
   const [selectedNames, setSelectedNames] = useState<string[]>(initial?.match_name ? [initial.match_name] : [])
+  const [selectedChannels, setSelectedChannels] = useState<string[]>(subDetail?.channel_ids ?? [])
+  useEffect(() => { if (subDetail?.channel_ids) setSelectedChannels(subDetail.channel_ids) }, [subDetail])
 
   const needsAbi = matchKind === 'event' || matchKind === 'call'
 
@@ -103,6 +113,14 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
 
     if (isEdit) {
       mut.mutate({ ...base, name: fd.get('name'), match_name: selectedNames[0] || matchName || null })
+      // Sync channel bindings
+      if (subDetail) {
+        const current = new Set(subDetail.channel_ids)
+        for (const cid of selectedChannels) {
+          if (!current.has(cid)) await api.post(`/subscriptions/${initial?.id}/channels`, { channel_id: cid })
+        }
+        // Note: unbind API not implemented yet, skip removals
+      }
       return
     }
 
@@ -112,7 +130,11 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
     for (let i = 0; i < names.length; i++) {
       const n = names[i]
       const subName = names.length > 1 ? `${baseName}-${n}` : baseName
-      await (api.post('/subscriptions', { ...base, name: subName, match_name: n }))
+      const created = await api.post<{ id: string }>('/subscriptions', { ...base, name: subName, match_name: n })
+      // 自动绑定选中的渠道
+      for (const cid of selectedChannels) {
+        await api.post(`/subscriptions/${created.id}/channels`, { channel_id: cid })
+      }
     }
     qc.invalidateQueries({ queryKey: ['subscriptions'] })
     onClose()
@@ -197,6 +219,23 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         <input name="address" defaultValue={initial?.address ?? ''} placeholder="合约地址（可选）" className="w-full border rounded px-3 py-1.5 text-sm font-mono" />
         <textarea name="arg_filters" defaultValue={JSON.stringify(initial?.arg_filters ?? {}, null, 2)} placeholder='参数过滤 JSON' className="w-full border rounded px-3 py-1.5 text-sm h-16 font-mono" />
         <label className="flex items-center gap-2 text-sm"><input name="enabled" type="checkbox" defaultChecked={initial?.enabled ?? true} /> 启用</label>
+
+        {allChannels.length > 0 && (
+          <div>
+            <label className="text-xs text-gray-500 block mb-1">绑定通知渠道（可多选）</label>
+            <div className="border rounded p-2 max-h-28 overflow-auto space-y-1">
+              {allChannels.map(ch => (
+                <label key={ch.id} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
+                  <input type="checkbox" checked={selectedChannels.includes(ch.id)}
+                    onChange={() => setSelectedChannels(prev => prev.includes(ch.id) ? prev.filter(x => x !== ch.id) : [...prev, ch.id])}
+                    className="accent-black" />
+                  <span>{ch.name}</span>
+                  <span className="text-[10px] text-gray-400 ml-auto">{ch.type}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-2 pt-2">
           <button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button>

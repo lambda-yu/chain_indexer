@@ -49,10 +49,20 @@ def _match_event(event: Event, matcher: Matcher) -> list[dict[str, Any]]:
     return hits
 
 
+def _safe_dict(obj: Any) -> Any:
+    if isinstance(obj, bytes):
+        return "0x" + obj.hex()
+    if isinstance(obj, dict):
+        return {k: _safe_dict(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_safe_dict(v) for v in obj]
+    return obj
+
+
 def _enrich_events(events: list[Event], matcher: Matcher) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for ev in events:
-        d = asdict(ev)
+        d = _safe_dict(asdict(ev))
         hits = _match_event(ev, matcher)
         d["matched_subscriptions"] = hits
         d["matched"] = len(hits) > 0
@@ -64,6 +74,18 @@ def _enrich_events(events: list[Event], matcher: Matcher) -> list[dict[str, Any]
 async def parse_block(
     req: ParseBlockRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> dict[str, Any]:
+    try:
+        return await _do_parse_block(req, session)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"解析失败: {exc!r}") from exc
+
+
+async def _do_parse_block(
+    req: ParseBlockRequest,
+    session: AsyncSession,
 ) -> dict[str, Any]:
     chain_row = await ChainRepo(session).get(req.chain_id)
     if chain_row is None:

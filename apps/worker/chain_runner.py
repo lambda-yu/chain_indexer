@@ -45,6 +45,9 @@ _DEGRADE_ERR_HINTS = (
 )
 
 
+_SOL_RANGE_TOO_LARGE_HINTS = ("exceeds maximum", "too large", "limit exceeded")
+
+
 def _bucket_by_block(logs: list[Log]) -> dict[int, list[Log]]:
     out: dict[int, list[Log]] = {}
     for lg in logs:
@@ -322,25 +325,67 @@ class ChainRunner:
         if gap <= 0:
             return
         if gap > self.MAX_CATCHUP_BLOCKS:
-            log.warning("chain_runner.catchup_gap_too_large", chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS)
+            log.warning(
+                "chain_runner.catchup_gap_too_large",
+                chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS,
+            )
             last_slot = tip - self.MAX_CATCHUP_BLOCKS
             gap = self.MAX_CATCHUP_BLOCKS
-        log.info("chain_runner.catchup_starting", chain_id=self._chain.id, from_slot=last_slot + 1, to_slot=tip, gap=gap)
-        matcher = self._matcher
-        notifier = self._notifier
+        log.info(
+            "chain_runner.catchup_starting",
+            chain_id=self._chain.id, from_slot=last_slot + 1, to_slot=tip, gap=gap,
+        )
+
+        range_slots = self._chain.slot_query_range_blocks
         processed = 0
-        for s in range(last_slot + 1, tip + 1):
-            if self._stop.is_set():
-                break
-            try:
-                await self._process_solana_slot(s)
-                processed += 1
-                if processed % 100 == 0:
-                    log.info("chain_runner.catchup_progress", chain_id=self._chain.id, slot=s, remaining=tip - s)
-            except Exception:  # noqa: BLE001
-                log.error("chain_runner.catchup_slot_failed", chain_id=self._chain.id, slot=s)
-                continue
+        start_s = last_slot + 1
+        while start_s <= tip:
+            end_s = min(start_s + range_slots - 1, tip)
+            valid = await self._get_blocks_classified(start_s, end_s)
+            for s in valid:
+                if self._stop.is_set():
+                    return
+                try:
+                    await self._process_solana_slot(s)
+                    processed += 1
+                    if processed % 100 == 0:
+                        log.info(
+                            "chain_runner.catchup_progress",
+                            chain_id=self._chain.id, slot=s, remaining=tip - s,
+                        )
+                except Exception:  # noqa: BLE001 — match existing per-slot tolerance
+                    log.error(
+                        "chain_runner.catchup_slot_failed",
+                        chain_id=self._chain.id, slot=s,
+                    )
+                    continue
+            start_s = end_s + 1
         log.info("chain_runner.catchup_done", chain_id=self._chain.id, processed=processed)
+
+    async def _get_blocks_classified(self, start: int, end: int) -> list[int]:
+        """Wrap adapter.get_blocks, classify errors.
+
+        - Size-limit class (hint match) → raise (config error: operator must
+          lower slot_query_range_blocks).
+        - Other transient errors → log warning, return dense [start, end+1).
+        """
+        assert self._adapter is not None
+        try:
+            result: list[int] = await self._adapter.get_blocks(start, end)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if any(h in msg for h in _SOL_RANGE_TOO_LARGE_HINTS):
+                log.error(
+                    "chain_runner.get_blocks_range_too_large",
+                    chain_id=self._chain.id, start=start, end=end,
+                )
+                raise
+            log.warning(
+                "chain_runner.get_blocks_failed",
+                chain_id=self._chain.id, start=start, end=end, error=str(exc),
+            )
+            return list(range(start, end + 1))
 
     async def _handle_evm_head(self, header: BlockHeader) -> None:
         assert self._buffer is not None and self._adapter is not None

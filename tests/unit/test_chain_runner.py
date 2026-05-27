@@ -106,8 +106,19 @@ class _FakeAdapter:
     async def fetch_block(self, number: int) -> Block:
         return self._blocks[number]
 
-    async def fetch_logs(self, _from: int, _to: int, _addr: list[str] | None = None) -> list[Any]:
-        return []
+    async def fetch_logs(
+        self,
+        from_block: int,
+        to_block: int,
+        addresses: list[str] | None = None,
+        topics: list[list[str]] | None = None,
+    ) -> list[Any]:
+        out: list[Any] = []
+        for n in range(from_block, to_block + 1):
+            b = self._blocks.get(n)
+            if b is not None:
+                out.extend(b.logs)
+        return out
 
     async def get_latest_block_number(self) -> int:
         return max(self._blocks) if self._blocks else 0

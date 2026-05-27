@@ -64,7 +64,7 @@ def test_create_chain_persists_and_publishes(db: Database) -> None:
     assert msg["id"] == "eth-mainnet"
 
 
-def test_list_chains_returns_only_enabled(db: Database) -> None:
+def test_list_chains_returns_all(db: Database) -> None:
     bus = _FakeBus()
     with _client(db, bus) as c:
         c.post("/api/chains", json={
@@ -78,7 +78,7 @@ def test_list_chains_returns_only_enabled(db: Database) -> None:
         r = c.get("/api/chains")
     assert r.status_code == 200
     ids = sorted(x["id"] for x in r.json())
-    assert ids == ["eth-mainnet"]
+    assert ids == ["bsc", "eth-mainnet"]
 
 
 def test_get_chain_by_id_404(db: Database) -> None:

@@ -130,6 +130,7 @@ class EvmAdapter:
                     address=str(lg["address"]),
                     topics=[_hexify(t) for t in lg["topics"]],
                     data=lg["data"] if isinstance(lg["data"], str) else _hexify(lg["data"]),
+                    block_number=int(lg["blockNumber"]),
                 )
             )
         return out

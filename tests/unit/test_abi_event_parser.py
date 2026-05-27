@@ -44,6 +44,7 @@ def _transfer_log(topic0: str = _TOPIC0, value_hex: str = "0x" + "0" * 62 + "7b"
         tx_hash="0xtA", log_index=0, address="0xcafe",
         topics=[topic0, "0x" + _PAD + _FROM, "0x" + _PAD + _TO],
         data=value_hex,
+        block_number=42,
     )
 
 
@@ -89,6 +90,7 @@ def test_downgrade_when_decode_raises() -> None:
         tx_hash="0xtA", log_index=1, address="0xcafe",
         topics=[_TOPIC0, "0x" + _PAD + _FROM, "0x" + _PAD + _TO],
         data="0xdead",
+        block_number=42,
     )
     events = list(p.parse(_block([bad])))
     assert len(events) == 1
@@ -100,7 +102,7 @@ def test_downgrade_when_decode_raises() -> None:
 def test_empty_topics_log_is_skipped_not_downgraded() -> None:
     reg = _registry_with_transfer()
     p = AbiEventParser(chain_id="eth-mainnet", registry=reg)
-    anon = Log(tx_hash="0xtA", log_index=0, address="0xcafe", topics=[], data="0xff")
+    anon = Log(tx_hash="0xtA", log_index=0, address="0xcafe", topics=[], data="0xff", block_number=42)
     events = list(p.parse(_block([anon])))
     assert events == []
 
@@ -111,7 +113,7 @@ def test_emits_one_event_per_log() -> None:
     logs = [
         _transfer_log(value_hex="0x" + "0" * 63 + "1"),
         Log(tx_hash="0xtA", log_index=1, address="0xcafe",
-            topics=["0xfeed" + "00" * 30], data="0x"),
+            topics=["0xfeed" + "00" * 30], data="0x", block_number=42),
     ]
     events = list(p.parse(_block(logs)))
     assert [e.name for e in events] == ["Transfer", None]

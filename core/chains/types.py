@@ -29,6 +29,7 @@ class Log:
     address: str
     topics: list[str]
     data: str  # hex string with 0x
+    block_number: int
 
 
 @dataclass(frozen=True)

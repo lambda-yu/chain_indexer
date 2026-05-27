@@ -303,6 +303,7 @@ def _block_with_erc20_log(n: int, *, value: int = 1000) -> Block:
                     "0x" + pad + _to,
                 ],
                 data="0x" + format(value, "064x"),
+                block_number=n,
             ),
         ],
     )

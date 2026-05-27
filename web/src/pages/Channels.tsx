@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
 import { Plus, Trash2, Pencil } from 'lucide-react'
@@ -70,13 +70,32 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
   const mut = isEdit ? updateMut : createMut
   const cfg = initial?.config ?? {}
 
+  // Parse redis_url back to host/port/db/password for edit回填
+  const redisParts = useMemo(() => {
+    const url = String(cfg.redis_url ?? '')
+    if (!url) return { host: '', port: '', db: '', password: '' }
+    try {
+      const m = url.match(/^redis:\/\/(?::(.+)@)?([^:/?]+):?(\d+)?\/(\d+)?/)
+      return { host: m?.[2] ?? '', port: m?.[3] ?? '6379', db: m?.[4] ?? '0', password: m?.[1] ?? '' }
+    } catch { return { host: '', port: '', db: '', password: '' } }
+  }, [cfg.redis_url])
+
   const submit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault(); const fd = new FormData(e.currentTarget)
     let config: Record<string, unknown> = {}
     if (actualType === 'http') {
       config = { url: fd.get('url'), method: fd.get('method') || 'POST', ...(fd.get('hmac_secret') ? { hmac_secret: fd.get('hmac_secret') } : {}), ...(fd.get('timeout_seconds') ? { timeout_seconds: Number(fd.get('timeout_seconds')) } : {}) }
     } else if (actualType === 'mq') {
-      config = { stream: fd.get('stream'), ...(fd.get('redis_url') ? { redis_url: fd.get('redis_url') } : {}), ...(fd.get('maxlen') ? { maxlen: Number(fd.get('maxlen')) } : {}) }
+      const host = fd.get('redis_host') as string
+      const port = fd.get('redis_port') as string
+      const db = fd.get('redis_db') as string
+      const pwd = fd.get('redis_password') as string
+      let redis_url = ''
+      if (host) {
+        const auth = pwd ? `:${pwd}@` : ''
+        redis_url = `redis://${auth}${host}:${port || '6379'}/${db || '0'}`
+      }
+      config = { stream: fd.get('stream'), ...(redis_url ? { redis_url } : {}), ...(fd.get('maxlen') ? { maxlen: Number(fd.get('maxlen')) } : {}) }
     } else if (actualType === 'kafka') {
       config = { bootstrap_servers: fd.get('bootstrap_servers'), topic: fd.get('topic'), ...(fd.get('key') ? { key: fd.get('key') } : {}), ...(fd.get('compression_type') && fd.get('compression_type') !== 'none' ? { compression_type: fd.get('compression_type') } : {}) }
     } else if (actualType === 'rabbitmq') {
@@ -121,7 +140,13 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
 
             {/* Redis Streams 配置 */}
             {mqDriver === 'mq' && <>
-              <input name="redis_url" defaultValue={String(cfg.redis_url ?? '')} placeholder="Redis URL（可选，留空用默认连接）" className="w-full border rounded px-3 py-1.5 text-sm" />
+              <p className="text-xs text-gray-500">Redis 连接（可选，留空用 Worker 默认连接）</p>
+              <div className="grid grid-cols-3 gap-2">
+                <input name="redis_host" defaultValue={redisParts.host} placeholder="Host" className="border rounded px-3 py-1.5 text-sm" />
+                <input name="redis_port" type="number" defaultValue={redisParts.port || undefined} placeholder="端口 (6379)" className="border rounded px-3 py-1.5 text-sm" />
+                <input name="redis_db" type="number" defaultValue={redisParts.db || undefined} placeholder="DB (0)" className="border rounded px-3 py-1.5 text-sm" />
+              </div>
+              <input name="redis_password" defaultValue={redisParts.password} placeholder="Redis 密码（可选）" type="password" className="w-full border rounded px-3 py-1.5 text-sm" />
               <input name="stream" defaultValue={String(cfg.stream ?? '')} placeholder="Stream 名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
               <input name="maxlen" type="number" defaultValue={cfg.maxlen ? Number(cfg.maxlen) : undefined} placeholder="最大长度（可选，MAXLEN ~ N）" className="w-full border rounded px-3 py-1.5 text-sm" />
             </>}

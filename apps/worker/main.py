@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import structlog
 
+import uuid as _uuid_mod
+
 from apps.worker.chain_runner import ChainRunner
 from apps.worker.config_watcher import ConfigWatcher
 from core.abi.registry import AbiRegistry
@@ -99,6 +101,8 @@ class _Worker:
         self._snap_queue: asyncio.Queue[ConfigSnapshot] = asyncio.Queue(maxsize=8)
         self._watcher: ConfigWatcher | None = None
         self._runners: dict[str, tuple[ChainRunner, asyncio.Task[None]]] = {}
+        self._locks: dict[str, Any] = {}
+        self._worker_id = str(_uuid_mod.uuid4())[:8]
         self._stop = asyncio.Event()
         self._ready = ready_event
 
@@ -121,6 +125,7 @@ class _Worker:
             log.error("worker.failed_delivery_save_error")
 
     async def start(self) -> None:
+        log.info("worker.starting", worker_id=self._worker_id)
         await self._db.connect()
         await self._bus.connect()
         from core.logging import set_log_redis_client
@@ -168,16 +173,25 @@ class _Worker:
                     t.cancel()
 
     async def _reconcile(self, snap: ConfigSnapshot) -> None:
+        from core.worker.chain_lock import ChainLock
         self._registry.refresh(snap)
         enabled = {c.id: c for c in snap.chains}
+        # Stop runners for disabled/removed chains + release locks
         for chain_id in list(self._runners):
             if chain_id not in enabled:
                 await self._stop_runner(chain_id)
+                if chain_id in self._locks:
+                    await self._locks.pop(chain_id).release()
         for chain_id, cfg in enabled.items():
             if chain_id in self._runners:
                 runner, _ = self._runners[chain_id]
                 await runner.apply_snapshot(snap)
             else:
+                # Try to acquire distributed lock
+                lock = ChainLock(self._bus.client, chain_id, self._worker_id)
+                if not await lock.acquire():
+                    continue
+                self._locks[chain_id] = lock
                 runner = ChainRunner(
                     chain=cfg,
                     adapter_factory=_default_adapter_factory,
@@ -190,10 +204,12 @@ class _Worker:
                     await runner.start(snap)
                 except Exception as exc:  # noqa: BLE001
                     log.error("worker.chain_runner_start_failed", chain_id=chain_id, error=repr(exc))
+                    await lock.release()
+                    self._locks.pop(chain_id, None)
                     continue
                 task = asyncio.create_task(runner.run(), name=f"chain-runner:{chain_id}")
                 self._runners[chain_id] = (runner, task)
-                log.info("worker.chain_runner_started", chain_id=chain_id)
+                log.info("worker.chain_runner_started", chain_id=chain_id, worker_id=self._worker_id)
 
     async def _stop_runner(self, chain_id: str) -> None:
         runner, task = self._runners.pop(chain_id)
@@ -227,6 +243,13 @@ class _Worker:
                 *(self._stop_runner(cid) for cid in list(self._runners)),
                 return_exceptions=False,
             )
+        # Release all distributed locks
+        for chain_id, lock in list(self._locks.items()):
+            try:
+                await lock.release()
+            except Exception:  # noqa: BLE001
+                pass
+        self._locks.clear()
         await self._bus.disconnect()
         await self._db.disconnect()
         log.info("worker.shutdown_complete")

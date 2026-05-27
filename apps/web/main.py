@@ -113,20 +113,28 @@ def create_app(
     spa_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "web" / "dist"
     if spa_dir.is_dir():
         from fastapi.staticfiles import StaticFiles
-        from starlette.responses import FileResponse
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.responses import FileResponse as _FileResponse
 
-        # Serve static assets (JS/CSS/images) under /assets
         assets_dir = spa_dir / "assets"
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-        # SPA fallback: any non-API GET returns index.html
-        @app.get("/{path:path}", include_in_schema=False)
-        async def spa_fallback(path: str) -> FileResponse:
-            file_path = spa_dir / path
-            if file_path.is_file() and ".." not in path:
-                return FileResponse(str(file_path))
-            return FileResponse(str(spa_dir / "index.html"))
+        index_html = spa_dir / "index.html"
+
+        class _SPAFallbackMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Any, call_next: Any) -> Any:
+                response = await call_next(request)
+                if (
+                    response.status_code == 404
+                    and request.method == "GET"
+                    and not request.url.path.startswith(("/api", "/ws", "/healthz", "/assets"))
+                    and index_html.is_file()
+                ):
+                    return _FileResponse(str(index_html))
+                return response
+
+        app.add_middleware(_SPAFallbackMiddleware)
 
     return app
 

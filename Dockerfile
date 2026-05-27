@@ -9,7 +9,7 @@ FROM python:3.11-slim AS backend
 WORKDIR /app
 RUN pip install uv
 COPY pyproject.toml uv.lock ./
-RUN uv sync --no-dev --frozen --extra postgres --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN uv sync --no-dev --frozen --extra postgres
 COPY core/ core/
 COPY apps/ apps/
 COPY scripts/ scripts/

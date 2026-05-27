@@ -102,6 +102,24 @@ class _Worker:
         self._stop = asyncio.Event()
         self._ready = ready_event
 
+    async def _on_delivery_failure(
+        self, subscription_id: str, channel_id: str, chain_id: str,
+        payload: dict, error: str,
+    ) -> None:
+        from core.config.repositories import FailedDeliveryRepo
+        try:
+            async with self._db.session() as s:
+                await FailedDeliveryRepo(s).create(
+                    subscription_id=subscription_id,
+                    channel_id=channel_id,
+                    chain_id=chain_id,
+                    event_payload=payload,
+                    error=error,
+                )
+                await s.commit()
+        except Exception:  # noqa: BLE001
+            log.error("worker.failed_delivery_save_error")
+
     async def start(self) -> None:
         await self._db.connect()
         await self._bus.connect()
@@ -164,6 +182,7 @@ class _Worker:
                     channel_factory=_make_channel_factory(self._bus),
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,
+                    on_send_failure=self._on_delivery_failure,
                 )
                 try:
                     await runner.start(snap)

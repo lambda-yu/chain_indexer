@@ -147,3 +147,28 @@ class ConfigVersion(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
+class DeliveryStatus(enum.StrEnum):
+    failed = "failed"
+    retrying = "retrying"
+    resolved = "resolved"
+
+
+class FailedDelivery(Base):
+    __tablename__ = "failed_deliveries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    subscription_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    chain_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    error: Mapped[str] = mapped_column(Text, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[DeliveryStatus] = mapped_column(
+        SAEnum(DeliveryStatus, name="delivery_status"), nullable=False, default=DeliveryStatus.failed
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

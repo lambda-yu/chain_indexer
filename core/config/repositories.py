@@ -16,6 +16,7 @@ from core.config.models import (
     ChannelType,
     Checkpoint,
     ConfigVersion,
+    FailedDelivery,
     MatchKind,
     Subscription,
     SubscriptionChannel,
@@ -236,3 +237,54 @@ class ConfigVersionRepo:
         row.version += 1
         await self.s.flush()
         return row.version
+
+
+class FailedDeliveryRepo:
+    def __init__(self, session: AsyncSession) -> None:
+        self.s = session
+
+    async def create(
+        self, *, subscription_id: str, channel_id: str, chain_id: str,
+        event_payload: dict[str, Any], error: str, attempts: int = 1,
+    ) -> FailedDelivery:
+        from core.config.models import DeliveryStatus
+        row = FailedDelivery(
+            subscription_id=subscription_id, channel_id=channel_id, chain_id=chain_id,
+            event_payload=event_payload, error=error, attempts=attempts,
+            status=DeliveryStatus.failed,
+        )
+        self.s.add(row)
+        await self.s.flush()
+        return row
+
+    async def get(self, delivery_id: str) -> FailedDelivery | None:
+        r = await self.s.execute(select(FailedDelivery).where(FailedDelivery.id == delivery_id))
+        return r.scalar_one_or_none()
+
+    async def list_failed(self, limit: int = 100) -> list[FailedDelivery]:
+        from core.config.models import DeliveryStatus
+        r = await self.s.execute(
+            select(FailedDelivery)
+            .where(FailedDelivery.status == DeliveryStatus.failed)
+            .order_by(FailedDelivery.created_at.desc())
+            .limit(limit)
+        )
+        return list(r.scalars().all())
+
+    async def list_all(self, limit: int = 100) -> list[FailedDelivery]:
+        r = await self.s.execute(
+            select(FailedDelivery).order_by(FailedDelivery.created_at.desc()).limit(limit)
+        )
+        return list(r.scalars().all())
+
+    async def mark_resolved(self, delivery_id: str) -> None:
+        from datetime import datetime, timezone
+        from core.config.models import DeliveryStatus
+        await self.s.execute(
+            sa_update(FailedDelivery)
+            .where(FailedDelivery.id == delivery_id)
+            .values(status=DeliveryStatus.resolved, resolved_at=datetime.now(timezone.utc))
+        )
+
+    async def delete(self, delivery_id: str) -> None:
+        await self.s.execute(sa_delete(FailedDelivery).where(FailedDelivery.id == delivery_id))

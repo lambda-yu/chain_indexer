@@ -19,35 +19,24 @@ def _default_factory(cfg: SnapshotChannel) -> Channel:
     return cls(config=cfg.config)  # type: ignore[call-arg]
 
 
+FailureCallback = Callable[[str, str, str, dict[str, Any], str], Any] | None
+
+
 class Notifier:
-    """Owns instantiated channels and dispatches events to them concurrently.
-
-    A bounded `asyncio.Semaphore` (default 50) caps total in-flight sends across
-    all channels held by this `Notifier` instance. Spec §6.1 specifies a *per-chain*
-    semaphore — the worker (Chunk 7) instantiates one `Notifier` per chain, so the
-    per-instance limit here IS the per-chain limit. Do not share a single `Notifier`
-    across chains; that would conflate the two budgets.
-
-    The semaphore is built lazily on the first `_send_one` call so it binds to
-    the running loop. Constructing a `Notifier` outside a running loop (e.g.
-    inside a sync fixture body) used to crash at first `send` with
-    `RuntimeError: ... bound to a different event loop`.
-
-    Failures in one channel do not block sibling channels — each `send` is wrapped
-    to log-and-continue, and `asyncio.gather(..., return_exceptions=True)` is used
-    defensively so a bug *outside* the `try` in `_send_one` cannot cancel siblings.
-    """
+    """Owns instantiated channels and dispatches events to them concurrently."""
 
     def __init__(
         self,
         *,
         channel_factory: Callable[[SnapshotChannel], Channel] = _default_factory,
         max_concurrency: int = 50,
+        on_failure: FailureCallback = None,
     ) -> None:
         self._factory = channel_factory
         self._max_concurrency = max_concurrency
         self._sem: asyncio.Semaphore | None = None
         self._channels: dict[str, Channel] = {}
+        self._on_failure = on_failure
 
     def _get_sem(self) -> asyncio.Semaphore:
         if self._sem is None:
@@ -96,10 +85,20 @@ class Notifier:
         async with self._get_sem():
             try:
                 await ch.send(payload)
-            except Exception:  # noqa: BLE001 — log-only per spec §9
-                log.exception(
+            except Exception as exc:  # noqa: BLE001
+                log.error(
                     "notifier.send_failed",
                     subscription_id=subscription_id,
                     channel_id=channel_id,
                     delivery_id=payload.get("delivery_id"),
+                    error=repr(exc),
                 )
+                if self._on_failure:
+                    try:
+                        await self._on_failure(
+                            subscription_id, channel_id,
+                            payload.get("chain_id", ""),
+                            payload, repr(exc),
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.error("notifier.on_failure_callback_error")

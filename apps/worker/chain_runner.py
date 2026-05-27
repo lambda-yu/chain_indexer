@@ -59,6 +59,7 @@ class ChainRunner:
         checkpoint_repo: _CheckpointRepo,
         notifier_max_concurrency: int = 50,
         abi_registry: AbiRegistry | None = None,
+        on_send_failure: Any = None,
     ) -> None:
         self._chain = chain
         self._adapter_factory = adapter_factory
@@ -66,6 +67,7 @@ class ChainRunner:
         self._cp = checkpoint_repo
         self._notifier_max_concurrency = notifier_max_concurrency
         self._abi_registry = abi_registry
+        self._on_send_failure = on_send_failure
 
         self._adapter: Any = None
         self._buffer: ConfirmationBuffer | None = None
@@ -128,6 +130,7 @@ class ChainRunner:
         self._notifier = Notifier(
             channel_factory=self._channel_factory,
             max_concurrency=self._notifier_max_concurrency,
+            on_failure=self._on_send_failure,
         )
         await self._notifier.start(snap.channels)
         self._current_snap = snap

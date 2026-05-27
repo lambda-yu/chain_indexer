@@ -13,7 +13,7 @@ The indexer's hottest cost center is RPC traffic to upstream chain nodes (Alchem
 2. **Catchup is fully serial.** `ChainRunner._catchup_evm` and `_catchup_solana` loop block-by-block; a 10k-block gap = 10k RTTs even though `eth_getLogs` natively supports `fromBlock`/`toBlock` ranges and Solana supports `getBlocks(start, end)`.
 3. **Solana hits empty/skipped slots.** Every slot is fetched via `getBlock(slot)`; on mainnet 5–20% of slots are skipped and return `result: null`, wasting an RPC round trip each.
 
-Hidden bonus: subscriptions with `match_kind ∈ {native_transfer, call, internal_call}` do not need `eth_getLogs` at all. The current pipeline calls it unconditionally.
+Hidden bonus: subscriptions with `match_kind ∈ {native_transfer, call}` do not need `eth_getLogs` at all (internal calls also surface with `match_kind="call"` since `InternalCallParser` emits `Event.kind="call"`). The current pipeline calls it unconditionally. The actual `MatchKind` enum is `{native_transfer, token_transfer, event, call}` — only `event` and `token_transfer` consume logs.
 
 ## Goals
 
@@ -71,7 +71,7 @@ Two new fields on `chains` table (Alembic migration `0006_rpc_range_config.py`):
 | Column | Type | Default | Applies To | Purpose |
 |--------|------|---------|------------|---------|
 | `log_query_range_blocks` | `Integer NOT NULL` | `100` | EVM | Max block span per `eth_getLogs` call during catchup |
-| `slot_query_range_blocks` | `Integer NOT NULL` | `1000` | Solana | Max slot span per `getBlocks` call during catchup |
+| `slot_query_range_blocks` | `Integer NOT NULL` | `1000` | Solana | Max slot span per `getBlocks` call during catchup (name uses "blocks" for symmetry with the EVM field and the `getBlocks` RPC method name; the unit is slots) |
 
 Both fields are present on every row regardless of chain `kind` (no kind-conditional schema), but only consumed by the matching adapter type. This avoids a sparse schema or a JSON config blob.
 
@@ -97,7 +97,12 @@ class EvmLogFilterSet:
 
     @property
     def topics_param(self) -> list[list[str]] | None:
-        """Shape for eth_getLogs `topics` field: [[t0a, t0b, ...]] or None."""
+        """Shape for eth_getLogs `topics` field: [[t0a, t0b, ...]] or None.
+
+        Outer position 0 matches log topic 0 (event signature). The inner
+        list is OR-of-topic0-candidates — RPC returns any log whose first
+        topic is in the set.
+        """
         return [self.topic0s] if self.topic0s else None
 
 
@@ -123,7 +128,7 @@ def build_evm_log_filter(
      - `match_kind == "event"`:
        - If `s.abi_id is None` or `s.match_name is None` → return early with `topic0s = None` (cannot compute; fall back to full topic scan).
        - Look up event signature in `abi_registry`; if not found → `topic0s = None` (consistent with user's "any miss → drop topic filter" decision).
-       - Compute `keccak(signature_canonical)[:32]` and add hex.
+       - Compute the topic0 via the existing `event_topic0(...)` helper in `core/abi/decoder.py` (keccak256 of the canonical event signature, already 32 bytes — no slicing).
    - `topic0s = sorted(topics)` if not bailed.
 5. Return `EvmLogFilterSet(addresses, topic0s, skip_logs=False)`.
 
@@ -136,7 +141,7 @@ def build_evm_log_filter(
 | Any relevant sub has `address=None` | **None** | derived | False |
 | All events have abi_id + match_name (computable) | concrete | computed + ERC20 | False |
 | Any event missing abi_id / match_name / signature lookup | concrete | **None** | False |
-| Both missing | None | None | False (still uses range query, saves RTT) |
+| Both missing | None | None | False (range query still used in catchup, saves per-block RTTs) |
 
 **Helpers needed in `AbiRegistry`**: existing `lookup_event_by_topic0` is reverse direction. We need forward: signature → topic0 hash. If not exposed, add `event_signature_to_topic0(abi_id, event_name) -> str | None`.
 
@@ -226,7 +231,12 @@ while start_n <= safe_tip:
     start_n = end_n + 1
 ```
 
-**New helper**: `_process_block_with_prefetched_logs(n, prefetched_logs, ...)` is a refactor of `_process_confirmed_block` that accepts `logs` directly instead of calling `fetch_logs(n, n)`. The head-following path passes a freshly-fetched list; catchup passes the bucketed slice. The block itself is still fetched per-block (we do not change block fetching in this design).
+**New helper**: `_process_block_with_prefetched_logs(n, prefetched_logs, ...)` is a refactor of `_process_confirmed_block` that accepts `logs` directly instead of calling `fetch_logs(n, n)`.
+
+**Refactoring contract**:
+- `_process_confirmed_block` stays as the **head-following entrypoint** — it owns the `asyncio.gather(block_coro, logs_coro)` concurrency (or single fetch when `skip_logs`), then calls `_process_block_with_prefetched_logs(n, logs, ...)` with the resolved logs.
+- Catchup calls `_process_block_with_prefetched_logs` directly with logs taken from the range-query bucket (no per-block `fetch_logs`).
+- The inner helper still owns `fetch_block`, parser dispatch, trace handling, matcher, notifier, checkpoint save — only the `logs` source differs.
 
 **Degradation helper** `_fetch_logs_with_degrade`:
 
@@ -245,11 +255,17 @@ async def _fetch_logs_with_degrade(
         return _bucket_by_block(logs)
     except Exception as exc:
         msg = str(exc).lower()
-        if any(h in msg for h in DEGRADE_ERR_HINTS) and end > start:
-            mid = (start + end) // 2
-            left = await self._fetch_logs_with_degrade(start, mid, filter)
-            right = await self._fetch_logs_with_degrade(mid + 1, end, filter)
-            return {**left, **right}
+        if any(h in msg for h in DEGRADE_ERR_HINTS):
+            if end > start:
+                mid = (start + end) // 2
+                left = await self._fetch_logs_with_degrade(start, mid, filter)
+                right = await self._fetch_logs_with_degrade(mid + 1, end, filter)
+                return {**left, **right}
+            # Single-block floor still failing — log and re-raise. This can
+            # happen on extremely active contracts (e.g. Polygon archive nodes
+            # have been observed returning "too large" for a single block).
+            log.error("chain_runner.fetch_logs_single_block_too_large",
+                      chain_id=self._chain.id, block=start)
         raise
 ```
 
@@ -311,9 +327,11 @@ Head-following Solana path is unchanged (one slot at a time).
 
 | Failure | Behavior |
 |---------|----------|
-| `eth_getLogs` returns "too large"-class error | Binary-split the window down to single block; if single block still fails, propagate |
+| `eth_getLogs` returns "too large"-class error, range > 1 | Binary-split the window |
+| `eth_getLogs` returns "too large"-class error, single block | Log error + propagate (no degrade path remaining) |
 | `eth_getLogs` returns network error | Propagate; `ChainRunner` catches and aborts current catchup iteration (existing behavior) |
-| `getBlocks` returns network error | Log warning + degrade to dense iteration over `[start, end]` for that window only |
+| `getBlocks` returns "range too large" / size-limit error | Treat as config error: log + raise (this is a misconfigured `slot_query_range_blocks`, not a transient failure) |
+| `getBlocks` returns network / transient error | Log warning + degrade to dense iteration over `[start, end]` for that window only |
 | Topic0 keccak computation fails | Builder drops topic filter for entire chain (consistent with approved policy) |
 | `Log.block_number` mismatch with bucket key | Skip the log with warning (defensive; should never happen with conformant RPCs) |
 
@@ -340,30 +358,38 @@ Head-following Solana path is unchanged (one slot at a time).
 
 Each step is independently committable, testable, and adds no broken state in between.
 
-1. **Schema + snapshot wiring**
+1. **Schema migration + model**
    - Alembic `0006_rpc_range_config.py`
-   - `Chain` model + `SnapshotChain` + repos + web schemas + UI form (UI may lag, API-only is enough)
+   - `Chain` model: `log_query_range_blocks` (Integer NOT NULL DEFAULT 100), `slot_query_range_blocks` (Integer NOT NULL DEFAULT 1000)
    - Default values applied to existing rows on migration
-2. **`Log.block_number` field**
-   - Add to dataclass, populate in `EvmAdapter.fetch_logs`, audit consumers
-3. **`EvmLogFilterSet` + builder**
+2. **Snapshot + repos + web schema wiring**
+   - `SnapshotChain` propagates both fields
+   - `ChainRepo` reads/writes
+   - `apps/web/schemas.py` request/response models
+   - `apps/web/routers/chains.py` accepts on POST/PATCH
+   - `web/src/pages/Chains.tsx` form input (optional; API-only is enough for first cut)
+3. **`Log.block_number` field**
+   - Add to dataclass, populate in `EvmAdapter.fetch_logs`, audit consumers (grep `Log(` across codebase)
+4. **`EvmLogFilterSet` + builder**
    - New file + unit tests
-4. **`EvmAdapter.fetch_logs` topics parameter**
+5. **`EvmAdapter.fetch_logs` topics parameter**
    - Signature change + unit test for parameter passthrough
-5. **`ChainRunner` head-following filter integration**
+6. **`ChainRunner` head-following filter integration**
    - Build filter in `start` / `apply_snapshot`; use in `_process_confirmed_block`
    - Verify existing tests still pass
-6. **`ChainRunner._catchup_evm` range query + degradation**
+7. **`ChainRunner._catchup_evm` range query + degradation**
    - Bucket helper + degrade helper + main loop refactor
    - New unit tests
-7. **`SolanaAdapter.get_blocks`**
+8. **`SolanaAdapter.get_blocks`**
    - Method + unit test
-8. **`ChainRunner._catchup_solana` range + skip integration**
+9. **`ChainRunner._catchup_solana` range + skip integration**
    - Main loop refactor + degrade fallback
    - New unit tests
-9. **E2E coverage**
-   - anvil + solana validator scenarios
-10. **Docs**: update `CLAUDE.md` quick reference if any new config knob mentioned
+10. **E2E coverage**
+    - anvil + solana validator scenarios
+11. **Docs**: update `CLAUDE.md` quick reference if any new config knob mentioned
+
+**Trace path note**: `_process_confirmed_block` also conditionally invokes `trace_block(number)` when `chain.trace_internal_calls=True`. This path is independent of logs and remains unchanged — trace events are produced from EVM call traces, not from `eth_getLogs` responses.
 
 ## Rollout / Safety
 

@@ -4,6 +4,7 @@ from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,12 +52,17 @@ def _match_event(event: Event, matcher: Matcher) -> list[dict[str, Any]]:
 
 def _safe_dict(obj: Any) -> Any:
     if isinstance(obj, bytes):
-        return "0x" + obj.hex()
+        try:
+            return "0x" + obj.hex()
+        except Exception:
+            return repr(obj)
     if isinstance(obj, dict):
-        return {k: _safe_dict(v) for k, v in obj.items()}
-    if isinstance(obj, list):
+        return {str(k): _safe_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
         return [_safe_dict(v) for v in obj]
-    return obj
+    if isinstance(obj, (int, float, bool, str)) or obj is None:
+        return obj
+    return str(obj)
 
 
 def _enrich_events(events: list[Event], matcher: Matcher) -> list[dict[str, Any]]:
@@ -74,13 +80,14 @@ def _enrich_events(events: list[Event], matcher: Matcher) -> list[dict[str, Any]
 async def parse_block(
     req: ParseBlockRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
-) -> dict[str, Any]:
+) -> JSONResponse:
     try:
-        return await _do_parse_block(req, session)
+        data = await _do_parse_block(req, session)
+        return JSONResponse(content=data)
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"解析失败: {exc!r}") from exc
+        return JSONResponse(status_code=500, content={"detail": f"解析失败: {exc!r}"})
 
 
 async def _do_parse_block(

@@ -150,7 +150,11 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
               <label className="text-xs text-gray-500">选择 ABI</label>
               <select value={abiId} onChange={e => { setAbiId(e.target.value); setMatchName(''); setSelectedNames([]) }} className="w-full border rounded px-3 py-1.5 text-sm">
                 <option value="">不绑定 ABI（手动输入）</option>
-                {abis.map(a => <option key={a.id} value={a.id}>{a.name} ({a.kind})</option>)}
+                {abis.map(a => {
+                  const ec = extractAbiNames(a.body, 'event').length
+                  const fc = extractAbiNames(a.body, 'function').length
+                  return <option key={a.id} value={a.id}>{a.name} — {ec} 事件, {fc} 函数</option>
+                })}
               </select>
             </div>
             {abiId && nameOptions.length > 0 && (
@@ -170,7 +174,15 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
               </div>
             )}
             {abiId && nameOptions.length === 0 && (
-              <p className="text-xs text-gray-400">该 ABI 中没有{matchKind === 'event' ? '事件' : '函数'}定义</p>
+              <p className="text-xs text-yellow-600">
+                该 ABI 中没有{matchKind === 'event' ? '事件（event）' : '函数（function）'}定义。
+                {(() => {
+                  if (!selectedAbi) return ''
+                  const otherType = matchKind === 'event' ? 'function' : 'event'
+                  const otherCount = extractAbiNames(selectedAbi.body, otherType as 'event' | 'function').length
+                  return otherCount > 0 ? ` 但有 ${otherCount} 个${otherType === 'event' ? '事件' : '函数'}，请切换类型。` : ''
+                })()}
+              </p>
             )}
             {!abiId && (
               <input value={matchName} onChange={e => setMatchName(e.target.value)} placeholder="手动输入匹配名称（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />

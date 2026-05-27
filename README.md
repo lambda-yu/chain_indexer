@@ -52,6 +52,33 @@ Multi-chain block indexer with pluggable notification channels. Indexes **EVM** 
 
 ## Quick Start
 
+### Docker 一键启动（推荐）
+
+```bash
+git clone https://github.com/lambda-yu/chain_indexer.git
+cd chain_indexer
+make up
+```
+
+启动 5 个服务：PostgreSQL + Redis + 数据库迁移 + API 服务 + Worker 进程。
+
+- **Web UI**: http://localhost:8000
+- **API**: http://localhost:8000/api
+- **健康检查**: http://localhost:8000/healthz
+
+```bash
+make logs    # 查看 web + worker 日志
+make down    # 停止所有服务
+
+# 水平扩展 worker
+docker compose up -d --scale worker=3
+
+# 强制重建（代码更新后）
+docker compose build --no-cache && docker compose up -d
+```
+
+### 本地开发（不用 Docker）
+
 ### Prerequisites
 
 - Python 3.11+

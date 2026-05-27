@@ -54,7 +54,10 @@ async def parse_block(
             rpc_ws=chain_row.rpc_ws,
             confirmations=chain_row.confirmations,
         )
-        await adapter.connect()
+        try:
+            await adapter.connect()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"RPC 连接失败: {exc!r}") from exc
         try:
             block = await adapter.fetch_block(req.block_number)
             logs = await adapter.fetch_logs(req.block_number, req.block_number)
@@ -89,6 +92,8 @@ async def parse_block(
             commitment=chain_row.commitment,
         )
         await adapter_sol.connect()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"RPC 连接失败: {exc!r}") from exc
         try:
             sol_block = await adapter_sol.fetch_block(req.block_number)
             if sol_block is None:

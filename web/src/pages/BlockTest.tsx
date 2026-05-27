@@ -24,7 +24,10 @@ export default function BlockTest() {
       const res = await api.post<ParseResult>('/test/parse-block', { chain_id: chainId, block_number: Number(blockNum) })
       setResult(res)
     } catch (err) {
-      setError(String(err))
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('502')) setError('RPC 连接失败，请检查链配置中的 RPC 地址是否正确且可访问。')
+      else if (msg.includes('404')) setError('链不存在，请先在"链配置"页面添加。')
+      else setError(msg)
     } finally { setLoading(false) }
   }
 

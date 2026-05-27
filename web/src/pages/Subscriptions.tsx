@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
-import { Plus, Trash2, Pencil } from 'lucide-react'
+import { Plus, Trash2, Pencil, FlaskConical } from 'lucide-react'
 
 interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null }
 interface AbiItem { id: string; name: string; kind: string; body: unknown }
@@ -10,6 +10,7 @@ export default function Subscriptions() {
   const qc = useQueryClient()
   const [editing, setEditing] = useState<Sub | null>(null)
   const [showForm, setShowForm] = useState(false)
+  const [testingSub, setTestingSub] = useState<Sub | null>(null)
   const { data: subs = [], isLoading } = useQuery<Sub[]>({ queryKey: ['subscriptions'], queryFn: () => api.get('/subscriptions') })
   const { data: abis = [] } = useQuery<AbiItem[]>({ queryKey: ['abis'], queryFn: () => api.get('/abis') })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/subscriptions/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['subscriptions'] }) })
@@ -38,14 +39,16 @@ export default function Subscriptions() {
               <td className="py-2 px-2 font-mono text-xs">{s.start_block?.toLocaleString() ?? '—'}</td>
               <td className="py-2 px-2">{s.enabled ? <span className="text-green-600">是</span> : <span className="text-gray-400">否</span>}</td>
               <td className="py-2 px-2 flex gap-2">
-                <button onClick={() => { setEditing(s); setShowForm(true) }} className="text-blue-500 hover:text-blue-700"><Pencil size={14} /></button>
-                <button onClick={() => delMut.mutate(s.id)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button>
+                <button onClick={() => setTestingSub(s)} className="text-orange-500 hover:text-orange-700" title="测试"><FlaskConical size={14} /></button>
+                <button onClick={() => { setEditing(s); setShowForm(true) }} className="text-blue-500 hover:text-blue-700" title="编辑"><Pencil size={14} /></button>
+                <button onClick={() => delMut.mutate(s.id)} className="text-red-500 hover:text-red-700" title="删除"><Trash2 size={14} /></button>
               </td>
             </tr>
           ))}</tbody>
         </table>
       )}
       {showForm && <SubForm initial={editing} abis={abis} onClose={() => { setShowForm(false); setEditing(null) }} />}
+      {testingSub && <TestSubModal sub={testingSub} onClose={() => setTestingSub(null)} />}
     </div>
   )
 }
@@ -258,6 +261,108 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         </div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
+    </div>
+  )
+}
+
+function TestSubModal({ sub, onClose }: { sub: Sub; onClose: () => void }) {
+  const [blockNum, setBlockNum] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState<Record<string, unknown> | null>(null)
+  const [error, setError] = useState('')
+
+  const run = async () => {
+    if (!blockNum) return
+    setLoading(true); setError(''); setResult(null)
+    try {
+      const res = await api.post<Record<string, unknown>>('/test/test-subscription', {
+        subscription_id: sub.id, block_number: Number(blockNum),
+      })
+      setResult(res)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally { setLoading(false) }
+  }
+
+  const matched = (result?.matched as number) ?? 0
+  const delivered = (result?.delivered as number) ?? 0
+  const events = (result?.events as Record<string, unknown>[]) ?? []
+  const channels = (result?.channels as { id: string; name: string; type: string }[]) ?? []
+
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg p-6 w-[520px] max-h-[85vh] overflow-auto">
+        <h3 className="text-lg font-bold mb-1">测试订阅规则</h3>
+        <p className="text-xs text-gray-500 mb-3">
+          <span className="font-medium">{sub.name}</span> — {sub.match_kind}{sub.match_name ? ` / ${sub.match_name}` : ''} @ {sub.chain_id}
+        </p>
+
+        <div className="flex items-end gap-2 mb-4">
+          <div className="flex-1">
+            <label className="text-xs text-gray-500 block mb-1">区块号</label>
+            <input value={blockNum} onChange={e => setBlockNum(e.target.value)} type="number" placeholder="输入区块号" className="w-full border rounded px-3 py-1.5 text-sm" />
+          </div>
+          <button onClick={run} disabled={loading || !blockNum} className="bg-black text-white px-4 py-1.5 rounded text-sm disabled:opacity-40">
+            {loading ? '测试中...' : '解析并推送'}
+          </button>
+        </div>
+
+        {error && <div className="bg-red-50 border border-red-200 rounded p-2 text-red-700 text-xs mb-3">{error}</div>}
+
+        {result && (
+          <div className="space-y-3">
+            <div className="flex gap-3">
+              <div className="border rounded p-2 text-center flex-1">
+                <p className="text-xl font-bold">{result.total_events as number}</p><p className="text-[10px] text-gray-500">解析事件</p>
+              </div>
+              <div className={`border rounded p-2 text-center flex-1 ${matched > 0 ? 'border-green-300 bg-green-50' : ''}`}>
+                <p className="text-xl font-bold text-green-600">{matched}</p><p className="text-[10px] text-gray-500">命中</p>
+              </div>
+              <div className={`border rounded p-2 text-center flex-1 ${delivered > 0 ? 'border-blue-300 bg-blue-50' : ''}`}>
+                <p className="text-xl font-bold text-blue-600">{delivered}</p><p className="text-[10px] text-gray-500">已推送</p>
+              </div>
+            </div>
+
+            {channels.length > 0 && (
+              <div className="text-xs">
+                <span className="text-gray-500">推送渠道：</span>
+                {channels.map(ch => (
+                  <span key={ch.id} className="ml-1 px-1.5 py-0.5 rounded bg-gray-100">{ch.name} ({ch.type})</span>
+                ))}
+              </div>
+            )}
+            {channels.length === 0 && <p className="text-xs text-yellow-600">未绑定渠道，仅匹配不推送</p>}
+
+            {matched === 0 && <p className="text-xs text-gray-400">该区块中没有命中此订阅的事件。</p>}
+
+            {events.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-xs text-gray-500 font-medium">命中事件（最多 50 条）</p>
+                {events.map((ev, i) => (
+                  <div key={i} className="bg-gray-50 rounded p-2 text-xs">
+                    <div className="flex gap-2 items-center">
+                      <span className="px-1.5 py-0.5 rounded bg-gray-200 text-[10px]">{String(ev.kind)}</span>
+                      {ev.name ? <span className="font-medium">{String(ev.name)}</span> : null}
+                      {ev.delivery_error ? <span className="text-red-500 text-[10px]">推送失败</span> : null}
+                    </div>
+                    {ev.args && typeof ev.args === 'object' && Object.keys(ev.args as object).length > 0 ? (
+                      <div className="mt-1 grid grid-cols-2 gap-1">
+                        {Object.entries(ev.args as Record<string, unknown>).map(([k, v]) => (
+                          <div key={k}><span className="text-gray-400">{k}:</span> <span className="font-mono break-all">{String(v)}</span></div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="flex justify-end mt-4">
+          <button onClick={onClose} className="border rounded px-4 py-1.5 text-sm">关闭</button>
+        </div>
+      </div>
     </div>
   )
 }

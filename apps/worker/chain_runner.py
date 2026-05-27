@@ -237,13 +237,22 @@ class ChainRunner:
         notifier: Notifier,
     ) -> None:
         assert self._adapter is not None and self._evm_pipeline is not None
-        block = await self._adapter.fetch_block(number)
+        # 优化1: 并行拉取 block + logs
+        block_coro = self._adapter.fetch_block(number)
+        logs_coro = self._adapter.fetch_logs(number, number)
+        block, logs = await asyncio.gather(block_coro, logs_coro)
+        from dataclasses import replace
+        block = replace(block, logs=logs)
+
         events = list(self._evm_pipeline.run(block))
+
+        # 优化2: 所有 event dispatch 并发而非串行
+        dispatch_tasks: list[asyncio.Task[None]] = []
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
-            if not hits:
-                continue
-            await notifier.dispatch(event, hits)
+            if hits:
+                dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+
         if self._chain.trace_internal_calls and self._abi_registry is not None:
             trace_fn = getattr(self._adapter, "trace_block", None)
             if callable(trace_fn):
@@ -253,7 +262,11 @@ class ChainRunner:
                     for event in internal_parser.parse(traces, block):
                         hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
                         if hits:
-                            await notifier.dispatch(event, hits)
+                            dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+
+        if dispatch_tasks:
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
 
     async def _process_solana_slot(self, slot: int) -> None:
@@ -266,11 +279,14 @@ class ChainRunner:
         if block is None:
             return
         events = list(self._solana_pipeline.run(block))
+        # 优化: 并发 dispatch
+        dispatch_tasks: list[asyncio.Task[None]] = []
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
-            if not hits:
-                continue
-            await notifier.dispatch(event, hits)
+            if hits:
+                dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+        if dispatch_tasks:
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
         await self._cp.save(self._chain.id, block.slot, block.block_hash)
 
     async def stop(self) -> None:

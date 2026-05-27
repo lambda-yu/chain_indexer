@@ -50,7 +50,11 @@ class HttpChannel(Channel):
         self._client: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(timeout=self._timeout)
+        self._client = httpx.AsyncClient(
+            timeout=self._timeout,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            http2=True,
+        )
 
     async def stop(self) -> None:
         if self._client is not None:

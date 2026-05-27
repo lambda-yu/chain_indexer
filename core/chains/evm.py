@@ -150,13 +150,19 @@ class EvmAdapter:
         while True:
             n = int(await self._w3.eth.block_number)
             if n > last:
-                raw = await self._w3.eth.get_block(n)
-                yield BlockHeader(
-                    number=int(raw["number"]),
-                    hash=_hexify(raw["hash"]),
-                    parent_hash=_hexify(raw["parentHash"]),
-                    timestamp=int(raw["timestamp"]),
-                )
+                # Yield all blocks since last (not just tip) to avoid skipping
+                start = last + 1 if last >= 0 else n
+                for bn in range(start, n + 1):
+                    try:
+                        raw = await self._w3.eth.get_block(bn)
+                        yield BlockHeader(
+                            number=int(raw["number"]),
+                            hash=_hexify(raw["hash"]),
+                            parent_hash=_hexify(raw["parentHash"]),
+                            timestamp=int(raw["timestamp"]),
+                        )
+                    except Exception:  # noqa: BLE001
+                        break
                 last = n
             await asyncio.sleep(self._poll_interval_s)
 

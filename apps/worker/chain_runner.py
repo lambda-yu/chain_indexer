@@ -158,8 +158,8 @@ class ChainRunner:
                 await self._run_evm()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
-            log.exception("chain_runner.run_failed", chain_id=self._chain.id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("chain_runner.run_failed", chain_id=self._chain.id, error=repr(exc))
             raise
 
     async def _run_evm(self) -> None:

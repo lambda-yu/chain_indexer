@@ -58,6 +58,10 @@ async def update_channel(
     await bump_and_publish(session, bus, entity="channel", entity_id=channel_id, action="update")
     await session.refresh(row)
     return ChannelOut.model_validate(row)
+
+
+@router.get("", response_model=list[ChannelOut])
+async def list_channels(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[ChannelOut]:
     rows = await ChannelRepo(session).list_all()

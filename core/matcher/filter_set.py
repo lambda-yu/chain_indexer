@@ -9,9 +9,8 @@ from dataclasses import dataclass
 
 import structlog
 
-from core.abi.decoder import event_topic0
 from core.abi.registry import AbiRegistry
-from core.config.snapshot import ConfigSnapshot
+from core.config.snapshot import ConfigSnapshot, SnapshotSubscription
 from core.parser.erc20 import ERC20_TRANSFER_TOPIC0  # re-exported below
 
 log = structlog.get_logger(__name__)
@@ -65,43 +64,32 @@ def build_evm_log_filter(
         addresses = sorted({s.address.lower() for s in relevant if s.address is not None})
 
     # Topic0s
-    topic0s: list[str] | None = None
-    topics_set: set[str] = set()
-    bailed = False
-    for s in relevant:
-        if s.match_kind == "token_transfer":
-            topics_set.add(ERC20_TRANSFER_TOPIC0)
-            continue
-        # match_kind == "event"
-        if s.abi_id is None or s.match_name is None or abi_registry is None:
-            bailed = True
-            break
-        t0 = _event_topic0_for(abi_registry, s.abi_id, s.match_name)
-        if t0 is None:
-            bailed = True
-            break
-        topics_set.add(t0)
-    if not bailed:
-        topic0s = sorted(topics_set)
+    collected = _collect_topic0s(relevant, abi_registry)
+    topic0s: list[str] | None = sorted(collected) if collected is not None else None
 
     return EvmLogFilterSet(addresses=addresses, topic0s=topic0s, skip_logs=False)
 
 
-def _event_topic0_for(registry: AbiRegistry, abi_id: str, event_name: str) -> str | None:
-    """Compute topic0 for the named event in the given abi, or None on miss."""
-    try:
-        body = registry.get_body(abi_id)
-    except Exception:  # noqa: BLE001
-        return None
-    entries = body if isinstance(body, list) else [body]
-    for entry in entries:
-        if entry.get("type") != "event":
+def _collect_topic0s(
+    relevant: list[SnapshotSubscription],
+    abi_registry: AbiRegistry | None,
+) -> set[str] | None:
+    """Collect the topic0 set for `relevant` subs, or None to bail.
+
+    Returns None (meaning "don't filter by topic0") when any event-kind
+    subscription cannot be resolved to a concrete topic0 — missing abi_id,
+    missing match_name, no registry, or unknown event in the registry.
+    """
+    out: set[str] = set()
+    for s in relevant:
+        if s.match_kind == "token_transfer":
+            out.add(ERC20_TRANSFER_TOPIC0)
             continue
-        if entry.get("name") != event_name:
-            continue
-        try:
-            return event_topic0(entry).lower()
-        except Exception:  # noqa: BLE001
-            log.warning("filter_set.event_topic0_failed", abi_id=abi_id, event_name=event_name)
+        # match_kind == "event"
+        if s.abi_id is None or s.match_name is None or abi_registry is None:
             return None
-    return None
+        t0 = abi_registry.event_topic0_for(s.abi_id, s.match_name)
+        if t0 is None:
+            return None
+        out.add(t0)
+    return out

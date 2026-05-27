@@ -256,6 +256,34 @@ def test_lookup_function_picks_first_abi_on_selector_collision() -> None:
     assert r.lookup_function_by_selector(sel) is first
 
 
+def test_event_topic0_for_returns_lowercase_topic0_for_known_event() -> None:
+    snap = _snap_with(SnapshotAbi(
+        id="a1", name="erc20", kind="evm_abi",
+        body=[_ERC20_TRANSFER, _SECOND_EVENT],
+    ))
+    r = AbiRegistry()
+    r.refresh(snap)
+    expected = event_topic0(_ERC20_TRANSFER).lower()
+    assert r.event_topic0_for("a1", "Transfer") == expected
+    # And for the second event in the same abi.
+    expected_2 = event_topic0(_SECOND_EVENT).lower()
+    assert r.event_topic0_for("a1", "Approval") == expected_2
+
+
+def test_event_topic0_for_returns_none_for_unknown_event_name() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    assert r.event_topic0_for("a1", "DoesNotExist") is None
+
+
+def test_event_topic0_for_returns_none_for_unknown_abi_id() -> None:
+    snap = _snap_with(SnapshotAbi(id="a1", name="erc20", kind="evm_abi", body=[_ERC20_TRANSFER]))
+    r = AbiRegistry()
+    r.refresh(snap)
+    assert r.event_topic0_for("missing-abi", "Transfer") is None
+
+
 def test_selector_index_rebuilt_on_abi_removal() -> None:
     snap_with = _snap_with(SnapshotAbi(id="a1", name="x", kind="evm_abi", body=[_FN_TRANSFER]))
     snap_without = _snap_with()

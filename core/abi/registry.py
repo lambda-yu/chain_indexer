@@ -114,6 +114,20 @@ class AbiRegistry:
                 idx[t0] = (abi_id, entry.get("name", ""))
         self._topic0_index = idx
 
+    def event_topic0_for(self, abi_id: str, event_name: str) -> str | None:
+        """Return the topic0 hex (lowercased) for the named event in `abi_id`.
+
+        Uses the pre-built `_topic0_index` (a single forward pass over its
+        items, no keccak recomputation). Returns None when either the
+        abi_id or the event_name is unknown — consistent with the legacy
+        `filter_set._event_topic0_for` semantics (no exceptions for missing
+        ABIs).
+        """
+        for t0, (aid, name) in self._topic0_index.items():
+            if aid == abi_id and name == event_name:
+                return t0
+        return None
+
     def lookup_event_by_topic0(
         self, topic0: str,
     ) -> tuple[str, EventDecoder] | None:

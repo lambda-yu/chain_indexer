@@ -19,11 +19,19 @@ def set_log_redis_client(client: Any) -> None:
 
 def _redis_log_sink(_logger: Any, _method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     if _redis_client is not None:
+        import asyncio
         import json
         try:
             line = json.dumps(event_dict, default=str)
-            _redis_client.lpush(_LOG_KEY, line)
-            _redis_client.ltrim(_LOG_KEY, 0, _MAX_LOGS - 1)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                async def _push() -> None:
+                    try:
+                        await _redis_client.lpush(_LOG_KEY, line)
+                        await _redis_client.ltrim(_LOG_KEY, 0, _MAX_LOGS - 1)
+                    except Exception:
+                        pass
+                loop.create_task(_push())
         except Exception:
             pass
     return event_dict

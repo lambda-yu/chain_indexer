@@ -121,8 +121,8 @@ class _Worker:
                     error=error,
                 )
                 await s.commit()
-        except Exception:  # noqa: BLE001
-            log.error("worker.failed_delivery_save_error")
+        except Exception as exc:  # noqa: BLE001
+            log.error("worker.failed_delivery_save_error", error=repr(exc))
 
     async def start(self) -> None:
         log.info("worker.starting", worker_id=self._worker_id)

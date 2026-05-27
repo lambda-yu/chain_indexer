@@ -16,11 +16,19 @@ def _gen_id() -> str:
     return str(uuid.uuid4())
 
 
+def _safe(obj: Any) -> Any:
+    if isinstance(obj, bytes):
+        return "0x" + obj.hex()
+    if isinstance(obj, dict):
+        return {str(k): _safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_safe(v) for v in obj]
+    if isinstance(obj, (int, float, bool, str)) or obj is None:
+        return obj
+    return str(obj)
+
+
 def build_payload(*, event: Event, subscription: SnapshotSubscription) -> dict[str, Any]:
-    """Uniform notification payload (spec §8). Two dedupe keys:
-    - logical: (chain_id, tx_hash, log_index, block_hash) — survives reorgs
-    - delivery_id: per-attempt idempotency key for at-least-once retry
-    """
     return {
         "subscription_id": subscription.id,
         "subscription_name": subscription.name,
@@ -28,14 +36,14 @@ def build_payload(*, event: Event, subscription: SnapshotSubscription) -> dict[s
         "event": {
             "kind": event.kind,
             "name": event.name,
-            "contract": event.contract,
+            "contract": _safe(event.contract),
             "block_number": event.block_number,
-            "block_hash": event.block_hash,
+            "block_hash": _safe(event.block_hash),
             "block_timestamp": event.block_timestamp,
-            "tx_hash": event.tx_hash,
+            "tx_hash": _safe(event.tx_hash),
             "tx_index": event.tx_index,
             "log_index": event.log_index,
-            "args": dict(event.args),
+            "args": _safe(dict(event.args)),
         },
         "delivered_at": _now_unix(),
         "delivery_id": _gen_id(),

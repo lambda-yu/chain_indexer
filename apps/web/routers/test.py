@@ -91,7 +91,8 @@ async def parse_block(
             rpc_http=chain_row.rpc_http,
             commitment=chain_row.commitment,
         )
-        await adapter_sol.connect()
+        try:
+            await adapter_sol.connect()
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"RPC 连接失败: {exc!r}") from exc
         try:

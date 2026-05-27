@@ -231,6 +231,13 @@ async def test_subscription(
 
         # Resolve channels
         channels_for_sub = [c for c in snap.channels if c.id in snap_sub.channel_ids]
+        # Fallback: if snapshot doesn't have the channels, query DB directly
+        if not channels_for_sub and snap_sub.channel_ids:
+            from core.config.snapshot import SnapshotChannel
+            for cid in snap_sub.channel_ids:
+                ch_row = await ChannelRepo(session).get(cid)
+                if ch_row:
+                    channels_for_sub.append(SnapshotChannel(id=ch_row.id, name=ch_row.name, type=ch_row.type.value, config=ch_row.config))
 
         kind = chain_row.kind.value
 
@@ -280,31 +287,39 @@ async def test_subscription(
             raise HTTPException(status_code=400, detail=f"unsupported kind: {kind}")
 
         # Match against this single subscription
+        # Build a dedicated matcher; also resolve channels directly from snapshot
+        # (load_snapshot may not include all channels if chain is disabled)
         matcher = Matcher(snap)
         matched_events: list[dict[str, Any]] = []
         delivered = 0
 
+        # Build channel lookup from DB directly (not from snapshot which may be filtered)
+        all_channels_map: dict[str, Any] = {c.id: c for c in snap.channels}
+
         for ev in events:
-            for matched_sub, matched_chans in matcher.match(ev):
+            for matched_sub, _ in matcher.match(ev):
                 if matched_sub.id != req.subscription_id:
                     continue
                 matched_events.append(_safe_dict(asdict(ev)))
-                # Actually deliver
-                if matched_chans:
+                # Deliver using channels from snapshot or direct channel lookup
+                resolved_chans = [all_channels_map[cid] for cid in matched_sub.channel_ids if cid in all_channels_map]
+                if not resolved_chans and channels_for_sub:
+                    # Fallback: use channels resolved from DB query
+                    resolved_chans = channels_for_sub
+                for ch_cfg in resolved_chans:
+                    cls = CHANNEL_REGISTRY.get(ch_cfg.type)
+                    if cls is None:
+                        continue
                     payload = build_payload(event=ev, subscription=matched_sub)
-                    for ch_cfg in matched_chans:
-                        cls = CHANNEL_REGISTRY.get(ch_cfg.type)
-                        if cls is None:
-                            continue
+                    try:
+                        ch_inst = cls(config=ch_cfg.config, bus=bus)
+                        await ch_inst.start()
                         try:
-                            ch_inst = cls(config=ch_cfg.config, bus=bus)
-                            await ch_inst.start()
-                            try:
-                                await ch_inst.send(payload)
-                                delivered += 1
-                            finally:
-                                await ch_inst.stop()
-                        except Exception as exc:
+                            await ch_inst.send(payload)
+                            delivered += 1
+                        finally:
+                            await ch_inst.stop()
+                    except Exception as exc:
                             matched_events[-1]["delivery_error"] = repr(exc)
 
         return JSONResponse(content={

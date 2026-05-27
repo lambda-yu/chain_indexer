@@ -1,5 +1,5 @@
 import { Link, Outlet, useLocation } from 'react-router-dom'
-import { Activity, Box, Link2, Radio, Settings, Upload } from 'lucide-react'
+import { Activity, Box, Link2, Radio, Settings, Upload, FlaskConical } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const NAV = [
@@ -8,6 +8,7 @@ const NAV = [
   { to: '/channels', label: '通知渠道', icon: Radio },
   { to: '/subscriptions', label: '订阅规则', icon: Link2 },
   { to: '/abis', label: 'ABI 管理', icon: Upload },
+  { to: '/test', label: '区块测试', icon: FlaskConical },
   { to: '/events', label: '实时事件', icon: Settings },
 ]
 

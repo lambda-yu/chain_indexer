@@ -6,6 +6,7 @@ import Chains from '@/pages/Chains'
 import Channels from '@/pages/Channels'
 import Subscriptions from '@/pages/Subscriptions'
 import Abis from '@/pages/Abis'
+import BlockTest from '@/pages/BlockTest'
 import EventStream from '@/pages/EventStream'
 
 const queryClient = new QueryClient()
@@ -21,6 +22,7 @@ export default function App() {
             <Route path="/channels" element={<Channels />} />
             <Route path="/subscriptions" element={<Subscriptions />} />
             <Route path="/abis" element={<Abis />} />
+            <Route path="/test" element={<BlockTest />} />
             <Route path="/events" element={<EventStream />} />
           </Route>
         </Routes>

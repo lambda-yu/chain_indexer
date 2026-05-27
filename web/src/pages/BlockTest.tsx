@@ -1,14 +1,46 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/api/client'
-import { Play, Loader2 } from 'lucide-react'
+import { Play, Loader2, ChevronDown, ChevronRight, Search } from 'lucide-react'
 
 interface Chain { id: string; kind: string }
 interface MatchedSub { subscription_id: string; subscription_name: string; match_kind: string; match_name: string | null; channels: { id: string; name: string; type: string }[] }
+type EventItem = Record<string, unknown> & { matched?: boolean; matched_subscriptions?: MatchedSub[] }
 interface ParseResult {
   chain_id: string; kind: string; block_number: number
   tx_count?: number; log_count?: number; event_count?: number; matched_count?: number
-  events: (Record<string, unknown> & { matched?: boolean; matched_subscriptions?: MatchedSub[] })[]; error?: string
+  events: EventItem[]; error?: string
+}
+
+function eventMatchesSearch(ev: EventItem, q: string): boolean {
+  const lower = q.toLowerCase()
+  if (String(ev.tx_hash ?? '').toLowerCase().includes(lower)) return true
+  if (String(ev.contract ?? '').toLowerCase().includes(lower)) return true
+  if (String(ev.name ?? '').toLowerCase().includes(lower)) return true
+  if (String(ev.kind ?? '').toLowerCase().includes(lower)) return true
+  const args = ev.args as Record<string, unknown> | undefined
+  if (args) {
+    for (const v of Object.values(args)) {
+      if (String(v).toLowerCase().includes(lower)) return true
+    }
+  }
+  if (ev.matched_subscriptions) {
+    for (const sub of ev.matched_subscriptions) {
+      if (sub.subscription_name.toLowerCase().includes(lower)) return true
+    }
+  }
+  return false
+}
+
+function groupByKind(events: EventItem[]): Map<string, EventItem[]> {
+  const map = new Map<string, EventItem[]>()
+  for (const ev of events) {
+    const key = `${ev.kind}${ev.name ? ` / ${ev.name}` : ''}`
+    const arr = map.get(key) || []
+    arr.push(ev)
+    map.set(key, arr)
+  }
+  return map
 }
 
 export default function BlockTest() {
@@ -18,10 +50,26 @@ export default function BlockTest() {
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<ParseResult | null>(null)
   const [error, setError] = useState('')
+  const [search, setSearch] = useState('')
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+
+  const toggle = (key: string) => setCollapsed(prev => {
+    const next = new Set(prev)
+    next.has(key) ? next.delete(key) : next.add(key)
+    return next
+  })
+
+  const filtered = useMemo(() => {
+    if (!result) return []
+    if (!search.trim()) return result.events
+    return result.events.filter(ev => eventMatchesSearch(ev, search.trim()))
+  }, [result, search])
+
+  const grouped = useMemo(() => groupByKind(filtered), [filtered])
 
   const run = async () => {
     if (!chainId || !blockNum) return
-    setLoading(true); setError(''); setResult(null)
+    setLoading(true); setError(''); setResult(null); setSearch(''); setCollapsed(new Set())
     try {
       const res = await api.post<ParseResult>('/test/parse-block', { chain_id: chainId, block_number: Number(blockNum) })
       setResult(res)
@@ -81,49 +129,98 @@ export default function BlockTest() {
 
           {result.error && <div className="bg-yellow-50 border border-yellow-200 rounded p-3 text-yellow-700 text-sm mb-4">{result.error}</div>}
 
+          {result.events.length > 0 && (
+            <div className="flex items-center gap-2 mb-3">
+              <div className="relative flex-1">
+                <Search size={14} className="absolute left-2.5 top-2 text-gray-400" />
+                <input
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder="搜索 tx hash、合约地址、事件名、参数值、订阅名..."
+                  className="w-full border rounded pl-8 pr-3 py-1.5 text-sm"
+                />
+              </div>
+              {search && <span className="text-xs text-gray-400">{filtered.length} / {result.events.length}</span>}
+            </div>
+          )}
+
           {result.events.length === 0 ? (
-            <p className="text-gray-400 text-sm">该区块未解析出任何事件。可能没有匹配的交易，或需要上传对应的 ABI。</p>
+            <p className="text-gray-400 text-sm">该区块未解析出任何事件。</p>
+          ) : filtered.length === 0 ? (
+            <p className="text-gray-400 text-sm">没有匹配的事件。</p>
           ) : (
             <div className="space-y-2">
-              {result.events.map((ev, i) => (
-                <div key={i} className={`border rounded-lg p-3 ${ev.matched ? 'border-green-300 bg-green-50/30' : ''}`}>
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="px-2 py-0.5 rounded text-xs font-medium bg-gray-100">{String(ev.kind)}</span>
-                    {ev.name ? <span className="text-sm font-medium">{String(ev.name)}</span> : null}
-                    {ev.matched ? <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-100 text-green-700 font-medium">命中</span> : null}
-                    {ev.contract ? <span className="text-xs font-mono text-gray-400 truncate max-w-64 ml-auto">{String(ev.contract)}</span> : null}
-                  </div>
-                  {ev.args && typeof ev.args === 'object' && Object.keys(ev.args as object).length > 0 ? (
-                    <div className="bg-gray-50 rounded p-2 mb-1">
-                      <p className="text-xs text-gray-500 mb-1">参数</p>
-                      <div className="grid grid-cols-2 gap-1 text-xs">
-                        {Object.entries(ev.args as Record<string, unknown>).map(([k, v]) => (
-                          <div key={k}><span className="text-gray-500">{k}:</span> <span className="font-mono">{String(v)}</span></div>
+              {[...grouped.entries()].map(([groupKey, events]) => {
+                const isCollapsed = collapsed.has(groupKey)
+                const matchedInGroup = events.filter(e => e.matched).length
+                return (
+                  <div key={groupKey} className="border rounded-lg overflow-hidden">
+                    <button
+                      onClick={() => toggle(groupKey)}
+                      className="w-full flex items-center gap-2 px-3 py-2 bg-gray-50 hover:bg-gray-100 text-left text-sm"
+                    >
+                      {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                      <span className="font-medium">{groupKey}</span>
+                      <span className="text-xs text-gray-400 ml-1">({events.length})</span>
+                      {matchedInGroup > 0 && <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-100 text-green-700">{matchedInGroup} 命中</span>}
+                    </button>
+                    {!isCollapsed && (
+                      <div className="divide-y">
+                        {events.map((ev, i) => (
+                          <EventCard key={i} ev={ev} />
                         ))}
                       </div>
-                    </div>
-                  ) : null}
-                  {ev.matched && ev.matched_subscriptions && ev.matched_subscriptions.length > 0 ? (
-                    <div className="bg-green-50 border border-green-200 rounded p-2 mt-1">
-                      <p className="text-xs text-green-700 font-medium mb-1">✓ 命中 {ev.matched_subscriptions.length} 条订阅</p>
-                      {ev.matched_subscriptions.map((sub, si) => (
-                        <div key={si} className="flex items-center gap-2 text-xs mt-0.5">
-                          <span className="font-medium">{sub.subscription_name}</span>
-                          <span className="text-gray-400">→</span>
-                          {sub.channels.map(ch => (
-                            <span key={ch.id} className={`px-1.5 py-0.5 rounded text-[10px] ${ch.type === 'http' ? 'bg-green-100 text-green-700' : ch.type === 'mq' ? 'bg-yellow-100 text-yellow-700' : 'bg-indigo-100 text-indigo-700'}`}>{ch.name}</span>
-                          ))}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-                  <div className="text-xs text-gray-400 mt-1">
-                    tx: {String(ev.tx_hash).slice(0, 16)}... | block: {String(ev.block_number)}
+                    )}
                   </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function EventCard({ ev }: { ev: EventItem }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className={`px-3 py-2 ${ev.matched ? 'bg-green-50/30' : ''}`}>
+      <div className="flex items-center gap-2 cursor-pointer" onClick={() => setExpanded(!expanded)}>
+        {expanded ? <ChevronDown size={12} className="text-gray-400" /> : <ChevronRight size={12} className="text-gray-400" />}
+        <span className="font-mono text-xs text-gray-500 truncate w-32">{String(ev.tx_hash).slice(0, 18)}...</span>
+        {ev.matched ? <span className="px-1 py-0.5 rounded text-[10px] bg-green-100 text-green-700">命中</span> : null}
+        {ev.contract ? <span className="text-xs font-mono text-gray-400 truncate max-w-48 ml-auto">{String(ev.contract)}</span> : null}
+      </div>
+      {expanded && (
+        <div className="ml-5 mt-2 space-y-1">
+          {ev.args && typeof ev.args === 'object' && Object.keys(ev.args as object).length > 0 ? (
+            <div className="bg-gray-50 rounded p-2">
+              <p className="text-xs text-gray-500 mb-1">参数</p>
+              <div className="grid grid-cols-2 gap-1 text-xs">
+                {Object.entries(ev.args as Record<string, unknown>).map(([k, v]) => (
+                  <div key={k}><span className="text-gray-500">{k}:</span> <span className="font-mono break-all">{String(v)}</span></div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {ev.matched && ev.matched_subscriptions && ev.matched_subscriptions.length > 0 ? (
+            <div className="bg-green-50 border border-green-200 rounded p-2">
+              <p className="text-xs text-green-700 font-medium mb-1">✓ 命中 {ev.matched_subscriptions.length} 条订阅</p>
+              {ev.matched_subscriptions.map((sub, si) => (
+                <div key={si} className="flex items-center gap-2 text-xs mt-0.5">
+                  <span className="font-medium">{sub.subscription_name}</span>
+                  <span className="text-gray-400">→</span>
+                  {sub.channels.map(ch => (
+                    <span key={ch.id} className={`px-1.5 py-0.5 rounded text-[10px] ${ch.type === 'http' ? 'bg-green-100 text-green-700' : ch.type === 'mq' ? 'bg-yellow-100 text-yellow-700' : 'bg-indigo-100 text-indigo-700'}`}>{ch.name}</span>
+                  ))}
                 </div>
               ))}
             </div>
-          )}
+          ) : null}
+          <div className="text-xs text-gray-400">
+            tx: {String(ev.tx_hash)} | block: {String(ev.block_number)}
+          </div>
         </div>
       )}
     </div>

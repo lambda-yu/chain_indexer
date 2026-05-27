@@ -40,6 +40,8 @@ ChannelFactory = Callable[[SnapshotChannel], Channel]
 _DEGRADE_ERR_HINTS = (
     "too large", "result too big", "query timeout",
     "limit exceeded", "returned more than",
+    "response size exceeded",  # Alchemy log-response cap
+    "block range",              # BlockPI/Ankr "block range is too wide"
 )
 
 

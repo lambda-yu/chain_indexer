@@ -96,6 +96,13 @@ def create_app(
         status_code = 200 if db_ok and redis_ok else 503
         return JSONResponse(body, status_code=status_code)
 
+    # Register channel types (side-effect imports)
+    from core.notifier.http import HttpChannel  # noqa: F401
+    from core.notifier.kafka import KafkaChannel  # noqa: F401
+    from core.notifier.rabbitmq import RabbitMQChannel  # noqa: F401
+    from core.notifier.redis_streams import RedisStreamsChannel  # noqa: F401
+    from core.notifier.websocket import WebSocketChannel  # noqa: F401
+
     # Routers (registered in later tasks of this chunk):
     from apps.web.routers import abis as abis_router  # noqa: E402
     from apps.web.routers import chains as chains_router  # noqa: E402

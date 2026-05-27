@@ -8,12 +8,13 @@ import structlog
 
 from core.abi.registry import AbiRegistry
 from core.chains.confirmation_buffer import ConfirmationBuffer, ReorgEvent
-from core.chains.types import BlockHeader
+from core.chains.types import Block, BlockHeader, Log
 from core.config.snapshot import (
     ConfigSnapshot,
     SnapshotChain,
     SnapshotChannel,
 )
+from core.matcher.filter_set import EvmLogFilterSet, build_evm_log_filter
 from core.matcher.matcher import Matcher
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
@@ -80,6 +81,7 @@ class ChainRunner:
         self._solana_pipeline: SolanaParserPipeline | None = None
         self._matcher: Matcher | None = None
         self._notifier: Notifier | None = None
+        self._evm_filter: EvmLogFilterSet | None = None
         self._current_snap: ConfigSnapshot | None = None
         self._buffer_tip_hash: str | None = None
         self._stop = asyncio.Event()
@@ -140,6 +142,8 @@ class ChainRunner:
         )
         await self._notifier.start(snap.channels)
         self._current_snap = snap
+        if self._chain.kind != "solana":
+            self._evm_filter = build_evm_log_filter(snap, self._chain.id, self._abi_registry)
 
     async def apply_snapshot(self, snap: ConfigSnapshot) -> None:
         async with self._snap_lock:
@@ -152,6 +156,8 @@ class ChainRunner:
             )
             await self._notifier.start(snap.channels)
             self._current_snap = snap
+            if self._chain.kind != "solana":
+                self._evm_filter = build_evm_log_filter(snap, self._chain.id, self._abi_registry)
             log.info(
                 "chain_runner.snapshot_applied",
                 chain_id=self._chain.id,
@@ -326,12 +332,37 @@ class ChainRunner:
         notifier: Notifier,
     ) -> None:
         assert self._adapter is not None and self._evm_pipeline is not None
-        # 优化1: 并行拉取 block + logs
+        assert self._evm_filter is not None
+        log_filter = self._evm_filter
+
         block_coro = self._adapter.fetch_block(number)
-        logs_coro = self._adapter.fetch_logs(number, number)
-        block, logs = await asyncio.gather(block_coro, logs_coro)
+        if log_filter.skip_logs:
+            block = await block_coro
+            logs: list[Log] = []
+        else:
+            logs_coro = self._adapter.fetch_logs(
+                number, number,
+                addresses=log_filter.addresses,
+                topics=log_filter.topics_param,
+            )
+            block, logs = await asyncio.gather(block_coro, logs_coro)
+
+        await self._process_block_with_prefetched_logs(
+            number, block, logs, matcher=matcher, notifier=notifier,
+        )
+
+    async def _process_block_with_prefetched_logs(
+        self,
+        number: int,
+        block: Block,
+        prefetched_logs: list[Log],
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        assert self._adapter is not None and self._evm_pipeline is not None
         from dataclasses import replace
-        block = replace(block, logs=logs)
+        block = replace(block, logs=prefetched_logs)
 
         events = list(self._evm_pipeline.run(block))
 

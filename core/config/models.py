@@ -49,6 +49,8 @@ class ChannelType(enum.StrEnum):
     mq = "mq"
     http = "http"
     ws = "ws"
+    kafka = "kafka"
+    rabbitmq = "rabbitmq"
 
 
 class TimestampMixin:

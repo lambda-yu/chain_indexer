@@ -29,6 +29,8 @@ chain-indexer-web    = "apps.web.main:main"  # populated in Chunk 9
 [project.optional-dependencies]
 postgres = ["asyncpg>=0.29", "psycopg2-binary>=2.9"]
 mysql = ["asyncmy>=0.2.9"]
+kafka = ["confluent-kafka>=2.3"]
+rabbitmq = ["aio-pika>=9.4"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

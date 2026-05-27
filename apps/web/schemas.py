@@ -57,7 +57,7 @@ class ChainOut(BaseModel):
 
 class ChannelCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
-    type: Literal["mq", "http", "ws"]
+    type: Literal["mq", "http", "ws", "kafka", "rabbitmq"]
     config: dict[str, Any] = Field(default_factory=dict)
 
 

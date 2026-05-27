@@ -11,7 +11,7 @@ export default function Channels() {
   const [showForm, setShowForm] = useState(false)
   const { data: channels = [], isLoading } = useQuery<Channel[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/channels/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['channels'] }) })
-  const typeBadge = (t: string) => ({ http: 'bg-green-100 text-green-700', mq: 'bg-yellow-100 text-yellow-700', ws: 'bg-indigo-100 text-indigo-700' }[t] ?? 'bg-gray-100')
+  const typeBadge = (t: string) => ({ http: 'bg-green-100 text-green-700', mq: 'bg-yellow-100 text-yellow-700', ws: 'bg-indigo-100 text-indigo-700', kafka: 'bg-orange-100 text-orange-700', rabbitmq: 'bg-pink-100 text-pink-700' }[t] ?? 'bg-gray-100')
 
   return (
     <div>
@@ -43,7 +43,7 @@ export default function Channels() {
 function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: () => void }) {
   const qc = useQueryClient()
   const isEdit = initial !== null
-  const [type, setType] = useState<'http'|'mq'|'ws'>((initial?.type as 'http'|'mq'|'ws') || 'http')
+  const [type, setType] = useState<'http'|'mq'|'ws'|'kafka'|'rabbitmq'>((initial?.type as 'http'|'mq'|'ws'|'kafka'|'rabbitmq') || 'http')
   const createMut = useMutation({ mutationFn: (d: Record<string, unknown>) => api.post('/channels', d), onSuccess: () => { qc.invalidateQueries({ queryKey: ['channels'] }); onClose() } })
   const updateMut = useMutation({ mutationFn: (d: Record<string, unknown>) => api.put(`/channels/${initial?.id}`, d), onSuccess: () => { qc.invalidateQueries({ queryKey: ['channels'] }); onClose() } })
   const mut = isEdit ? updateMut : createMut
@@ -53,6 +53,8 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
     let config: Record<string, unknown> = {}
     if (type === 'http') config = { url: fd.get('url'), method: fd.get('method') || 'POST' }
     else if (type === 'mq') config = { stream: fd.get('stream'), ...(fd.get('maxlen') ? { maxlen: Number(fd.get('maxlen')) } : {}) }
+    else if (type === 'kafka') config = { bootstrap_servers: fd.get('bootstrap_servers'), topic: fd.get('topic'), ...(fd.get('key') ? { key: fd.get('key') } : {}), ...(fd.get('compression_type') ? { compression_type: fd.get('compression_type') } : {}) }
+    else if (type === 'rabbitmq') config = { url: fd.get('rmq_url'), ...(fd.get('exchange') ? { exchange: fd.get('exchange') } : {}), ...(fd.get('routing_key') ? { routing_key: fd.get('routing_key') } : {}), ...(fd.get('queue') ? { queue: fd.get('queue') } : {}) }
     else config = { ws_fanout_channel: fd.get('ws_fanout_channel') }
     mut.mutate({ name: fd.get('name'), type, config })
   }
@@ -61,9 +63,23 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
       <form onSubmit={submit} className="bg-white rounded-lg p-6 w-96 space-y-3">
         <h3 className="text-lg font-bold">{isEdit ? '编辑渠道' : '添加渠道'}</h3>
         <input name="name" defaultValue={initial?.name ?? ''} placeholder="渠道名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
-        <div className="flex gap-2">{(['http','mq','ws'] as const).map(t => <button key={t} type="button" onClick={() => !isEdit && setType(t)} className={`flex-1 py-1.5 rounded text-sm ${type===t?'bg-black text-white':'border'} ${isEdit?'opacity-60':''}`}>{t.toUpperCase()}</button>)}</div>
+        <div className="flex gap-2 flex-wrap">{(['http','mq','ws','kafka','rabbitmq'] as const).map(t => <button key={t} type="button" onClick={() => !isEdit && setType(t)} className={`px-3 py-1.5 rounded text-sm ${type===t?'bg-black text-white':'border'} ${isEdit?'opacity-60':''}`}>{t.toUpperCase()}</button>)}</div>
         {type === 'http' && <><input name="url" defaultValue={String(cfg.url ?? '')} placeholder="Webhook 地址" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="method" defaultValue={String(cfg.method ?? 'POST')} placeholder="请求方法" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
         {type === 'mq' && <><input name="stream" defaultValue={String(cfg.stream ?? '')} placeholder="Redis Stream 名称" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="maxlen" type="number" defaultValue={cfg.maxlen ? Number(cfg.maxlen) : undefined} placeholder="最大长度（可选）" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
+        {type === 'kafka' && <>
+          <input name="bootstrap_servers" defaultValue={String(cfg.bootstrap_servers ?? '')} placeholder="Kafka Broker 地址（如 localhost:9092）" required className="w-full border rounded px-3 py-1.5 text-sm" />
+          <input name="topic" defaultValue={String(cfg.topic ?? '')} placeholder="Topic 名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
+          <input name="key" defaultValue={String(cfg.key ?? '')} placeholder="消息 Key（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />
+          <select name="compression_type" defaultValue={String(cfg.compression_type ?? 'none')} className="w-full border rounded px-3 py-1.5 text-sm">
+            <option value="none">无压缩</option><option value="gzip">gzip</option><option value="snappy">snappy</option><option value="lz4">lz4</option>
+          </select>
+        </>}
+        {type === 'rabbitmq' && <>
+          <input name="rmq_url" defaultValue={String(cfg.url ?? '')} placeholder="AMQP URL（如 amqp://guest:guest@localhost:5672/）" required className="w-full border rounded px-3 py-1.5 text-sm" />
+          <input name="exchange" defaultValue={String(cfg.exchange ?? '')} placeholder="Exchange 名称（可选，默认 default）" className="w-full border rounded px-3 py-1.5 text-sm" />
+          <input name="routing_key" defaultValue={String(cfg.routing_key ?? '')} placeholder="Routing Key（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />
+          <input name="queue" defaultValue={String(cfg.queue ?? '')} placeholder="Queue 名称（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />
+        </>}
         {type === 'ws' && <input name="ws_fanout_channel" defaultValue={String(cfg.ws_fanout_channel ?? '')} placeholder="广播频道名称" required className="w-full border rounded px-3 py-1.5 text-sm" />}
         <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">{isEdit ? '保存' : '创建'}</button></div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}

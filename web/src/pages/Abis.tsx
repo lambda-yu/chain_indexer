@@ -1,13 +1,14 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
-import { Plus, Trash2, Eye } from 'lucide-react'
+import { Plus, Trash2, Eye, Download } from 'lucide-react'
 
 interface Abi { id: string; name: string; kind: string; body: unknown }
 
 export default function Abis() {
   const qc = useQueryClient()
   const [showForm, setShowForm] = useState(false)
+  const [showFetch, setShowFetch] = useState(false)
   const [preview, setPreview] = useState<Abi | null>(null)
   const { data: abis = [], isLoading } = useQuery<Abi[]>({ queryKey: ['abis'], queryFn: () => api.get('/abis') })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/abis/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['abis'] }) })
@@ -24,7 +25,10 @@ export default function Abis() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-2xl font-bold">ABI 管理</h2>
-        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> 上传 ABI</button>
+        <div className="flex gap-2">
+          <button onClick={() => setShowFetch(true)} className="flex items-center gap-1 border px-3 py-1.5 rounded text-sm"><Download size={14} /> 链上拉取 IDL</button>
+          <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> 上传 ABI</button>
+        </div>
       </div>
       {isLoading ? <p className="text-gray-500">加载中...</p> : (
         <table className="w-full text-sm border-collapse">
@@ -43,6 +47,7 @@ export default function Abis() {
         </table>
       )}
       {showForm && <AbiForm onClose={() => setShowForm(false)} />}
+      {showFetch && <FetchIdlForm onClose={() => setShowFetch(false)} />}
       {preview && (
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setPreview(null)}>
           <div className="bg-white rounded-lg p-6 w-[500px] max-h-[80vh] overflow-auto" onClick={e => e.stopPropagation()}>
@@ -82,6 +87,46 @@ function AbiForm({ onClose }: { onClose: () => void }) {
         <textarea value={body} onChange={e => setBody(e.target.value)} placeholder="粘贴 ABI/IDL JSON" className="w-full border rounded px-3 py-1.5 text-sm h-32 font-mono" />
         <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">上传</button></div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
+      </form>
+    </div>
+  )
+}
+
+function FetchIdlForm({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient()
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); setError(''); setLoading(true)
+    const fd = new FormData(e.currentTarget)
+    const programId = fd.get('program_id') as string
+    const rpcUrl = fd.get('rpc_url') as string
+    const name = fd.get('name') as string || undefined
+    try {
+      const params = new URLSearchParams({ program_id: programId, rpc_url: rpcUrl })
+      if (name) params.set('name', name)
+      await api.post(`/abis/fetch-idl?${params.toString()}`, {})
+      qc.invalidateQueries({ queryKey: ['abis'] })
+      onClose()
+    } catch (err) {
+      setError(String(err))
+    } finally { setLoading(false) }
+  }
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+      <form onSubmit={submit} className="bg-white rounded-lg p-6 w-[480px] space-y-3">
+        <h3 className="text-lg font-bold">从链上拉取 Solana IDL</h3>
+        <p className="text-xs text-gray-500">输入 Anchor 程序的 Program ID，系统将自动从链上 IDL 账户拉取并解压 IDL。</p>
+        <input name="program_id" placeholder="Program ID（如 TokenkegQfeZy...）" required className="w-full border rounded px-3 py-1.5 text-sm font-mono" />
+        <input name="rpc_url" placeholder="Solana RPC URL" defaultValue="https://api.mainnet-beta.solana.com" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <input name="name" placeholder="名称（可选，默认自动生成）" className="w-full border rounded px-3 py-1.5 text-sm" />
+        <div className="flex gap-2 pt-2">
+          <button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button>
+          <button type="submit" disabled={loading} className="flex-1 bg-black text-white rounded py-1.5 text-sm disabled:opacity-50">
+            {loading ? '拉取中...' : '拉取 IDL'}
+          </button>
+        </div>
+        {error && <p className="text-red-500 text-xs">{error}</p>}
       </form>
     </div>
   )

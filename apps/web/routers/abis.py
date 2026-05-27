@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.web.deps import get_bus, get_session
 from apps.web.routers._common import bump_and_publish
 from apps.web.schemas import AbiCreate, AbiOut
+from core.abi.idl_fetcher import fetch_idl_from_chain
 from core.bus.redis_bus import RedisBus
 from core.config.models import AbiKind
 from core.config.repositories import AbiRepo
@@ -59,3 +60,23 @@ async def delete_abi(
         raise HTTPException(status_code=404, detail="abi not found")
     await repo.delete(abi_id)
     await bump_and_publish(session, bus, entity="abi", entity_id=abi_id, action="delete")
+
+
+@router.post("/fetch-idl", response_model=AbiOut, status_code=status.HTTP_201_CREATED)
+async def fetch_and_create_idl(
+    program_id: str,
+    rpc_url: str,
+    name: str | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> AbiOut:
+    idl = await fetch_idl_from_chain(rpc_url, program_id)
+    if idl is None:
+        raise HTTPException(status_code=404, detail=f"IDL not found on-chain for program {program_id}")
+    row = await AbiRepo(session).create(
+        name=name or f"idl-{program_id[:8]}",
+        kind=AbiKind.solana_idl,
+        body=idl,
+    )
+    await bump_and_publish(session, bus, entity="abi", entity_id=row.id, action="create")
+    return AbiOut.model_validate(row)

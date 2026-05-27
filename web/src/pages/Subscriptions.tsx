@@ -73,6 +73,7 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
   const [matchKind, setMatchKind] = useState(initial?.match_kind ?? 'native_transfer')
   const [abiId, setAbiId] = useState(initial?.abi_id ?? '')
   const [matchName, setMatchName] = useState(initial?.match_name ?? '')
+  const [selectedNames, setSelectedNames] = useState<string[]>(initial?.match_name ? [initial.match_name] : [])
 
   const needsAbi = matchKind === 'event' || matchKind === 'call'
 
@@ -84,19 +85,37 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
     return []
   }, [selectedAbi, matchKind])
 
-  const submit = (e: React.FormEvent<HTMLFormElement>) => {
+  const toggleName = (n: string) => {
+    setSelectedNames(prev => prev.includes(n) ? prev.filter(x => x !== n) : [...prev, n])
+  }
+
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault(); const fd = new FormData(e.currentTarget)
     let af = {}; try { af = JSON.parse(fd.get('arg_filters') as string || '{}') } catch { /* ignore */ }
-    mut.mutate({
-      name: fd.get('name'),
+    const base = {
       chain_id: fd.get('chain_id'),
       address: fd.get('address') || null,
       abi_id: abiId || null,
       match_kind: matchKind,
-      match_name: matchName || null,
       arg_filters: af,
       enabled: fd.get('enabled') === 'on',
-    })
+    }
+
+    if (isEdit) {
+      mut.mutate({ ...base, name: fd.get('name'), match_name: selectedNames[0] || matchName || null })
+      return
+    }
+
+    // 新建：多选时为每个事件/函数创建一条订阅
+    const names = needsAbi && abiId && selectedNames.length > 0 ? selectedNames : [matchName || null]
+    const baseName = fd.get('name') as string
+    for (let i = 0; i < names.length; i++) {
+      const n = names[i]
+      const subName = names.length > 1 ? `${baseName}-${n}` : baseName
+      await (api.post('/subscriptions', { ...base, name: subName, match_name: n }))
+    }
+    qc.invalidateQueries({ queryKey: ['subscriptions'] })
+    onClose()
   }
 
   return (
@@ -115,7 +134,7 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
           </div>
           <div>
             <label className="text-xs text-gray-500">事件类型</label>
-            <select value={matchKind} onChange={e => { setMatchKind(e.target.value); setMatchName(''); setAbiId('') }} className="w-full border rounded px-3 py-1.5 text-sm">
+            <select value={matchKind} onChange={e => { setMatchKind(e.target.value); setMatchName(''); setAbiId(''); setSelectedNames([]) }} className="w-full border rounded px-3 py-1.5 text-sm">
               <option value="native_transfer">native_transfer</option>
               <option value="token_transfer">token_transfer</option>
               <option value="event">event（合约事件）</option>
@@ -129,18 +148,25 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
             <p className="text-xs text-blue-600 font-medium">从 ABI 选择{matchKind === 'event' ? '事件' : '函数'}</p>
             <div>
               <label className="text-xs text-gray-500">选择 ABI</label>
-              <select value={abiId} onChange={e => { setAbiId(e.target.value); setMatchName('') }} className="w-full border rounded px-3 py-1.5 text-sm">
+              <select value={abiId} onChange={e => { setAbiId(e.target.value); setMatchName(''); setSelectedNames([]) }} className="w-full border rounded px-3 py-1.5 text-sm">
                 <option value="">不绑定 ABI（手动输入）</option>
                 {abis.map(a => <option key={a.id} value={a.id}>{a.name} ({a.kind})</option>)}
               </select>
             </div>
             {abiId && nameOptions.length > 0 && (
               <div>
-                <label className="text-xs text-gray-500">选择{matchKind === 'event' ? '事件' : '函数'}</label>
-                <select value={matchName} onChange={e => setMatchName(e.target.value)} className="w-full border rounded px-3 py-1.5 text-sm">
-                  <option value="">全部匹配（不限名称）</option>
-                  {nameOptions.map(n => <option key={n} value={n}>{n}</option>)}
-                </select>
+                <label className="text-xs text-gray-500">选择{matchKind === 'event' ? '事件' : '函数'}（可多选）</label>
+                <div className="border rounded bg-white p-2 max-h-40 overflow-auto space-y-1 mt-1">
+                  {nameOptions.map(n => (
+                    <label key={n} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 px-1 rounded">
+                      <input type="checkbox" checked={selectedNames.includes(n)} onChange={() => toggleName(n)} className="accent-black" />
+                      <span className="font-mono text-xs">{n}</span>
+                    </label>
+                  ))}
+                </div>
+                {selectedNames.length > 0 && (
+                  <p className="text-xs text-blue-600 mt-1">已选 {selectedNames.length} 个{matchKind === 'event' ? '事件' : '函数'}，将创建 {selectedNames.length} 条订阅</p>
+                )}
               </div>
             )}
             {abiId && nameOptions.length === 0 && (

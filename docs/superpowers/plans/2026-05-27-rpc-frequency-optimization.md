@@ -1343,6 +1343,14 @@ class _Adapter:
     def subscribe_heads(self): ...
 
 
+class _NullChannel:
+    """Minimal Channel stand-in so Notifier.start doesn't crash."""
+    type = "http"
+    async def start(self): pass
+    async def stop(self): pass
+    async def send(self, *a, **kw): pass
+
+
 class _CP:
     def __init__(self, start): self.start = start
     async def get(self, chain_id): return (self.start, "0x" + format(self.start, "064x"))
@@ -1370,7 +1378,7 @@ async def test_catchup_issues_window_sized_log_queries():
     runner = ChainRunner(
         chain=chain,
         adapter_factory=lambda c: adapter,
-        channel_factory=lambda c: None,
+        channel_factory=lambda c: _NullChannel(),
         checkpoint_repo=_CP(start=0),
     )
     await runner.start(snap)
@@ -1400,7 +1408,7 @@ async def test_catchup_skips_logs_for_native_transfer_only_subs():
     adapter = _Adapter(tip=5)
     runner = ChainRunner(
         chain=chain, adapter_factory=lambda c: adapter,
-        channel_factory=lambda c: None,
+        channel_factory=lambda c: _NullChannel(),
         checkpoint_repo=_CP(start=0),
     )
     await runner.start(snap)
@@ -1785,6 +1793,13 @@ class _Adapter:
     def subscribe_heads(self): ...
 
 
+class _NullChannel:
+    type = "http"
+    async def start(self): pass
+    async def stop(self): pass
+    async def send(self, *a, **kw): pass
+
+
 class _CP:
     def __init__(self, start): self.start = start
     async def get(self, chain_id): return (self.start, "0x00")
@@ -1812,7 +1827,7 @@ async def test_solana_catchup_skips_empty_slots():
     adapter = _Adapter(valid_slots=valid_slots, tip=15)
     runner = ChainRunner(
         chain=chain, adapter_factory=lambda c: adapter,
-        channel_factory=lambda c: None,
+        channel_factory=lambda c: _NullChannel(),
         checkpoint_repo=_CP(start=0),
     )
     await runner.start(snap)
@@ -1846,7 +1861,7 @@ async def test_solana_catchup_size_limit_error_raises():
     adapter = _BadAdapter(valid_slots={}, tip=5)
     runner = ChainRunner(
         chain=chain, adapter_factory=lambda c: adapter,
-        channel_factory=lambda c: None,
+        channel_factory=lambda c: _NullChannel(),
         checkpoint_repo=_CP(start=0),
     )
     await runner.start(snap)
@@ -1879,7 +1894,7 @@ async def test_solana_catchup_transient_error_degrades_to_dense():
     adapter = _FlakyAdapter(valid_slots={}, tip=3)
     runner = ChainRunner(
         chain=chain, adapter_factory=lambda c: adapter,
-        channel_factory=lambda c: None,
+        channel_factory=lambda c: _NullChannel(),
         checkpoint_repo=_CP(start=0),
     )
     await runner.start(snap)

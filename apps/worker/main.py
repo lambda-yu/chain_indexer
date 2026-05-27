@@ -163,7 +163,11 @@ class _Worker:
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,
                 )
-                await runner.start(snap)
+                try:
+                    await runner.start(snap)
+                except Exception:  # noqa: BLE001
+                    log.exception("worker.chain_runner_start_failed", chain_id=chain_id)
+                    continue
                 task = asyncio.create_task(runner.run(), name=f"chain-runner:{chain_id}")
                 self._runners[chain_id] = (runner, task)
                 log.info("worker.chain_runner_started", chain_id=chain_id)

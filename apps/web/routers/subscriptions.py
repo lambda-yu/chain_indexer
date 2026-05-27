@@ -98,12 +98,8 @@ async def get_subscription(
         .where(SubscriptionChannel.subscription_id == sub_id)
     )
     channel_ids: list[str] = list(res.scalars().all())
-    return SubscriptionDetail(
-        id=sub.id, name=sub.name, chain_id=sub.chain_id, address=sub.address,
-        abi_id=sub.abi_id, match_kind=sub.match_kind.value, match_name=sub.match_name,
-        arg_filters=sub.arg_filters, enabled=sub.enabled,
-        channel_ids=channel_ids,
-    )
+    base = SubscriptionOut.model_validate(sub)
+    return SubscriptionDetail(**base.model_dump(), channel_ids=channel_ids)
 
 
 @router.post("/{sub_id}/channels", status_code=status.HTTP_204_NO_CONTENT)

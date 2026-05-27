@@ -113,7 +113,20 @@ def create_app(
     spa_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "web" / "dist"
     if spa_dir.is_dir():
         from fastapi.staticfiles import StaticFiles
-        app.mount("/", StaticFiles(directory=str(spa_dir), html=True), name="spa")
+        from starlette.responses import FileResponse
+
+        # Serve static assets (JS/CSS/images) under /assets
+        assets_dir = spa_dir / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        # SPA fallback: any non-API GET returns index.html
+        @app.get("/{path:path}", include_in_schema=False)
+        async def spa_fallback(path: str) -> FileResponse:
+            file_path = spa_dir / path
+            if file_path.is_file() and ".." not in path:
+                return FileResponse(str(file_path))
+            return FileResponse(str(spa_dir / "index.html"))
 
     return app
 

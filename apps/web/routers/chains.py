@@ -67,7 +67,7 @@ async def update_chain(
 async def list_chains(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[ChainOut]:
-    rows = await ChainRepo(session).list_enabled()
+    rows = await ChainRepo(session).list_all()
     return [ChainOut.model_validate(r) for r in rows]
 
 

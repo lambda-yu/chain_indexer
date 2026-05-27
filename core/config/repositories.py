@@ -57,6 +57,10 @@ class ChainRepo:
         r = await self.s.execute(select(Chain).where(Chain.enabled.is_(True)))
         return list(r.scalars().all())
 
+    async def list_all(self) -> list[Chain]:
+        r = await self.s.execute(select(Chain))
+        return list(r.scalars().all())
+
     async def update(self, chain_id: str, **fields: Any) -> None:
         await self.s.execute(sa_update(Chain).where(Chain.id == chain_id).values(**fields))
 

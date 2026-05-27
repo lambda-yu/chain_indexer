@@ -38,8 +38,6 @@ class ParseBlockRequest(BaseModel):
 def _match_event(event: Event, matcher: Matcher) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
     for sub, channels in matcher.match(event):
-        if not channels:
-            continue
         hits.append({
             "subscription_id": sub.id,
             "subscription_name": sub.name,

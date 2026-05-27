@@ -13,11 +13,13 @@ from core.chains.evm import EvmAdapter
 from core.chains.solana import SolanaAdapter
 from core.config.repositories import ChainRepo
 from core.config.snapshot import load_snapshot
+from core.matcher.matcher import Matcher
 from core.parser.abi_call import AbiCallParser
 from core.parser.abi_event import AbiEventParser
 from core.parser.anchor_call import AnchorIdlCallParser
 from core.parser.anchor_event import AnchorIdlEventParser
 from core.parser.erc20 import Erc20TransferParser
+from core.parser.event import Event
 from core.parser.native import EvmNativeTransferParser
 from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
 from core.parser.sol_native import SolNativeTransferParser
@@ -32,6 +34,32 @@ class ParseBlockRequest(BaseModel):
     block_number: int
 
 
+def _match_event(event: Event, matcher: Matcher) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for sub, channels in matcher.match(event):
+        if not channels:
+            continue
+        hits.append({
+            "subscription_id": sub.id,
+            "subscription_name": sub.name,
+            "match_kind": sub.match_kind,
+            "match_name": sub.match_name,
+            "channels": [{"id": ch.id, "name": ch.name, "type": ch.type} for ch in channels],
+        })
+    return hits
+
+
+def _enrich_events(events: list[Event], matcher: Matcher) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for ev in events:
+        d = asdict(ev)
+        hits = _match_event(ev, matcher)
+        d["matched_subscriptions"] = hits
+        d["matched"] = len(hits) > 0
+        result.append(d)
+    return result
+
+
 @router.post("/parse-block")
 async def parse_block(
     req: ParseBlockRequest,
@@ -44,6 +72,7 @@ async def parse_block(
     snap = await load_snapshot(session)
     registry = AbiRegistry()
     registry.refresh(snap)
+    matcher = Matcher(snap)
 
     kind = chain_row.kind.value
 
@@ -71,9 +100,12 @@ async def parse_block(
                 AbiCallParser(chain_id=chain_row.id, registry=registry),
             ]
             pipeline = EvmParserPipeline(parsers)
-            events = [asdict(e) for e in pipeline.run(block)]
+            events = list(pipeline.run(block))
         finally:
             await adapter.disconnect()
+
+        enriched = _enrich_events(events, matcher)
+        matched_count = sum(1 for e in enriched if e["matched"])
 
         return {
             "chain_id": chain_row.id,
@@ -81,7 +113,9 @@ async def parse_block(
             "block_number": req.block_number,
             "tx_count": len(block.txs),
             "log_count": len(block.logs),
-            "events": events,
+            "event_count": len(enriched),
+            "matched_count": matched_count,
+            "events": enriched,
         }
 
     if kind == "solana":
@@ -98,7 +132,7 @@ async def parse_block(
         try:
             sol_block = await adapter_sol.fetch_block(req.block_number)
             if sol_block is None:
-                return {"chain_id": chain_row.id, "kind": kind, "block_number": req.block_number, "events": [], "error": "slot not found or skipped"}
+                return {"chain_id": chain_row.id, "kind": kind, "block_number": req.block_number, "events": [], "matched_count": 0, "event_count": 0, "error": "slot not found or skipped"}
 
             sol_parsers: list[Any] = [
                 SolNativeTransferParser(chain_id=chain_row.id),
@@ -108,16 +142,21 @@ async def parse_block(
                 AnchorIdlCallParser(chain_id=chain_row.id, registry=registry),
             ]
             sol_pipeline = SolanaParserPipeline(sol_parsers)
-            events = [asdict(e) for e in sol_pipeline.run(sol_block)]
+            events = list(sol_pipeline.run(sol_block))
         finally:
             await adapter_sol.disconnect()
+
+        enriched = _enrich_events(events, matcher)
+        matched_count = sum(1 for e in enriched if e["matched"])
 
         return {
             "chain_id": chain_row.id,
             "kind": kind,
             "block_number": req.block_number,
             "tx_count": len(sol_block.transactions),
-            "events": events,
+            "event_count": len(enriched),
+            "matched_count": matched_count,
+            "events": enriched,
         }
 
     raise HTTPException(status_code=400, detail=f"unsupported chain kind: {kind}")

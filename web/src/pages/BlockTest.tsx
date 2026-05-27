@@ -4,9 +4,11 @@ import { api } from '@/api/client'
 import { Play, Loader2 } from 'lucide-react'
 
 interface Chain { id: string; kind: string }
+interface MatchedSub { subscription_id: string; subscription_name: string; match_kind: string; match_name: string | null; channels: { id: string; name: string; type: string }[] }
 interface ParseResult {
   chain_id: string; kind: string; block_number: number
-  tx_count?: number; log_count?: number; events: Record<string, unknown>[]; error?: string
+  tx_count?: number; log_count?: number; event_count?: number; matched_count?: number
+  events: (Record<string, unknown> & { matched?: boolean; matched_subscriptions?: MatchedSub[] })[]; error?: string
 }
 
 export default function BlockTest() {
@@ -60,8 +62,12 @@ export default function BlockTest() {
         <div>
           <div className="flex gap-4 mb-4">
             <div className="border rounded-lg p-3 text-center">
-              <p className="text-2xl font-bold">{result.events.length}</p>
+              <p className="text-2xl font-bold">{result.event_count ?? result.events.length}</p>
               <p className="text-xs text-gray-500">解析事件</p>
+            </div>
+            <div className={`border rounded-lg p-3 text-center ${result.matched_count ? 'border-green-300 bg-green-50' : ''}`}>
+              <p className="text-2xl font-bold text-green-600">{result.matched_count ?? 0}</p>
+              <p className="text-xs text-gray-500">命中订阅</p>
             </div>
             {result.tx_count !== undefined && <div className="border rounded-lg p-3 text-center">
               <p className="text-2xl font-bold">{result.tx_count}</p>
@@ -80,11 +86,12 @@ export default function BlockTest() {
           ) : (
             <div className="space-y-2">
               {result.events.map((ev, i) => (
-                <div key={i} className="border rounded-lg p-3">
+                <div key={i} className={`border rounded-lg p-3 ${ev.matched ? 'border-green-300 bg-green-50/30' : ''}`}>
                   <div className="flex items-center gap-2 mb-2">
                     <span className="px-2 py-0.5 rounded text-xs font-medium bg-gray-100">{String(ev.kind)}</span>
                     {ev.name ? <span className="text-sm font-medium">{String(ev.name)}</span> : null}
-                    {ev.contract ? <span className="text-xs font-mono text-gray-400 truncate max-w-64">{String(ev.contract)}</span> : null}
+                    {ev.matched ? <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-100 text-green-700 font-medium">命中</span> : null}
+                    {ev.contract ? <span className="text-xs font-mono text-gray-400 truncate max-w-64 ml-auto">{String(ev.contract)}</span> : null}
                   </div>
                   {ev.args && typeof ev.args === 'object' && Object.keys(ev.args as object).length > 0 ? (
                     <div className="bg-gray-50 rounded p-2 mb-1">
@@ -94,6 +101,20 @@ export default function BlockTest() {
                           <div key={k}><span className="text-gray-500">{k}:</span> <span className="font-mono">{String(v)}</span></div>
                         ))}
                       </div>
+                    </div>
+                  ) : null}
+                  {ev.matched && ev.matched_subscriptions && ev.matched_subscriptions.length > 0 ? (
+                    <div className="bg-green-50 border border-green-200 rounded p-2 mt-1">
+                      <p className="text-xs text-green-700 font-medium mb-1">✓ 命中 {ev.matched_subscriptions.length} 条订阅</p>
+                      {ev.matched_subscriptions.map((sub, si) => (
+                        <div key={si} className="flex items-center gap-2 text-xs mt-0.5">
+                          <span className="font-medium">{sub.subscription_name}</span>
+                          <span className="text-gray-400">→</span>
+                          {sub.channels.map(ch => (
+                            <span key={ch.id} className={`px-1.5 py-0.5 rounded text-[10px] ${ch.type === 'http' ? 'bg-green-100 text-green-700' : ch.type === 'mq' ? 'bg-yellow-100 text-yellow-700' : 'bg-indigo-100 text-indigo-700'}`}>{ch.name}</span>
+                          ))}
+                        </div>
+                      ))}
                     </div>
                   ) : null}
                   <div className="text-xs text-gray-400 mt-1">

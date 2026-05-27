@@ -14,3 +14,6 @@ build/
 .idea/
 web/node_modules/
 web/dist/
+
+# Local worktrees for isolated feature work
+.worktrees/

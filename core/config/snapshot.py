@@ -25,6 +25,7 @@ class SnapshotSubscription:
     arg_filters: dict[str, Any]
     enabled: bool
     channel_ids: list[str] = field(default_factory=list)
+    start_block: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
                 arg_filters=sub.arg_filters or {},
                 enabled=sub.enabled,
                 channel_ids=[c.id for c in channels],
+                start_block=sub.start_block,
             )
         )
 

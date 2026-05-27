@@ -81,6 +81,7 @@ class SubscriptionCreate(BaseModel):
     match_kind: Literal["native_transfer", "token_transfer", "event", "call"]
     match_name: str | None = None
     arg_filters: dict[str, ArgFilterValue] = Field(default_factory=dict)
+    start_block: int | None = None
     enabled: bool = True
 
     @field_validator("arg_filters")
@@ -106,6 +107,7 @@ class SubscriptionOut(BaseModel):
     match_kind: str
     match_name: str | None
     arg_filters: dict[str, Any]
+    start_block: int | None
     enabled: bool
 
 

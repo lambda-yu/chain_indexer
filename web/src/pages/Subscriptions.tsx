@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
 import { Plus, Trash2, Pencil } from 'lucide-react'
 
-interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown> }
+interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null }
 interface AbiItem { id: string; name: string; kind: string; body: unknown }
 
 export default function Subscriptions() {
@@ -26,7 +26,7 @@ export default function Subscriptions() {
         <table className="w-full text-sm border-collapse">
           <thead><tr className="border-b text-left text-gray-500">
             <th className="py-2 px-2">名称</th><th className="py-2 px-2">链</th><th className="py-2 px-2">类型</th>
-            <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
+            <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">起始块</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
           </tr></thead>
           <tbody>{subs.map(s => (
             <tr key={s.id} className="border-b hover:bg-gray-50">
@@ -35,6 +35,7 @@ export default function Subscriptions() {
               <td className="py-2 px-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100">{s.match_kind}</span></td>
               <td className="py-2 px-2 text-xs">{s.abi_id ? (abiNameMap[s.abi_id] ?? s.abi_id.slice(0, 8)) : '—'}</td>
               <td className="py-2 px-2">{s.match_name ?? '—'}</td>
+              <td className="py-2 px-2 font-mono text-xs">{s.start_block?.toLocaleString() ?? '—'}</td>
               <td className="py-2 px-2">{s.enabled ? <span className="text-green-600">是</span> : <span className="text-gray-400">否</span>}</td>
               <td className="py-2 px-2 flex gap-2">
                 <button onClick={() => { setEditing(s); setShowForm(true) }} className="text-blue-500 hover:text-blue-700"><Pencil size={14} /></button>
@@ -108,6 +109,7 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
       abi_id: abiId || null,
       match_kind: matchKind,
       arg_filters: af,
+      start_block: fd.get('start_block') ? Number(fd.get('start_block')) : null,
       enabled: fd.get('enabled') === 'on',
     }
 
@@ -217,6 +219,10 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         )}
 
         <input name="address" defaultValue={initial?.address ?? ''} placeholder="合约地址（可选）" className="w-full border rounded px-3 py-1.5 text-sm font-mono" />
+        <div>
+          <label className="text-xs text-gray-500">起始区块（可选，留空从最新开始）</label>
+          <input name="start_block" type="number" defaultValue={initial?.start_block ?? ''} placeholder="如 87000000" className="w-full border rounded px-3 py-1.5 text-sm font-mono" />
+        </div>
         <div>
           <div className="flex items-center justify-between mb-1">
             <label className="text-xs text-gray-500">参数过滤 JSON</label>

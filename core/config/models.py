@@ -104,6 +104,7 @@ class Subscription(Base, TimestampMixin):
     match_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     arg_filters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    start_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
 
 
 class Channel(Base, TimestampMixin):

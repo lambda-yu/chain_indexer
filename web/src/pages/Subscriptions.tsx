@@ -14,19 +14,19 @@ export default function Subscriptions() {
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">Subscriptions</h2>
-        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> Add</button>
+        <h2 className="text-2xl font-bold">订阅规则</h2>
+        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> 添加</button>
       </div>
-      {isLoading ? <p className="text-gray-500">Loading...</p> : (
+      {isLoading ? <p className="text-gray-500">加载中...</p> : (
         <table className="w-full text-sm border-collapse">
-          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">Name</th><th className="py-2 px-2">Chain</th><th className="py-2 px-2">Kind</th><th className="py-2 px-2">Match Name</th><th className="py-2 px-2">Enabled</th><th className="py-2 px-2"></th></tr></thead>
+          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">名称</th><th className="py-2 px-2">链</th><th className="py-2 px-2">事件类型</th><th className="py-2 px-2">匹配名</th><th className="py-2 px-2">启用</th><th className="py-2 px-2"></th></tr></thead>
           <tbody>{subs.map(s => (
             <tr key={s.id} className="border-b hover:bg-gray-50">
               <td className="py-2 px-2 font-medium">{s.name}</td>
               <td className="py-2 px-2 font-mono text-xs">{s.chain_id}</td>
               <td className="py-2 px-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100">{s.match_kind}</span></td>
               <td className="py-2 px-2">{s.match_name ?? '—'}</td>
-              <td className="py-2 px-2">{s.enabled ? <span className="text-green-600">Yes</span> : <span className="text-gray-400">No</span>}</td>
+              <td className="py-2 px-2">{s.enabled ? <span className="text-green-600">是</span> : <span className="text-gray-400">否</span>}</td>
               <td className="py-2 px-2"><button onClick={() => delMut.mutate(s.id)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button></td>
             </tr>
           ))}</tbody>
@@ -49,17 +49,17 @@ function SubForm({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
       <form onSubmit={submit} className="bg-white rounded-lg p-6 w-96 space-y-3">
-        <h3 className="text-lg font-bold">Add Subscription</h3>
-        <input name="name" placeholder="Name" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <h3 className="text-lg font-bold">添加订阅</h3>
+        <input name="name" placeholder="订阅名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
         <select name="chain_id" required className="w-full border rounded px-3 py-1.5 text-sm">{chains.map(c => <option key={c.id} value={c.id}>{c.id}</option>)}</select>
         <select name="match_kind" className="w-full border rounded px-3 py-1.5 text-sm">
           <option value="native_transfer">native_transfer</option><option value="token_transfer">token_transfer</option>
           <option value="event">event</option><option value="call">call</option>
         </select>
-        <input name="match_name" placeholder="Match name (optional)" className="w-full border rounded px-3 py-1.5 text-sm" />
-        <input name="address" placeholder="Contract address (optional)" className="w-full border rounded px-3 py-1.5 text-sm" />
-        <textarea name="arg_filters" placeholder='arg_filters JSON (e.g. {"to": "0x..."})' defaultValue="{}" className="w-full border rounded px-3 py-1.5 text-sm h-16 font-mono" />
-        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">Cancel</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">Create</button></div>
+        <input name="match_name" placeholder="匹配名称（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />
+        <input name="address" placeholder="合约地址（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />
+        <textarea name="arg_filters" placeholder='参数过滤 JSON（如 {"to": "0x..."}）' defaultValue="{}" className="w-full border rounded px-3 py-1.5 text-sm h-16 font-mono" />
+        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">创建</button></div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
     </div>

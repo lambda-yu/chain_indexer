@@ -45,26 +45,26 @@ export default function EventStream() {
 
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-4">Event Stream</h2>
+      <h2 className="text-2xl font-bold mb-4">实时事件</h2>
       <div className="flex items-center gap-3 mb-4">
         <select value={selectedId} onChange={e => setSelectedId(e.target.value)} className="border rounded px-3 py-1.5 text-sm" disabled={connected}>
-          <option value="">Select WS channel...</option>
+          <option value="">选择 WS 渠道...</option>
           {wsChannels.map(c => <option key={c.id} value={c.id}>{c.name} ({c.id.slice(0, 8)})</option>)}
         </select>
         {connected ? (
-          <button onClick={disconnect} className="flex items-center gap-1 bg-red-500 text-white px-3 py-1.5 rounded text-sm"><PlugZap size={14} /> Disconnect</button>
+          <button onClick={disconnect} className="flex items-center gap-1 bg-red-500 text-white px-3 py-1.5 rounded text-sm"><PlugZap size={14} /> 断开</button>
         ) : (
-          <button onClick={connect} disabled={!selectedId} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm disabled:opacity-40"><Plug size={14} /> Connect</button>
+          <button onClick={connect} disabled={!selectedId} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm disabled:opacity-40"><Plug size={14} /> 连接</button>
         )}
         {connected && (
           <button onClick={() => setPaused(!paused)} className="flex items-center gap-1 border px-3 py-1.5 rounded text-sm">
-            {paused ? <><Play size={14} /> Resume</> : <><Pause size={14} /> Pause</>}
+            {paused ? <><Play size={14} /> 继续</> : <><Pause size={14} /> 暂停</>}
           </button>
         )}
-        <span className="text-xs text-gray-400">{events.length} events</span>
+        <span className="text-xs text-gray-400">{events.length} 条事件</span>
       </div>
 
-      {!connected && events.length === 0 && <p className="text-gray-400 text-sm">Select a WS channel and connect to see live events.</p>}
+      {!connected && events.length === 0 && <p className="text-gray-400 text-sm">选择一个 WS 渠道并连接以查看实时事件。</p>}
 
       <div className="space-y-2">
         {events.map((ev, i) => (

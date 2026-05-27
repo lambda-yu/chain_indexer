@@ -3,12 +3,12 @@ import { Activity, Box, Link2, Radio, Settings, Upload } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const NAV = [
-  { to: '/', label: 'Dashboard', icon: Activity },
-  { to: '/chains', label: 'Chains', icon: Box },
-  { to: '/channels', label: 'Channels', icon: Radio },
-  { to: '/subscriptions', label: 'Subscriptions', icon: Link2 },
-  { to: '/abis', label: 'ABIs', icon: Upload },
-  { to: '/events', label: 'Event Stream', icon: Settings },
+  { to: '/', label: '仪表盘', icon: Activity },
+  { to: '/chains', label: '链配置', icon: Box },
+  { to: '/channels', label: '通知渠道', icon: Radio },
+  { to: '/subscriptions', label: '订阅规则', icon: Link2 },
+  { to: '/abis', label: 'ABI 管理', icon: Upload },
+  { to: '/events', label: '实时事件', icon: Settings },
 ]
 
 export default function Layout() {
@@ -16,7 +16,7 @@ export default function Layout() {
   return (
     <div className="flex h-screen">
       <aside className="w-56 border-r bg-gray-50 p-4 flex flex-col gap-1">
-        <h1 className="text-lg font-bold mb-4">Chain Indexer</h1>
+        <h1 className="text-lg font-bold mb-4">链索引器</h1>
         {NAV.map(({ to, label, icon: Icon }) => (
           <Link
             key={to}

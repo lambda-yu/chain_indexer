@@ -23,12 +23,12 @@ export default function Abis() {
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">ABIs</h2>
-        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> Upload ABI</button>
+        <h2 className="text-2xl font-bold">ABI 管理</h2>
+        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> 上传 ABI</button>
       </div>
-      {isLoading ? <p className="text-gray-500">Loading...</p> : (
+      {isLoading ? <p className="text-gray-500">加载中...</p> : (
         <table className="w-full text-sm border-collapse">
-          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">Name</th><th className="py-2 px-2">Kind</th><th className="py-2 px-2">ID</th><th className="py-2 px-2"></th></tr></thead>
+          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">名称</th><th className="py-2 px-2">类型</th><th className="py-2 px-2">ID</th><th className="py-2 px-2"></th></tr></thead>
           <tbody>{abis.map(a => (
             <tr key={a.id} className="border-b hover:bg-gray-50">
               <td className="py-2 px-2 font-medium">{a.name}</td>
@@ -46,10 +46,10 @@ export default function Abis() {
       {preview && (
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setPreview(null)}>
           <div className="bg-white rounded-lg p-6 w-[500px] max-h-[80vh] overflow-auto" onClick={e => e.stopPropagation()}>
-            <h3 className="text-lg font-bold mb-3">{preview.name} — Preview</h3>
+            <h3 className="text-lg font-bold mb-3">{preview.name} — 预览</h3>
             {(() => { const { events, functions } = extractNames(preview.body); return (<>
-              {events.length > 0 && <div className="mb-3"><p className="text-xs text-gray-500 mb-1">Events ({events.length})</p>{events.map(n => <span key={n} className="inline-block px-2 py-0.5 rounded bg-orange-100 text-orange-700 text-xs mr-1 mb-1">{n}</span>)}</div>}
-              {functions.length > 0 && <div className="mb-3"><p className="text-xs text-gray-500 mb-1">Functions ({functions.length})</p>{functions.map(n => <span key={n} className="inline-block px-2 py-0.5 rounded bg-teal-100 text-teal-700 text-xs mr-1 mb-1">{n}</span>)}</div>}
+              {events.length > 0 && <div className="mb-3"><p className="text-xs text-gray-500 mb-1">事件 ({events.length})</p>{events.map(n => <span key={n} className="inline-block px-2 py-0.5 rounded bg-orange-100 text-orange-700 text-xs mr-1 mb-1">{n}</span>)}</div>}
+              {functions.length > 0 && <div className="mb-3"><p className="text-xs text-gray-500 mb-1">函数 ({functions.length})</p>{functions.map(n => <span key={n} className="inline-block px-2 py-0.5 rounded bg-teal-100 text-teal-700 text-xs mr-1 mb-1">{n}</span>)}</div>}
             </>)})()}
             <pre className="bg-gray-50 rounded p-3 text-xs overflow-auto max-h-60 mt-3">{JSON.stringify(preview.body, null, 2)}</pre>
           </div>
@@ -75,12 +75,12 @@ function AbiForm({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
       <form onSubmit={submit} className="bg-white rounded-lg p-6 w-[500px] space-y-3">
-        <h3 className="text-lg font-bold">Upload ABI</h3>
-        <input name="name" placeholder="ABI name" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <h3 className="text-lg font-bold">上传 ABI</h3>
+        <input name="name" placeholder="ABI 名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
         <select name="kind" className="w-full border rounded px-3 py-1.5 text-sm"><option value="evm_abi">EVM ABI</option><option value="solana_idl">Solana IDL</option></select>
-        <div><input type="file" accept=".json" onChange={handleFile} className="text-sm" /><span className="text-xs text-gray-400 ml-2">or paste below</span></div>
-        <textarea value={body} onChange={e => setBody(e.target.value)} placeholder="Paste ABI/IDL JSON here" className="w-full border rounded px-3 py-1.5 text-sm h-32 font-mono" />
-        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">Cancel</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">Upload</button></div>
+        <div><input type="file" accept=".json" onChange={handleFile} className="text-sm" /><span className="text-xs text-gray-400 ml-2">或在下方粘贴</span></div>
+        <textarea value={body} onChange={e => setBody(e.target.value)} placeholder="粘贴 ABI/IDL JSON" className="w-full border rounded px-3 py-1.5 text-sm h-32 font-mono" />
+        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">上传</button></div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
     </div>

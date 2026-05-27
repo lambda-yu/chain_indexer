@@ -16,12 +16,12 @@ export default function Channels() {
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">Channels</h2>
-        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> Add Channel</button>
+        <h2 className="text-2xl font-bold">通知渠道</h2>
+        <button onClick={() => setShowForm(true)} className="flex items-center gap-1 bg-black text-white px-3 py-1.5 rounded text-sm"><Plus size={14} /> 添加渠道</button>
       </div>
-      {isLoading ? <p className="text-gray-500">Loading...</p> : (
+      {isLoading ? <p className="text-gray-500">加载中...</p> : (
         <table className="w-full text-sm border-collapse">
-          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">Name</th><th className="py-2 px-2">Type</th><th className="py-2 px-2">Config</th><th className="py-2 px-2"></th></tr></thead>
+          <thead><tr className="border-b text-left text-gray-500"><th className="py-2 px-2">名称</th><th className="py-2 px-2">类型</th><th className="py-2 px-2">配置</th><th className="py-2 px-2"></th></tr></thead>
           <tbody>{channels.map(c => (
             <tr key={c.id} className="border-b hover:bg-gray-50">
               <td className="py-2 px-2 font-medium">{c.name}</td>
@@ -52,13 +52,13 @@ function ChannelForm({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
       <form onSubmit={submit} className="bg-white rounded-lg p-6 w-96 space-y-3">
-        <h3 className="text-lg font-bold">Add Channel</h3>
-        <input name="name" placeholder="Channel name" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <h3 className="text-lg font-bold">添加渠道</h3>
+        <input name="name" placeholder="渠道名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
         <div className="flex gap-2">{(['http','mq','ws'] as const).map(t => <button key={t} type="button" onClick={() => setType(t)} className={`flex-1 py-1.5 rounded text-sm ${type===t?'bg-black text-white':'border'}`}>{t.toUpperCase()}</button>)}</div>
-        {type === 'http' && <><input name="url" placeholder="Webhook URL" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="method" placeholder="Method (POST)" defaultValue="POST" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
-        {type === 'mq' && <><input name="stream" placeholder="Redis stream name" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="maxlen" type="number" placeholder="Max length (optional)" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
-        {type === 'ws' && <input name="ws_fanout_channel" placeholder="Fanout channel name" required className="w-full border rounded px-3 py-1.5 text-sm" />}
-        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">Cancel</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">Create</button></div>
+        {type === 'http' && <><input name="url" placeholder="Webhook 地址" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="method" placeholder="请求方法 (POST)" defaultValue="POST" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
+        {type === 'mq' && <><input name="stream" placeholder="Redis Stream 名称" required className="w-full border rounded px-3 py-1.5 text-sm" /><input name="maxlen" type="number" placeholder="最大长度（可选）" className="w-full border rounded px-3 py-1.5 text-sm" /></>}
+        {type === 'ws' && <input name="ws_fanout_channel" placeholder="广播频道名称" required className="w-full border rounded px-3 py-1.5 text-sm" />}
+        <div className="flex gap-2 pt-2"><button type="button" onClick={onClose} className="flex-1 border rounded py-1.5 text-sm">取消</button><button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">创建</button></div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
     </div>

@@ -306,39 +306,51 @@ In `apps/web/routers/chains.py:51-60` (update route):
 
 - [ ] **Step 5.3: Write test that round-trips new fields through the API**
 
-Append to `tests/unit/test_web_app.py` (find by `grep -l "def test_.*chains" tests/unit/test_web_app.py`; if no chain test exists, add a fresh one):
+Append to `tests/unit/test_web_chains.py`. The existing tests use a sync `TestClient` via the `_client(db, bus)` helper already defined in that file — follow the same pattern (don't introduce an async client fixture).
 
 ```python
-import pytest
-
-@pytest.mark.asyncio
-async def test_chain_create_persists_log_and_slot_range(async_client):
+def test_chain_create_persists_log_and_slot_range(db: Database) -> None:
+    bus = _FakeBus()
     payload = {
         "id": "test-evm-range",
         "kind": "evm",
         "rpc_http": "http://localhost:8545",
+        "rpc_ws": None,
         "confirmations": 1,
         "poll_interval_ms": 1000,
         "log_query_range_blocks": 250,
         "slot_query_range_blocks": 500,
+        "enabled": True,
     }
-    r = await async_client.post("/api/chains", json=payload)
-    assert r.status_code == 201
-    body = r.json()
-    assert body["log_query_range_blocks"] == 250
-    assert body["slot_query_range_blocks"] == 500
+    with _client(db, bus) as c:
+        r = c.post("/api/chains", json=payload)
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["log_query_range_blocks"] == 250
+        assert body["slot_query_range_blocks"] == 500
 
-    g = await async_client.get(f"/api/chains/{payload['id']}")
-    assert g.status_code == 200
-    assert g.json()["log_query_range_blocks"] == 250
+        g = c.get(f"/api/chains/{payload['id']}")
+        assert g.status_code == 200
+        assert g.json()["log_query_range_blocks"] == 250
+
+
+def test_chain_create_rejects_zero_log_query_range(db: Database) -> None:
+    bus = _FakeBus()
+    payload = {
+        "id": "bad", "kind": "evm", "rpc_http": "http://x",
+        "rpc_ws": None, "confirmations": 1, "poll_interval_ms": 1000,
+        "log_query_range_blocks": 0,  # below ge=1 bound
+        "enabled": True,
+    }
+    with _client(db, bus) as c:
+        r = c.post("/api/chains", json=payload)
+    assert r.status_code == 422
 ```
 
-The fixture `async_client` is the same one used by the other chain tests in this file — reuse, don't redefine.
+- [ ] **Step 5.4: Run the new tests**
 
-- [ ] **Step 5.4: Run the new test**
-
-Run: `uv run pytest tests/unit/test_web_app.py::test_chain_create_persists_log_and_slot_range -v`
-Expected: PASS.
+Run: `uv run pytest tests/unit/test_web_chains.py::test_chain_create_persists_log_and_slot_range tests/unit/test_web_chains.py::test_chain_create_rejects_zero_log_query_range -v`
+Expected: both PASS.
 
 - [ ] **Step 5.5: Run full unit test suite to verify no regressions**
 
@@ -348,7 +360,7 @@ Expected: all pass.
 - [ ] **Step 5.6: Commit**
 
 ```bash
-git add apps/web/schemas.py apps/web/routers/chains.py tests/unit/test_web_app.py
+git add apps/web/schemas.py apps/web/routers/chains.py tests/unit/test_web_chains.py
 git commit -m "feat(web): expose log_query_range_blocks and slot_query_range_blocks on /api/chains"
 ```
 
@@ -612,16 +624,15 @@ import structlog
 from core.abi.decoder import event_topic0
 from core.abi.registry import AbiRegistry
 from core.config.snapshot import ConfigSnapshot
+from core.parser.erc20 import ERC20_TRANSFER_TOPIC0  # re-export below
 
 log = structlog.get_logger(__name__)
 
-# ERC-20 Transfer(address,address,uint256) topic0 — fixed, no need to compute.
-ERC20_TRANSFER_TOPIC0 = (
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-)
+# Re-export so consumers (tests, future callers) have a single import path.
+__all__ = ["EvmLogFilterSet", "build_evm_log_filter", "ERC20_TRANSFER_TOPIC0"]
 
 # Subscription kinds that consume `eth_getLogs` output. native_transfer / call
-# / internal_call do not look at logs at all.
+# do not look at logs at all.
 _LOG_CONSUMING_KINDS = frozenset({"event", "token_transfer"})
 
 
@@ -1012,15 +1023,14 @@ from core.chains.types import Block, BlockHeader, Log
 
 - [ ] **Step 9.3: Write a test for the head-following filter usage**
 
-Append to `tests/unit/test_chain_runner.py`:
+Append to `tests/unit/test_chain_runner.py`. **Reuse the existing `_CheckpointStub` helper** at line 141 — don't introduce a parallel fake.
 
 ```python
 @pytest.mark.asyncio
-async def test_head_following_passes_filter_to_fetch_logs(monkeypatch):
+async def test_head_following_passes_filter_to_fetch_logs() -> None:
     """ChainRunner with a token_transfer subscription should call fetch_logs
     with the ERC-20 topic0 in `topics`."""
     from core.matcher.filter_set import ERC20_TRANSFER_TOPIC0
-    # Build a snapshot with one token_transfer sub.
     snap = ConfigSnapshot(
         version=1,
         subscriptions=[SnapshotSubscription(
@@ -1032,7 +1042,6 @@ async def test_head_following_passes_filter_to_fetch_logs(monkeypatch):
         chains=[],
         abis=[],
     )
-    # Build a ChainRunner with a stub adapter that records calls.
     captured: dict = {}
 
     class _Adapter:
@@ -1040,10 +1049,14 @@ async def test_head_following_passes_filter_to_fetch_logs(monkeypatch):
         async def connect(self): pass
         async def disconnect(self): pass
         async def get_latest_block_number(self): return 100
-        async def fetch_block(self, n): return Block(
-            header=BlockHeader(number=n, hash="0x" + "f"*64, parent_hash="0x"+"0"*64, timestamp=0),
-            txs=[], logs=[],
-        )
+        async def fetch_block(self, n):
+            return Block(
+                header=BlockHeader(
+                    number=n, hash="0x" + "f"*64,
+                    parent_hash="0x" + "0"*64, timestamp=0,
+                ),
+                txs=[], logs=[],
+            )
         async def fetch_logs(self, from_block, to_block, addresses=None, topics=None):
             captured["from"] = from_block
             captured["to"] = to_block
@@ -1060,8 +1073,8 @@ async def test_head_following_passes_filter_to_fetch_logs(monkeypatch):
     runner = ChainRunner(
         chain=chain,
         adapter_factory=lambda c: _Adapter(),
-        channel_factory=lambda c: None,  # noqa: ARG005 — notifier won't dispatch
-        checkpoint_repo=_FakeCheckpointRepo(),  # reuse helper from this test file
+        channel_factory=lambda c: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
     )
     await runner.start(snap)
     await runner._process_confirmed_block(
@@ -1074,7 +1087,7 @@ async def test_head_following_passes_filter_to_fetch_logs(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_head_following_skips_logs_when_no_log_subscription(monkeypatch):
+async def test_head_following_skips_logs_when_no_log_subscription() -> None:
     """If only native_transfer subs exist, fetch_logs should never be called."""
     snap = ConfigSnapshot(
         version=1,
@@ -1093,21 +1106,28 @@ async def test_head_following_skips_logs_when_no_log_subscription(monkeypatch):
         async def connect(self): pass
         async def disconnect(self): pass
         async def get_latest_block_number(self): return 100
-        async def fetch_block(self, n): return Block(
-            header=BlockHeader(number=n, hash="0x" + "f"*64, parent_hash="0x"+"0"*64, timestamp=0),
-            txs=[], logs=[],
-        )
+        async def fetch_block(self, n):
+            return Block(
+                header=BlockHeader(
+                    number=n, hash="0x" + "f"*64,
+                    parent_hash="0x" + "0"*64, timestamp=0,
+                ),
+                txs=[], logs=[],
+            )
         async def fetch_logs(self, *a, **kw):
             called["fetch_logs"] += 1
             return []
         def subscribe_heads(self): ...
         async def trace_block(self, n): return []
 
-    chain = SnapshotChain(id="evm-1", kind="evm", rpc_http="http://x", rpc_ws=None, confirmations=0, poll_interval_ms=1000)
+    chain = SnapshotChain(
+        id="evm-1", kind="evm", rpc_http="http://x", rpc_ws=None,
+        confirmations=0, poll_interval_ms=1000,
+    )
     runner = ChainRunner(
         chain=chain, adapter_factory=lambda c: _Adapter(),
-        channel_factory=lambda c: None,
-        checkpoint_repo=_FakeCheckpointRepo(),
+        channel_factory=lambda c: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
     )
     await runner.start(snap)
     await runner._process_confirmed_block(
@@ -1116,16 +1136,7 @@ async def test_head_following_skips_logs_when_no_log_subscription(monkeypatch):
     assert called["fetch_logs"] == 0
 ```
 
-If `_FakeCheckpointRepo` is not already in the test file, write a minimal one at the top:
-
-```python
-class _FakeCheckpointRepo:
-    def __init__(self) -> None:
-        self.saves: list[tuple[str, int, str]] = []
-    async def get(self, chain_id): return None
-    async def save(self, chain_id, last_block, last_block_hash):
-        self.saves.append((chain_id, last_block, last_block_hash))
-```
+If `Block`, `BlockHeader`, `ConfigSnapshot`, `SnapshotSubscription`, `SnapshotChannel`, `SnapshotChain`, or `_CollectingChannel` are not already imported at the top of `test_chain_runner.py`, add them now. Verify by reading the file's existing imports first.
 
 - [ ] **Step 9.4: Run the tests**
 
@@ -1434,6 +1445,12 @@ class _StubAdapter:
         return []
 
 
+class _CheckpointStub:
+    """Local async-aware stub. Mirrors the one in test_chain_runner.py."""
+    async def get(self, _chain_id: str): return None
+    async def save(self, *_a, **_kw): pass
+
+
 @pytest.fixture
 def runner():
     snap = ConfigSnapshot(
@@ -1446,11 +1463,21 @@ def runner():
         channels=[SnapshotChannel(id="c1", name="c1", type="http", config={})],
         chains=[], abis=[],
     )
-    chain = SnapshotChain(id="evm-1", kind="evm", rpc_http="http://x", rpc_ws=None, confirmations=0, poll_interval_ms=1000)
+    chain = SnapshotChain(
+        id="evm-1", kind="evm", rpc_http="http://x", rpc_ws=None,
+        confirmations=0, poll_interval_ms=1000,
+    )
+
+    class _NullChannel:
+        async def start(self): pass
+        async def stop(self): pass
+        async def send(self, *a, **kw): pass
+
     r = ChainRunner(
-        chain=chain, adapter_factory=lambda c: _StubAdapter(fail_until_window=2),
-        channel_factory=lambda c: None,
-        checkpoint_repo=type("_CP", (), {"get": staticmethod(lambda self_, cid: None), "save": staticmethod(lambda *a, **k: None)})(),
+        chain=chain,
+        adapter_factory=lambda c: _StubAdapter(fail_until_window=2),
+        channel_factory=lambda c: _NullChannel(),
+        checkpoint_repo=_CheckpointStub(),
     )
     return r, snap
 
@@ -1896,34 +1923,33 @@ This chunk adds anvil-backed and solana-test-validator-backed integration tests 
 
 - [ ] **Step 13.1: Write the test**
 
-Use the existing anvil fixture pattern from `tests/e2e/test_anvil_e2e.py`. Sketch:
+Reuse the anvil + webhook_receiver fixtures from `tests/e2e/conftest.py` and the test patterns in `tests/e2e/test_native_transfer_e2e.py`. Sketch:
 
 ```python
 """E2E: catchup uses RPC-side filtering and range queries against anvil."""
-import asyncio
 import pytest
 
-# Reuse anvil + chain-runner harness from tests/e2e/test_anvil_e2e.py
-# (see that file for the fixture pattern).
+# Fixtures `anvil`, `webhook_receiver` are provided by tests/e2e/conftest.py.
+# Read tests/e2e/test_native_transfer_e2e.py for the full harness pattern.
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_catchup_with_address_and_topic_filter(anvil, deployed_erc20, runner_factory):
-    """Mint some ERC-20 transfers across N blocks, then subscribe to only
-    one contract and verify catchup picks up exactly those events using
-    RPC-side filtering."""
-    # 1. Deploy two ERC-20s (subscribed + unsubscribed) and emit transfers.
-    # 2. Configure a single token_transfer subscription on the subscribed token.
-    # 3. Start a ChainRunner from block 0; let catchup run.
-    # 4. Verify the resulting matched events count is exactly the subscribed
-    #    contract's transfer count (proves filter is correct).
-    # 5. Verify the runner issued ceil(N / log_query_range_blocks) fetch_logs
-    #    calls (proves range query is used). This needs a thin wrapper around
-    #    EvmAdapter.fetch_logs that counts.
-    pytest.skip("e2e harness setup — implement against existing anvil fixture")
+async def test_catchup_with_address_and_topic_filter(anvil, webhook_receiver):
+    """Mint ERC-20 transfers across N blocks, then subscribe to only one
+    contract and verify catchup picks up exactly those events via RPC-side
+    filtering AND that the runner issues ceil(N / log_query_range_blocks)
+    fetch_logs calls (not N)."""
+    # 1. Deploy two ERC-20s; emit transfers on both across ≥30 blocks.
+    # 2. Configure a single token_transfer subscription on contract A.
+    # 3. Start a ChainRunner from block 0 with log_query_range_blocks=10.
+    # 4. Wait for catchup completion (poll checkpoint / matched_count).
+    # 5. Verify webhook received exactly A's transfer count.
+    # 6. Wrap EvmAdapter.fetch_logs with a counter via monkeypatch to assert
+    #    the call count == ceil(blocks / 10).
+    pytest.skip("e2e harness — implement against existing anvil fixture in tests/e2e/conftest.py")
 ```
 
-The actual fixture wiring depends on the existing e2e harness; the e2e-runner agent or the executor should fill in the body following the patterns in `tests/e2e/test_anvil_e2e.py`. If existing helpers don't expose a deploy-erc20 path, mark the test as `xfail`/`skip` and capture as a follow-up task.
+The fixture wiring depends on the e2e harness in `tests/e2e/conftest.py`. If deploying ERC-20s through the existing harness is non-trivial, leave the `pytest.skip` in place and capture the harness extension as a follow-up task — the unit tests in Chunk 4 already cover the optimization's correctness.
 
 - [ ] **Step 13.2: Run e2e if anvil is available**
 
@@ -1952,15 +1978,17 @@ import pytest
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_catchup_skips_empty_slots(solana_validator, runner_factory):
-    """solana-test-validator does not naturally produce skipped slots in a
-    deterministic way, so this test focuses on correctness rather than skip
-    count: ensure all valid slots are processed and that the get_blocks
-    call count matches expectations."""
-    pytest.skip("e2e harness — implement against existing solana fixture")
+async def test_catchup_skips_empty_slots():
+    """No `solana_validator` fixture exists in tests/e2e/conftest.py today —
+    add one (similar to the `anvil` fixture: launch solana-test-validator as
+    a subprocess, expose its RPC URL, tear down on session end) and a
+    matching ChainRunner harness, then port the assertion shape from
+    test_solana_catchup_range.py (verify get_blocks call count and that
+    every valid slot received a fetch_block call)."""
+    pytest.skip("e2e harness — needs new solana_validator fixture")
 ```
 
-Same caveat as Task 13: the actual harness depends on existing fixtures in `tests/e2e/test_solana_e2e.py`. If the harness doesn't easily support engineered skipped slots, validate correctness only (all blocks processed) and leave skip-count assertion as a future follow-up.
+Same caveat as Task 13: leave `pytest.skip` if the fixture work is too large to bundle into this plan; unit tests in `test_solana_catchup_range.py` already prove correctness.
 
 - [ ] **Step 14.2: Run e2e**
 

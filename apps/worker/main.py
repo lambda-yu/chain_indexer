@@ -165,8 +165,8 @@ class _Worker:
                 )
                 try:
                     await runner.start(snap)
-                except Exception:  # noqa: BLE001
-                    log.exception("worker.chain_runner_start_failed", chain_id=chain_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("worker.chain_runner_start_failed", chain_id=chain_id, error=repr(exc))
                     continue
                 task = asyncio.create_task(runner.run(), name=f"chain-runner:{chain_id}")
                 self._runners[chain_id] = (runner, task)

@@ -49,6 +49,7 @@ class ChainRunner:
     """
 
     DRAIN_TIMEOUT_S = 30.0
+    MAX_CATCHUP_BLOCKS = 10_000
 
     def __init__(
         self,
@@ -167,16 +168,90 @@ class ChainRunner:
 
     async def _run_evm(self) -> None:
         assert self._buffer is not None
+        # 快速追块：从 checkpoint 追到 tip - confirmations
+        await self._catchup_evm()
         async for header in self._adapter.subscribe_heads():
             if self._stop.is_set():
                 break
             await self._handle_evm_head(header)
 
+    async def _catchup_evm(self) -> None:
+        """Process missed blocks between checkpoint and chain tip before entering live mode."""
+        if self.resume_from is None:
+            return
+        assert self._adapter is not None and self._matcher is not None and self._notifier is not None
+        last_block = self.resume_from[0]
+        try:
+            tip = await self._adapter.get_latest_block_number()
+        except Exception:  # noqa: BLE001
+            log.warning("chain_runner.catchup_tip_failed", chain_id=self._chain.id)
+            return
+        safe_tip = tip - self._chain.confirmations
+        gap = safe_tip - last_block
+        if gap <= 0:
+            return
+        if gap > self.MAX_CATCHUP_BLOCKS:
+            log.warning("chain_runner.catchup_gap_too_large", chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS, skipping_to=safe_tip - self.MAX_CATCHUP_BLOCKS)
+            last_block = safe_tip - self.MAX_CATCHUP_BLOCKS
+            gap = self.MAX_CATCHUP_BLOCKS
+        log.info("chain_runner.catchup_starting", chain_id=self._chain.id, from_block=last_block + 1, to_block=safe_tip, gap=gap)
+        matcher = self._matcher
+        notifier = self._notifier
+        processed = 0
+        for n in range(last_block + 1, safe_tip + 1):
+            if self._stop.is_set():
+                break
+            try:
+                await self._process_confirmed_block(n, matcher=matcher, notifier=notifier)
+                processed += 1
+                if processed % 100 == 0:
+                    log.info("chain_runner.catchup_progress", chain_id=self._chain.id, block=n, remaining=safe_tip - n)
+            except Exception:  # noqa: BLE001
+                log.error("chain_runner.catchup_block_failed", chain_id=self._chain.id, block=n)
+                break
+        log.info("chain_runner.catchup_done", chain_id=self._chain.id, processed=processed)
+
     async def _run_solana(self) -> None:
+        # 快速追块：从 checkpoint 追到最新 slot
+        await self._catchup_solana()
         async for slot in self._adapter.subscribe_heads():
             if self._stop.is_set():
                 break
             await self._process_solana_slot(slot)
+
+    async def _catchup_solana(self) -> None:
+        if self.resume_from is None:
+            return
+        assert self._adapter is not None and self._matcher is not None and self._notifier is not None
+        last_slot = self.resume_from[0]
+        try:
+            tip = await self._adapter.get_latest_slot()
+        except Exception:  # noqa: BLE001
+            log.warning("chain_runner.catchup_tip_failed", chain_id=self._chain.id)
+            return
+        gap = tip - last_slot
+        if gap <= 0:
+            return
+        if gap > self.MAX_CATCHUP_BLOCKS:
+            log.warning("chain_runner.catchup_gap_too_large", chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS)
+            last_slot = tip - self.MAX_CATCHUP_BLOCKS
+            gap = self.MAX_CATCHUP_BLOCKS
+        log.info("chain_runner.catchup_starting", chain_id=self._chain.id, from_slot=last_slot + 1, to_slot=tip, gap=gap)
+        matcher = self._matcher
+        notifier = self._notifier
+        processed = 0
+        for s in range(last_slot + 1, tip + 1):
+            if self._stop.is_set():
+                break
+            try:
+                await self._process_solana_slot(s)
+                processed += 1
+                if processed % 100 == 0:
+                    log.info("chain_runner.catchup_progress", chain_id=self._chain.id, slot=s, remaining=tip - s)
+            except Exception:  # noqa: BLE001
+                log.error("chain_runner.catchup_slot_failed", chain_id=self._chain.id, slot=s)
+                continue
+        log.info("chain_runner.catchup_done", chain_id=self._chain.id, processed=processed)
 
     async def _handle_evm_head(self, header: BlockHeader) -> None:
         assert self._buffer is not None and self._adapter is not None

@@ -61,6 +61,9 @@ async def update_chain(
     await bump_and_publish(session, bus, entity="chain", entity_id=chain_id, action="update")
     await session.refresh(row)
     return ChainOut.model_validate(row)
+
+
+@router.get("", response_model=list[ChainOut])
 async def list_chains(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[ChainOut]:

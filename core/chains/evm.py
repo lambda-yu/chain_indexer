@@ -113,12 +113,18 @@ class EvmAdapter:
         return Block(header=header, txs=txs, logs=[])
 
     async def fetch_logs(
-        self, from_block: int, to_block: int, addresses: list[str] | None = None
+        self,
+        from_block: int,
+        to_block: int,
+        addresses: list[str] | None = None,
+        topics: list[list[str]] | None = None,
     ) -> list[Log]:
         assert self._w3 is not None
         params: dict[str, Any] = {"fromBlock": from_block, "toBlock": to_block}
         if addresses:
             params["address"] = addresses
+        if topics:
+            params["topics"] = topics
         # FilterParams is a TypedDict; the runtime dict matches its shape.
         raw_logs = await self._w3.eth.get_logs(cast(FilterParams, params))
         out: list[Log] = []

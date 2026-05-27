@@ -63,7 +63,9 @@ class EvmAdapter:
 
     async def connect(self) -> None:
         self._w3 = AsyncWeb3(AsyncHTTPProvider(self._rpc_http))
-        # Sanity ping; raises if the RPC is unreachable.
+        # Inject PoA middleware for chains like Polygon that use >32 byte extraData
+        from web3.middleware import ExtraDataToPOAMiddleware
+        self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         await self._w3.eth.block_number
 
     async def disconnect(self) -> None:

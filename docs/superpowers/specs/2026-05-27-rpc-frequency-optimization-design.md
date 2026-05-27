@@ -202,8 +202,10 @@ else:
     )
     block, logs = await asyncio.gather(block_coro, logs_coro)
 
-block = replace(block, logs=logs)
-# ... rest unchanged
+# Delegate to the inner helper (see Refactoring contract below)
+await self._process_block_with_prefetched_logs(
+    number, block, logs, matcher=matcher, notifier=notifier,
+)
 ```
 
 **Catchup path** (`_catchup_evm`) — replaces the per-block loop:
@@ -214,6 +216,7 @@ filter = self._evm_filter
 assert filter is not None
 
 start_n = last_block + 1
+processed = 0
 while start_n <= safe_tip:
     end_n = min(start_n + range_blocks - 1, safe_tip)
     try:
@@ -226,9 +229,15 @@ while start_n <= safe_tip:
         for n in range(start_n, end_n + 1):
             if self._stop.is_set():
                 return
+            block = await self._adapter.fetch_block(n)
             await self._process_block_with_prefetched_logs(
-                n, logs_by_block.get(n, []), matcher=matcher, notifier=notifier,
+                n, block, logs_by_block.get(n, []),
+                matcher=matcher, notifier=notifier,
             )
+            processed += 1
+            if processed % 100 == 0:
+                log.info("chain_runner.catchup_progress",
+                         chain_id=self._chain.id, block=n, remaining=safe_tip - n)
     except Exception:  # noqa: BLE001 — preserves existing _catchup_evm break-on-error
         log.error("chain_runner.catchup_window_failed",
                   chain_id=self._chain.id, start=start_n, end=end_n)
@@ -236,12 +245,14 @@ while start_n <= safe_tip:
     start_n = end_n + 1
 ```
 
+The inner helper signature: `_process_block_with_prefetched_logs(number: int, block: Block, prefetched_logs: list[Log], *, matcher, notifier) -> None`. Both head-following and catchup paths fetch the block themselves and pass it in; the helper owns parsing, trace handling, matcher, notifier, and checkpoint save.
+
 **New helper**: `_process_block_with_prefetched_logs(n, prefetched_logs, ...)` is a refactor of `_process_confirmed_block` that accepts `logs` directly instead of calling `fetch_logs(n, n)`.
 
 **Refactoring contract**:
-- `_process_confirmed_block` stays as the **head-following entrypoint** — it owns the `asyncio.gather(block_coro, logs_coro)` concurrency (or single fetch when `skip_logs`), then calls `_process_block_with_prefetched_logs(n, logs, ...)` with the resolved logs.
-- Catchup calls `_process_block_with_prefetched_logs` directly with logs taken from the range-query bucket (no per-block `fetch_logs`).
-- The inner helper still owns `fetch_block`, parser dispatch, trace handling, matcher, notifier, checkpoint save — only the `logs` source differs.
+- `_process_confirmed_block` stays as the **head-following entrypoint** — it owns the `asyncio.gather(block_coro, logs_coro)` concurrency (or single fetch when `skip_logs`), then calls `_process_block_with_prefetched_logs(n, block, logs, ...)` with both resolved.
+- Catchup calls the same inner helper, passing the per-block `fetch_block` result plus the bucketed log slice (no per-block `fetch_logs`).
+- The inner helper owns parser dispatch, trace handling, matcher, notifier, checkpoint save — only the `block`+`logs` sourcing differs between callers.
 
 **Degradation helper** `_fetch_logs_with_degrade`:
 

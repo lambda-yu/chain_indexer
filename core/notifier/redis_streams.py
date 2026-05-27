@@ -22,6 +22,7 @@ class RedisStreamsChannel(Channel):
         "properties": {
             "stream": {"type": "string"},
             "maxlen": {"type": "integer"},
+            "redis_url": {"type": "string"},
         },
     }
 
@@ -34,15 +35,21 @@ class RedisStreamsChannel(Channel):
     ) -> None:
         self._stream: str = config["stream"]
         self._maxlen: int | None = config.get("maxlen")
+        self._redis_url: str | None = config.get("redis_url")
         self._config = config
         self._bus = bus
         self._base_delay = base_delay
+        self._own_client: Any = None
 
     async def start(self) -> None:
-        return None
+        if self._redis_url:
+            import redis.asyncio as aioredis
+            self._own_client = aioredis.from_url(self._redis_url, decode_responses=True)
 
     async def stop(self) -> None:
-        return None
+        if self._own_client is not None:
+            await self._own_client.aclose()
+            self._own_client = None
 
     async def send(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"))
@@ -55,7 +62,7 @@ class RedisStreamsChannel(Channel):
         )
 
     async def _xadd_once(self, *, body: str) -> None:
-        client = self._bus.client
+        client = self._own_client if self._own_client is not None else self._bus.client
         kwargs: dict[str, Any] = {}
         if self._maxlen is not None:
             kwargs["maxlen"] = self._maxlen

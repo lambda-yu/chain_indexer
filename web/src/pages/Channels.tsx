@@ -76,7 +76,7 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
     if (actualType === 'http') {
       config = { url: fd.get('url'), method: fd.get('method') || 'POST', ...(fd.get('hmac_secret') ? { hmac_secret: fd.get('hmac_secret') } : {}), ...(fd.get('timeout_seconds') ? { timeout_seconds: Number(fd.get('timeout_seconds')) } : {}) }
     } else if (actualType === 'mq') {
-      config = { stream: fd.get('stream'), ...(fd.get('maxlen') ? { maxlen: Number(fd.get('maxlen')) } : {}) }
+      config = { stream: fd.get('stream'), ...(fd.get('redis_url') ? { redis_url: fd.get('redis_url') } : {}), ...(fd.get('maxlen') ? { maxlen: Number(fd.get('maxlen')) } : {}) }
     } else if (actualType === 'kafka') {
       config = { bootstrap_servers: fd.get('bootstrap_servers'), topic: fd.get('topic'), ...(fd.get('key') ? { key: fd.get('key') } : {}), ...(fd.get('compression_type') && fd.get('compression_type') !== 'none' ? { compression_type: fd.get('compression_type') } : {}) }
     } else if (actualType === 'rabbitmq') {
@@ -121,6 +121,7 @@ function ChannelForm({ initial, onClose }: { initial: Channel | null; onClose: (
 
             {/* Redis Streams 配置 */}
             {mqDriver === 'mq' && <>
+              <input name="redis_url" defaultValue={String(cfg.redis_url ?? '')} placeholder="Redis URL（可选，留空用默认连接）" className="w-full border rounded px-3 py-1.5 text-sm" />
               <input name="stream" defaultValue={String(cfg.stream ?? '')} placeholder="Stream 名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
               <input name="maxlen" type="number" defaultValue={cfg.maxlen ? Number(cfg.maxlen) : undefined} placeholder="最大长度（可选，MAXLEN ~ N）" className="w-full border rounded px-3 py-1.5 text-sm" />
             </>}

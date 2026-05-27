@@ -111,6 +111,9 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
     snap_channels_by_id: dict[str, SnapshotChannel] = {}
     snap_subs: list[SnapshotSubscription] = []
     for sub, channels in sub_bindings:
+        # Skip subscriptions with no bound channels — no point processing events
+        if not channels:
+            continue
         for ch in channels:
             snap_channels_by_id.setdefault(
                 ch.id,
@@ -131,6 +134,10 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
                 start_block=sub.start_block,
             )
         )
+
+    # Only include chains that have at least one active subscription
+    active_chain_ids = {s.chain_id for s in snap_subs}
+    snap_chains = [c for c in snap_chains if c.id in active_chain_ids]
 
     return ConfigSnapshot(
         version=version,

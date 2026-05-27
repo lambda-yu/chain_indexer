@@ -273,7 +273,7 @@ function SubChannelBadges({ subId, allChannels }: { subId: string; allChannels: 
     queryFn: () => api.get(`/subscriptions/${subId}`),
     staleTime: 30000,
   })
-  if (!data?.channel_ids?.length) return <span className="text-gray-400 text-xs">—</span>
+  if (!data?.channel_ids?.length) return <span className="text-yellow-600 text-xs">⚠ 未绑定渠道</span>
   const chMap = Object.fromEntries(allChannels.map(c => [c.id, c]))
   return (
     <div className="flex flex-wrap gap-0.5">

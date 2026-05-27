@@ -217,7 +217,16 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         )}
 
         <input name="address" defaultValue={initial?.address ?? ''} placeholder="合约地址（可选）" className="w-full border rounded px-3 py-1.5 text-sm font-mono" />
-        <textarea name="arg_filters" defaultValue={JSON.stringify(initial?.arg_filters ?? {}, null, 2)} placeholder='参数过滤 JSON' className="w-full border rounded px-3 py-1.5 text-sm h-16 font-mono" />
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <label className="text-xs text-gray-500">参数过滤 JSON</label>
+            <ArgFilterExamples onSelect={(v) => {
+              const el = document.querySelector<HTMLTextAreaElement>('textarea[name=arg_filters]')
+              if (el) el.value = JSON.stringify(v, null, 2)
+            }} />
+          </div>
+          <textarea name="arg_filters" defaultValue={JSON.stringify(initial?.arg_filters ?? {}, null, 2)} placeholder='{}' className="w-full border rounded px-3 py-1.5 text-sm h-20 font-mono" />
+        </div>
         <label className="flex items-center gap-2 text-sm"><input name="enabled" type="checkbox" defaultChecked={initial?.enabled ?? true} /> 启用</label>
 
         {allChannels.length > 0 && (
@@ -243,6 +252,39 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         </div>
         {mut.isError && <p className="text-red-500 text-xs">{String(mut.error)}</p>}
       </form>
+    </div>
+  )
+}
+
+const ARG_FILTER_EXAMPLES: { label: string; desc: string; value: Record<string, unknown> }[] = [
+  { label: '精确匹配地址', desc: '只匹配 from 为指定地址', value: { from: '0xABC...123' } },
+  { label: '多地址 IN', desc: '匹配 to 在列表中的任一地址', value: { to_in: ['0xAAA...', '0xBBB...'] } },
+  { label: '金额范围', desc: '匹配 value >= 1000 且 <= 10000', value: { value_gte: 1000, value_lte: 10000 } },
+  { label: '最低金额', desc: '只通知大额转账 (1 ETH)', value: { value_gte: 1000000000000000000 } },
+  { label: '组合过滤', desc: '指定发送方 + 最低金额', value: { from: '0xABC...123', value_gte: 100000 } },
+  { label: '空（全部匹配）', desc: '不过滤任何参数', value: {} },
+]
+
+function ArgFilterExamples({ onSelect }: { onSelect: (v: Record<string, unknown>) => void }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="relative">
+      <button type="button" onClick={() => setOpen(!open)} className="text-xs text-blue-500 hover:text-blue-700">
+        插入示例 ▾
+      </button>
+      {open && (
+        <div className="absolute right-0 top-5 z-10 bg-white border rounded-lg shadow-lg w-72 py-1">
+          {ARG_FILTER_EXAMPLES.map((ex, i) => (
+            <button key={i} type="button"
+              onClick={() => { onSelect(ex.value); setOpen(false) }}
+              className="w-full text-left px-3 py-1.5 hover:bg-gray-50 text-xs">
+              <span className="font-medium">{ex.label}</span>
+              <span className="text-gray-400 ml-1">— {ex.desc}</span>
+              <pre className="text-[10px] text-gray-500 font-mono mt-0.5">{JSON.stringify(ex.value)}</pre>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

@@ -46,6 +46,32 @@ async def create_subscription(
     return SubscriptionOut.model_validate(sub)
 
 
+@router.put("/{sub_id}", response_model=SubscriptionOut)
+async def update_subscription(
+    sub_id: str,
+    payload: SubscriptionCreate,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> SubscriptionOut:
+    repo = SubscriptionRepo(session)
+    row = await repo.get(sub_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    await repo.update(
+        sub_id,
+        name=payload.name,
+        address=payload.address,
+        abi_id=payload.abi_id,
+        match_kind=MatchKind(payload.match_kind),
+        match_name=payload.match_name,
+        arg_filters=payload.arg_filters,
+        enabled=payload.enabled,
+    )
+    await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="update")
+    await session.refresh(row)
+    return SubscriptionOut.model_validate(row)
+
+
 @router.get("", response_model=list[SubscriptionOut])
 async def list_subscriptions(
     session: AsyncSession = Depends(get_session),  # noqa: B008

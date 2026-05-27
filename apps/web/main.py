@@ -78,6 +78,7 @@ def create_app(
     )
 
     @app.get("/healthz")
+    @app.get("/api/healthz")
     async def healthz(
         db: Database = Depends(get_db),  # noqa: B008
         bus: RedisBus = Depends(get_bus),  # noqa: B008

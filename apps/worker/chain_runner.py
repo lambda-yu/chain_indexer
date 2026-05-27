@@ -176,11 +176,16 @@ class ChainRunner:
             await self._handle_evm_head(header)
 
     async def _catchup_evm(self) -> None:
-        """Process missed blocks between checkpoint and chain tip before entering live mode."""
-        if self.resume_from is None:
-            return
+        """Process missed blocks between effective start and chain tip."""
         assert self._adapter is not None and self._matcher is not None and self._notifier is not None
-        last_block = self.resume_from[0]
+        # Determine effective start: min of checkpoint and all subscription start_blocks
+        cp_block = self.resume_from[0] if self.resume_from else None
+        sub_starts = [s.start_block for s in (self._current_snap.subscriptions if self._current_snap else [])
+                      if s.chain_id == self._chain.id and s.start_block is not None and s.enabled]
+        candidates = [b for b in [cp_block, *sub_starts] if b is not None]
+        if not candidates:
+            return
+        last_block = min(candidates)
         try:
             tip = await self._adapter.get_latest_block_number()
         except Exception:  # noqa: BLE001
@@ -220,10 +225,14 @@ class ChainRunner:
             await self._process_solana_slot(slot)
 
     async def _catchup_solana(self) -> None:
-        if self.resume_from is None:
-            return
         assert self._adapter is not None and self._matcher is not None and self._notifier is not None
-        last_slot = self.resume_from[0]
+        cp_slot = self.resume_from[0] if self.resume_from else None
+        sub_starts = [s.start_block for s in (self._current_snap.subscriptions if self._current_snap else [])
+                      if s.chain_id == self._chain.id and s.start_block is not None and s.enabled]
+        candidates = [b for b in [cp_slot, *sub_starts] if b is not None]
+        if not candidates:
+            return
+        last_slot = min(candidates)
         try:
             tip = await self._adapter.get_latest_slot()
         except Exception:  # noqa: BLE001

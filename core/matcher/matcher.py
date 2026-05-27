@@ -47,6 +47,8 @@ class Matcher:
                 log.exception("matcher.exception", subscription_id=sub.id, tx_hash=event.tx_hash)
 
     def _matches(self, sub: SnapshotSubscription, event: Event) -> bool:
+        if sub.start_block is not None and event.block_number < sub.start_block:
+            return False
         if sub.address is not None and (
             event.contract is None or _addr_norm(sub.address) != _addr_norm(event.contract)
         ):

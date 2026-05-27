@@ -6,7 +6,10 @@ import pytest
 from apps.worker.chain_runner import ChainRunner
 from core.chains.types import SolanaBlock
 from core.config.snapshot import (
-    ConfigSnapshot, SnapshotChain, SnapshotChannel, SnapshotSubscription,
+    ConfigSnapshot,
+    SnapshotChain,
+    SnapshotChannel,
+    SnapshotSubscription,
 )
 
 

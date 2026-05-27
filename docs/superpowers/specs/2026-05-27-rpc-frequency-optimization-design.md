@@ -1,0 +1,405 @@
+# RPC Frequency Optimization (Package A) — Design
+
+**Date**: 2026-05-27
+**Status**: Draft
+**Scope**: Reduce blockchain RPC call count and data transfer for EVM and Solana adapters
+**Milestone**: post-m5 follow-up
+
+## Background
+
+The indexer's hottest cost center is RPC traffic to upstream chain nodes (Alchemy / Infura / self-hosted Geth / Solana validators). Profiling the current pipeline reveals three avoidable inefficiencies:
+
+1. **EVM `eth_getLogs` is called per-block with no filters.** `core/chains/evm.py` issues `fetch_logs(n, n)` for every confirmed block and omits `addresses` / `topics`, so the node returns *every* log in the block. The indexer then filters client-side in `Matcher`.
+2. **Catchup is fully serial.** `ChainRunner._catchup_evm` and `_catchup_solana` loop block-by-block; a 10k-block gap = 10k RTTs even though `eth_getLogs` natively supports `fromBlock`/`toBlock` ranges and Solana supports `getBlocks(start, end)`.
+3. **Solana hits empty/skipped slots.** Every slot is fetched via `getBlock(slot)`; on mainnet 5–20% of slots are skipped and return `result: null`, wasting an RPC round trip each.
+
+Hidden bonus: subscriptions with `match_kind ∈ {native_transfer, call, internal_call}` do not need `eth_getLogs` at all. The current pipeline calls it unconditionally.
+
+## Goals
+
+- Reduce `eth_getLogs` data volume by 50–95% via RPC-side filtering (`addresses` + `topics`).
+- Reduce `eth_getLogs` call count by 100–1000× on catchup via range queries.
+- Eliminate `fetch_logs` calls entirely when the chain has no log-consuming subscriptions.
+- Reduce Solana `getBlock` calls by ~5–20% on catchup by skipping empty slots via `getBlocks`.
+- Catchup speed improvement is a *side effect*, not a primary goal of this design (handled by Package B in a future iteration).
+
+## Non-goals
+
+- Concurrent block fetching during catchup (Package B).
+- `debug_traceBlockByNumber` consolidation (Package C).
+- JSON-RPC batch requests (#5, low ROI).
+- `_prefetch_ancestors_for` concurrency (#6, reorg-only, low frequency).
+- Range merging during head-following (one block at a time, low ROI).
+- Adaptive window sizing.
+- Caching of topic0 keccak computations (snapshot rebuild is rare; volume is small).
+
+## Architecture
+
+```
+┌─────────────────────────────┐
+│ ConfigSnapshot              │
+│   subscriptions, abis       │
+└──────────────┬──────────────┘
+               │ build on snapshot apply
+               ▼
+┌─────────────────────────────┐    used by    ┌────────────────────────┐
+│ EvmLogFilterSet (per chain) │──────────────▶│ ChainRunner            │
+│   addresses                 │               │   _catchup_evm         │
+│   topic0s                   │               │   _process_confirmed.. │
+│   skip_logs                 │               └─────────┬──────────────┘
+└─────────────────────────────┘                         │
+                                                        ▼
+                                              ┌────────────────────────┐
+                                              │ EvmAdapter.fetch_logs  │
+                                              │   from, to, addresses, │
+                                              │   topics               │
+                                              └────────────────────────┘
+
+┌─────────────────────────────┐
+│ ChainRunner._catchup_solana │
+│   for window in slot_range: │
+│     valid = get_blocks()    │
+│     for s in valid:         │
+│       getBlock(s)           │
+└─────────────────────────────┘
+```
+
+## Data Model Changes
+
+Two new fields on `chains` table (Alembic migration `0006_rpc_range_config.py`):
+
+| Column | Type | Default | Applies To | Purpose |
+|--------|------|---------|------------|---------|
+| `log_query_range_blocks` | `Integer NOT NULL` | `100` | EVM | Max block span per `eth_getLogs` call during catchup |
+| `slot_query_range_blocks` | `Integer NOT NULL` | `1000` | Solana | Max slot span per `getBlocks` call during catchup |
+
+Both fields are present on every row regardless of chain `kind` (no kind-conditional schema), but only consumed by the matching adapter type. This avoids a sparse schema or a JSON config blob.
+
+Affected files:
+- `core/config/models.py` — `Chain` model
+- `core/config/snapshot.py` — `SnapshotChain`
+- `core/config/repositories.py` — read/write through
+- `apps/web/schemas.py` — request/response models for chains router
+- `migrations/versions/0006_rpc_range_config.py` — new
+
+## Component 1: `EvmLogFilterSet`
+
+**Location**: `core/matcher/filter_set.py` (new file)
+
+**Shape**:
+
+```python
+@dataclass(frozen=True)
+class EvmLogFilterSet:
+    addresses: list[str] | None      # lowercased hex; None = no RPC-side address filter
+    topic0s: list[str] | None        # lowercased hex; None = no RPC-side topic filter
+    skip_logs: bool                  # True when no subscription needs logs at all
+
+    @property
+    def topics_param(self) -> list[list[str]] | None:
+        """Shape for eth_getLogs `topics` field: [[t0a, t0b, ...]] or None."""
+        return [self.topic0s] if self.topic0s else None
+
+
+def build_evm_log_filter(
+    snapshot: ConfigSnapshot,
+    chain_id: str,
+    abi_registry: AbiRegistry | None,
+) -> EvmLogFilterSet:
+    ...
+```
+
+**Builder logic**:
+
+1. Collect `relevant = [s for s in snapshot.subscriptions_for_chain(chain_id) if s.match_kind in {"event", "token_transfer"}]`.
+2. If `relevant == []` → return `EvmLogFilterSet(None, None, skip_logs=True)`.
+3. **Address set**:
+   - If any `s.address is None` in `relevant` → `addresses = None`.
+   - Else → `addresses = sorted({s.address.lower() for s in relevant})`.
+4. **Topic0 set**:
+   - Start `topics = set()`.
+   - For each `s in relevant`:
+     - `match_kind == "token_transfer"` → add `ERC20_TRANSFER_TOPIC0`.
+     - `match_kind == "event"`:
+       - If `s.abi_id is None` or `s.match_name is None` → return early with `topic0s = None` (cannot compute; fall back to full topic scan).
+       - Look up event signature in `abi_registry`; if not found → `topic0s = None` (consistent with user's "any miss → drop topic filter" decision).
+       - Compute `keccak(signature_canonical)[:32]` and add hex.
+   - `topic0s = sorted(topics)` if not bailed.
+5. Return `EvmLogFilterSet(addresses, topic0s, skip_logs=False)`.
+
+**Behavior table** (already approved in brainstorm):
+
+| Subscription mix | addresses | topic0s | skip_logs |
+|------------------|-----------|---------|-----------|
+| No event/token_transfer subs | — | — | **True** |
+| All relevant subs have `address` | concrete list | derived | False |
+| Any relevant sub has `address=None` | **None** | derived | False |
+| All events have abi_id + match_name (computable) | concrete | computed + ERC20 | False |
+| Any event missing abi_id / match_name / signature lookup | concrete | **None** | False |
+| Both missing | None | None | False (still uses range query, saves RTT) |
+
+**Helpers needed in `AbiRegistry`**: existing `lookup_event_by_topic0` is reverse direction. We need forward: signature → topic0 hash. If not exposed, add `event_signature_to_topic0(abi_id, event_name) -> str | None`.
+
+## Component 2: `EvmAdapter.fetch_logs` topics parameter
+
+**Location**: `core/chains/evm.py`
+
+**Current signature**:
+```python
+async def fetch_logs(self, from_block, to_block, addresses=None) -> list[Log]
+```
+
+**New signature**:
+```python
+async def fetch_logs(
+    self,
+    from_block: int,
+    to_block: int,
+    addresses: list[str] | None = None,
+    topics: list[list[str]] | None = None,   # eth_getLogs topics shape
+) -> list[Log]
+```
+
+Threads `topics` into `params` dict before the `get_logs` call. Existing call sites without `topics` are unaffected.
+
+**Backward compatibility**: None needed — internal API, single caller (`ChainRunner`).
+
+## Component 3: `ChainRunner` filter integration
+
+**Location**: `apps/worker/chain_runner.py`
+
+**State additions**:
+```python
+self._evm_filter: EvmLogFilterSet | None = None  # EVM chains only
+```
+
+**Build/rebuild points**:
+- `start(snap)`: build filter after `_current_snap = snap`.
+- `apply_snapshot(snap)`: rebuild filter under `self._snap_lock`.
+
+For Solana chains the filter stays `None` and is never read.
+
+**Head-following path** (`_process_confirmed_block`):
+
+```python
+filter = self._evm_filter
+assert filter is not None
+
+block_coro = self._adapter.fetch_block(number)
+if filter.skip_logs:
+    block = await block_coro
+    logs = []
+else:
+    logs_coro = self._adapter.fetch_logs(
+        number, number,
+        addresses=filter.addresses,
+        topics=filter.topics_param,
+    )
+    block, logs = await asyncio.gather(block_coro, logs_coro)
+
+block = replace(block, logs=logs)
+# ... rest unchanged
+```
+
+**Catchup path** (`_catchup_evm`) — replaces the per-block loop:
+
+```python
+range_blocks = self._chain.log_query_range_blocks
+filter = self._evm_filter
+assert filter is not None
+
+start_n = last_block + 1
+while start_n <= safe_tip:
+    end_n = min(start_n + range_blocks - 1, safe_tip)
+    if filter.skip_logs:
+        logs_by_block: dict[int, list[Log]] = {}
+    else:
+        logs_by_block = await self._fetch_logs_with_degrade(
+            start_n, end_n, filter,
+        )
+    for n in range(start_n, end_n + 1):
+        if self._stop.is_set():
+            return
+        await self._process_block_with_prefetched_logs(
+            n, logs_by_block.get(n, []), matcher=matcher, notifier=notifier,
+        )
+    start_n = end_n + 1
+```
+
+**New helper**: `_process_block_with_prefetched_logs(n, prefetched_logs, ...)` is a refactor of `_process_confirmed_block` that accepts `logs` directly instead of calling `fetch_logs(n, n)`. The head-following path passes a freshly-fetched list; catchup passes the bucketed slice. The block itself is still fetched per-block (we do not change block fetching in this design).
+
+**Degradation helper** `_fetch_logs_with_degrade`:
+
+```python
+DEGRADE_ERR_HINTS = ("too large", "result too big", "query timeout",
+                     "limit exceeded", "Returned more than")
+
+async def _fetch_logs_with_degrade(
+    self, start: int, end: int, filter: EvmLogFilterSet,
+) -> dict[int, list[Log]]:
+    try:
+        logs = await self._adapter.fetch_logs(
+            start, end,
+            addresses=filter.addresses, topics=filter.topics_param,
+        )
+        return _bucket_by_block(logs)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if any(h in msg for h in DEGRADE_ERR_HINTS) and end > start:
+            mid = (start + end) // 2
+            left = await self._fetch_logs_with_degrade(start, mid, filter)
+            right = await self._fetch_logs_with_degrade(mid + 1, end, filter)
+            return {**left, **right}
+        raise
+```
+
+`_bucket_by_block` derives `block_number` from each `Log`. **Schema dependency**: `Log` does not currently carry `block_number` — we must add it. Audit shows `Log` (in `core/chains/types.py`) has `tx_hash, log_index, address, topics, data`. Need to:
+
+- Extend `Log` with `block_number: int`.
+- Update `EvmAdapter.fetch_logs` parsing to populate `block_number` from `lg["blockNumber"]`.
+- Audit callers of `Log` to ensure additive field is safe (it is — `frozen=True` dataclass with required positional arg; we use keyword everywhere in adapter, but check the wider codebase before commit).
+
+## Component 4: Solana `get_blocks` + catchup
+
+**Location**: `core/chains/solana.py`
+
+**New method**:
+
+```python
+async def get_blocks(self, start_slot: int, end_slot: int) -> list[int]:
+    """Return slot numbers in [start_slot, end_slot] that contain confirmed blocks.
+
+    Skipped/empty slots are excluded. Uses RPC `getBlocks(start, end)`.
+    Range size must respect server limit (`slot_query_range_blocks` controls
+    the caller-side window; this method does not internally chunk).
+    """
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getBlocks",
+        "params": [start_slot, end_slot, {"commitment": "finalized"}],
+    }
+    resp = await self._client.post(self._rpc_url, json=payload, ...)
+    result = resp.json().get("result")
+    return list(result or [])
+```
+
+**Commitment caveat**: `getBlocks` is officially supported for `finalized` commitment. `confirmed` works on most providers but may return empty on stricter ones. We pass `finalized` regardless of the chain's configured commitment, *only* for the slot-discovery step. The subsequent `getBlock` calls still use the chain's configured commitment.
+
+**Catchup change** (`_catchup_solana`):
+
+```python
+range_slots = self._chain.slot_query_range_blocks  # default 1000
+start_s = last_slot + 1
+while start_s <= tip:
+    end_s = min(start_s + range_slots - 1, tip)
+    try:
+        valid = await self._adapter.get_blocks(start_s, end_s)
+    except Exception:
+        log.warning("chain_runner.get_blocks_failed", chain_id=..., start=start_s, end=end_s)
+        # Degrade to full range iteration for safety
+        valid = list(range(start_s, end_s + 1))
+    for s in valid:
+        if self._stop.is_set():
+            return
+        await self._process_solana_slot(s)
+    start_s = end_s + 1
+```
+
+Head-following Solana path is unchanged (one slot at a time).
+
+## Error Handling
+
+| Failure | Behavior |
+|---------|----------|
+| `eth_getLogs` returns "too large"-class error | Binary-split the window down to single block; if single block still fails, propagate |
+| `eth_getLogs` returns network error | Propagate; `ChainRunner` catches and aborts current catchup iteration (existing behavior) |
+| `getBlocks` returns network error | Log warning + degrade to dense iteration over `[start, end]` for that window only |
+| Topic0 keccak computation fails | Builder drops topic filter for entire chain (consistent with approved policy) |
+| `Log.block_number` mismatch with bucket key | Skip the log with warning (defensive; should never happen with conformant RPCs) |
+
+## Testing Strategy
+
+**Unit tests**:
+
+- `tests/unit/test_filter_set.py` — 7 cases (one per behavior-table row + ERC20 topic0 + abi registry hit/miss).
+- `tests/unit/test_evm_fetch_logs_topics.py` — mock httpx provider, verify `topics` and `address` keys appear/absent in JSON-RPC body for each filter shape.
+- `tests/unit/test_evm_catchup_range.py` — mock adapter, count calls; verify N-block gap → ceil(N/range_blocks) `fetch_logs` calls and N `fetch_block` calls.
+- `tests/unit/test_evm_fetch_logs_degrade.py` — adapter raising "too large" once, verify bisection and eventual success.
+- `tests/unit/test_evm_skip_logs.py` — chain with only native_transfer subs, verify `fetch_logs` never called.
+- `tests/unit/test_solana_get_blocks.py` — mock client, verify only valid slots get `fetch_block`.
+- `tests/unit/test_solana_catchup_range.py` — full catchup with mixed valid/skipped slots.
+
+**Integration tests** (in `tests/e2e`, gated by `@pytest.mark.e2e`):
+
+- `test_evm_catchup_anvil_logs_filtered.py` — anvil with multiple contracts; only one subscribed; verify catchup correctness + reduced `eth_getLogs` calls via anvil request log.
+- `test_solana_catchup_skips_empty.py` — solana-test-validator with engineered skipped slots (or mock).
+
+**Regression**: existing `tests/e2e/test_anvil_e2e.py` and `tests/e2e/test_solana_e2e.py` must still pass without modification.
+
+## Implementation Order
+
+Each step is independently committable, testable, and adds no broken state in between.
+
+1. **Schema + snapshot wiring**
+   - Alembic `0006_rpc_range_config.py`
+   - `Chain` model + `SnapshotChain` + repos + web schemas + UI form (UI may lag, API-only is enough)
+   - Default values applied to existing rows on migration
+2. **`Log.block_number` field**
+   - Add to dataclass, populate in `EvmAdapter.fetch_logs`, audit consumers
+3. **`EvmLogFilterSet` + builder**
+   - New file + unit tests
+4. **`EvmAdapter.fetch_logs` topics parameter**
+   - Signature change + unit test for parameter passthrough
+5. **`ChainRunner` head-following filter integration**
+   - Build filter in `start` / `apply_snapshot`; use in `_process_confirmed_block`
+   - Verify existing tests still pass
+6. **`ChainRunner._catchup_evm` range query + degradation**
+   - Bucket helper + degrade helper + main loop refactor
+   - New unit tests
+7. **`SolanaAdapter.get_blocks`**
+   - Method + unit test
+8. **`ChainRunner._catchup_solana` range + skip integration**
+   - Main loop refactor + degrade fallback
+   - New unit tests
+9. **E2E coverage**
+   - anvil + solana validator scenarios
+10. **Docs**: update `CLAUDE.md` quick reference if any new config knob mentioned
+
+## Rollout / Safety
+
+- All changes are behind existing config keys with sensible defaults — no opt-in flag needed.
+- Per-chain `log_query_range_blocks=1` reverts EVM behavior to per-block (escape hatch for misbehaving RPC providers).
+- Per-chain `slot_query_range_blocks=1` similarly degrades Solana to current behavior.
+- No data migration of historical events; checkpoint resume continues to work unchanged.
+
+## Open Questions
+
+None at design time. Implementation may surface RPC-provider-specific quirks (e.g., Infura/Alchemy topic param shape strictness); those become bug fixes, not design changes.
+
+## File-by-file Change Summary
+
+| File | Change | Approx LOC |
+|------|--------|-----------|
+| `migrations/versions/0006_rpc_range_config.py` | new | ~30 |
+| `core/config/models.py` | +2 fields | +4 |
+| `core/config/snapshot.py` | +2 fields, propagation | +6 |
+| `core/config/repositories.py` | read/write fields | +6 |
+| `apps/web/schemas.py` | request/response fields | +4 |
+| `apps/web/routers/chains.py` | accept new fields on POST/PATCH | +6 |
+| `web/src/pages/Chains.tsx` | form inputs (optional, can lag) | +20 |
+| `core/chains/types.py` | `Log.block_number` | +1 |
+| `core/chains/evm.py` | `fetch_logs(topics)` + `block_number` population | +10 |
+| `core/chains/solana.py` | `get_blocks()` method | +30 |
+| `core/matcher/filter_set.py` | new | ~80 |
+| `apps/worker/chain_runner.py` | filter wiring + catchup refactor | +120 |
+| `tests/unit/test_filter_set.py` | new | ~120 |
+| `tests/unit/test_evm_fetch_logs_topics.py` | new | ~60 |
+| `tests/unit/test_evm_catchup_range.py` | new | ~80 |
+| `tests/unit/test_evm_fetch_logs_degrade.py` | new | ~50 |
+| `tests/unit/test_evm_skip_logs.py` | new | ~40 |
+| `tests/unit/test_solana_get_blocks.py` | new | ~40 |
+| `tests/unit/test_solana_catchup_range.py` | new | ~60 |
+| `tests/e2e/test_evm_catchup_anvil_logs_filtered.py` | new | ~100 |
+| `tests/e2e/test_solana_catchup_skips_empty.py` | new | ~80 |
+
+**Total**: ~950 LOC including tests; ~340 LOC of production code.

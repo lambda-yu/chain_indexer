@@ -96,7 +96,7 @@ class Notifier:
                             payload, None, 1,
                         )
                     except Exception:  # noqa: BLE001
-                        pass
+                        log.error("notifier.on_success_callback_error")
             except Exception as exc:  # noqa: BLE001
                 attempts = getattr(exc, "attempts", 1)
                 log.error(

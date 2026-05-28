@@ -108,7 +108,7 @@ class _Worker:
 
     async def _on_delivery_failure(
         self, subscription_id: str, channel_id: str, chain_id: str,
-        payload: dict, error: str,
+        payload: dict, error: str, attempts: int,
     ) -> None:
         from core.config.repositories import DeliveryRecordRepo
         try:
@@ -119,6 +119,7 @@ class _Worker:
                     chain_id=chain_id,
                     event_payload=payload,
                     error=error,
+                    attempts=attempts,
                     status="failed",
                 )
                 await s.commit()
@@ -127,7 +128,7 @@ class _Worker:
 
     async def _on_delivery_success(
         self, subscription_id: str, channel_id: str, chain_id: str,
-        payload: dict, _error: str | None,
+        payload: dict, _error: None, _attempts: int,
     ) -> None:
         from core.config.repositories import DeliveryRecordRepo
         try:

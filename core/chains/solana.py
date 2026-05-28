@@ -89,6 +89,33 @@ class SolanaAdapter:
             return None
         return self._parse_block(slot, result)
 
+    async def get_blocks(self, start_slot: int, end_slot: int) -> list[int]:
+        """Return slots in [start_slot, end_slot] that contain confirmed blocks.
+
+        Skipped/empty slots are excluded. The slot-discovery step always uses
+        `finalized` commitment because `confirmed` is not guaranteed to support
+        large ranges across providers. Subsequent `getBlock` calls still
+        respect the chain's configured commitment.
+
+        The caller is responsible for window sizing (per-chain
+        `slot_query_range_blocks`); this method does not internally chunk.
+        """
+        assert self._client is not None
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getBlocks",
+            "params": [start_slot, end_slot, {"commitment": "finalized"}],
+        }
+        resp = await self._client.post(
+            self._rpc_url,
+            json=payload,
+            headers={"content-type": "application/json"},
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        result = body.get("result")
+        return list(result or [])
+
     def _parse_block(self, slot: int, result: dict[str, Any]) -> SolanaBlock:
         txs: list[SolanaTransaction] = []
         for tx_obj in result.get("transactions", []):

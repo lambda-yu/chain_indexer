@@ -8,12 +8,13 @@ import structlog
 
 from core.abi.registry import AbiRegistry
 from core.chains.confirmation_buffer import ConfirmationBuffer, ReorgEvent
-from core.chains.types import BlockHeader
+from core.chains.types import Block, BlockHeader, Log
 from core.config.snapshot import (
     ConfigSnapshot,
     SnapshotChain,
     SnapshotChannel,
 )
+from core.matcher.filter_set import EvmLogFilterSet, build_evm_log_filter
 from core.matcher.matcher import Matcher
 from core.notifier.channel import Channel
 from core.notifier.notifier import Notifier
@@ -34,6 +35,24 @@ log = structlog.get_logger(__name__)
 
 AdapterFactory = Callable[[SnapshotChain], Any]
 ChannelFactory = Callable[[SnapshotChannel], Channel]
+
+
+_DEGRADE_ERR_HINTS = (
+    "too large", "result too big", "query timeout",
+    "limit exceeded", "returned more than",
+    "response size exceeded",  # Alchemy log-response cap
+    "block range",              # BlockPI/Ankr "block range is too wide"
+)
+
+
+_SOL_RANGE_TOO_LARGE_HINTS = ("exceeds maximum", "too large", "limit exceeded")
+
+
+def _bucket_by_block(logs: list[Log]) -> dict[int, list[Log]]:
+    out: dict[int, list[Log]] = {}
+    for lg in logs:
+        out.setdefault(lg.block_number, []).append(lg)
+    return out
 
 
 class _CheckpointRepo(Protocol):
@@ -80,6 +99,7 @@ class ChainRunner:
         self._solana_pipeline: SolanaParserPipeline | None = None
         self._matcher: Matcher | None = None
         self._notifier: Notifier | None = None
+        self._evm_filter: EvmLogFilterSet | None = None
         self._current_snap: ConfigSnapshot | None = None
         self._buffer_tip_hash: str | None = None
         self._stop = asyncio.Event()
@@ -140,6 +160,8 @@ class ChainRunner:
         )
         await self._notifier.start(snap.channels)
         self._current_snap = snap
+        if self._chain.kind != "solana":
+            self._evm_filter = build_evm_log_filter(snap, self._chain.id, self._abi_registry)
 
     async def apply_snapshot(self, snap: ConfigSnapshot) -> None:
         async with self._snap_lock:
@@ -152,6 +174,8 @@ class ChainRunner:
             )
             await self._notifier.start(snap.channels)
             self._current_snap = snap
+            if self._chain.kind != "solana":
+                self._evm_filter = build_evm_log_filter(snap, self._chain.id, self._abi_registry)
             log.info(
                 "chain_runner.snapshot_applied",
                 chain_id=self._chain.id,
@@ -180,10 +204,34 @@ class ChainRunner:
                 break
             await self._handle_evm_head(header)
 
+    async def _fetch_logs_with_degrade(
+        self, start: int, end: int, log_filter: EvmLogFilterSet,
+    ) -> dict[int, list[Log]]:
+        try:
+            logs = await self._adapter.fetch_logs(
+                start, end,
+                addresses=log_filter.addresses,
+                topics=log_filter.topics_param,
+            )
+            return _bucket_by_block(logs)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if any(h in msg for h in _DEGRADE_ERR_HINTS):
+                if end > start:
+                    mid = (start + end) // 2
+                    left = await self._fetch_logs_with_degrade(start, mid, log_filter)
+                    right = await self._fetch_logs_with_degrade(mid + 1, end, log_filter)
+                    return {**left, **right}
+                # Single-block floor still failing.
+                log.error(
+                    "chain_runner.fetch_logs_single_block_too_large",
+                    chain_id=self._chain.id, block=start,
+                )
+            raise
+
     async def _catchup_evm(self) -> None:
-        """Process missed blocks between effective start and chain tip."""
         assert self._adapter is not None and self._matcher is not None and self._notifier is not None
-        # Determine effective start: min of checkpoint and all subscription start_blocks
+        assert self._evm_filter is not None
         cp_block = self.resume_from[0] if self.resume_from else None
         sub_starts = [s.start_block for s in (self._current_snap.subscriptions if self._current_snap else [])
                       if s.chain_id == self._chain.id and s.start_block is not None and s.enabled]
@@ -201,24 +249,61 @@ class ChainRunner:
         if gap <= 0:
             return
         if gap > self.MAX_CATCHUP_BLOCKS:
-            log.warning("chain_runner.catchup_gap_too_large", chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS, skipping_to=safe_tip - self.MAX_CATCHUP_BLOCKS)
+            log.warning(
+                "chain_runner.catchup_gap_too_large",
+                chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS,
+                skipping_to=safe_tip - self.MAX_CATCHUP_BLOCKS,
+            )
             last_block = safe_tip - self.MAX_CATCHUP_BLOCKS
             gap = self.MAX_CATCHUP_BLOCKS
-        log.info("chain_runner.catchup_starting", chain_id=self._chain.id, from_block=last_block + 1, to_block=safe_tip, gap=gap)
-        matcher = self._matcher
-        notifier = self._notifier
+        log.info(
+            "chain_runner.catchup_starting",
+            chain_id=self._chain.id, from_block=last_block + 1,
+            to_block=safe_tip, gap=gap,
+        )
+        range_blocks = self._chain.log_query_range_blocks
+
         processed = 0
-        for n in range(last_block + 1, safe_tip + 1):
-            if self._stop.is_set():
-                break
+        start_n = last_block + 1
+        while start_n <= safe_tip:
+            # Re-read snapshot-derived state per window so apply_snapshot()
+            # mid-catchup takes effect at the next window boundary instead of
+            # being deferred until catchup completes. Reads are atomic (Python
+            # GIL); a torn (matcher_v1, filter_v2) read at worst delays new
+            # subscriptions by one window — never violates correctness for
+            # already-active subscriptions.
+            matcher = self._matcher
+            notifier = self._notifier
+            log_filter = self._evm_filter
+            assert matcher is not None and notifier is not None and log_filter is not None
+            end_n = min(start_n + range_blocks - 1, safe_tip)
             try:
-                await self._process_confirmed_block(n, matcher=matcher, notifier=notifier)
-                processed += 1
-                if processed % 100 == 0:
-                    log.info("chain_runner.catchup_progress", chain_id=self._chain.id, block=n, remaining=safe_tip - n)
-            except Exception:  # noqa: BLE001
-                log.error("chain_runner.catchup_block_failed", chain_id=self._chain.id, block=n)
+                if log_filter.skip_logs:
+                    logs_by_block: dict[int, list[Log]] = {}
+                else:
+                    logs_by_block = await self._fetch_logs_with_degrade(start_n, end_n, log_filter)
+                for n in range(start_n, end_n + 1):
+                    if self._stop.is_set():
+                        return
+                    block = await self._adapter.fetch_block(n)
+                    await self._process_block_with_prefetched_logs(
+                        n, block, logs_by_block.get(n, []),
+                        matcher=matcher, notifier=notifier,
+                    )
+                    processed += 1
+                    if processed % 100 == 0:
+                        log.info(
+                            "chain_runner.catchup_progress",
+                            chain_id=self._chain.id, block=n,
+                            remaining=safe_tip - n,
+                        )
+            except Exception:  # noqa: BLE001 — preserves existing _catchup_evm break-on-error
+                log.error(
+                    "chain_runner.catchup_window_failed",
+                    chain_id=self._chain.id, start=start_n, end=end_n,
+                )
                 break
+            start_n = end_n + 1
         log.info("chain_runner.catchup_done", chain_id=self._chain.id, processed=processed)
 
     async def _run_solana(self) -> None:
@@ -247,25 +332,67 @@ class ChainRunner:
         if gap <= 0:
             return
         if gap > self.MAX_CATCHUP_BLOCKS:
-            log.warning("chain_runner.catchup_gap_too_large", chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS)
+            log.warning(
+                "chain_runner.catchup_gap_too_large",
+                chain_id=self._chain.id, gap=gap, max=self.MAX_CATCHUP_BLOCKS,
+            )
             last_slot = tip - self.MAX_CATCHUP_BLOCKS
             gap = self.MAX_CATCHUP_BLOCKS
-        log.info("chain_runner.catchup_starting", chain_id=self._chain.id, from_slot=last_slot + 1, to_slot=tip, gap=gap)
-        matcher = self._matcher
-        notifier = self._notifier
+        log.info(
+            "chain_runner.catchup_starting",
+            chain_id=self._chain.id, from_slot=last_slot + 1, to_slot=tip, gap=gap,
+        )
+
+        range_slots = self._chain.slot_query_range_blocks
         processed = 0
-        for s in range(last_slot + 1, tip + 1):
-            if self._stop.is_set():
-                break
-            try:
-                await self._process_solana_slot(s)
-                processed += 1
-                if processed % 100 == 0:
-                    log.info("chain_runner.catchup_progress", chain_id=self._chain.id, slot=s, remaining=tip - s)
-            except Exception:  # noqa: BLE001
-                log.error("chain_runner.catchup_slot_failed", chain_id=self._chain.id, slot=s)
-                continue
+        start_s = last_slot + 1
+        while start_s <= tip:
+            end_s = min(start_s + range_slots - 1, tip)
+            valid = await self._get_blocks_classified(start_s, end_s)
+            for s in valid:
+                if self._stop.is_set():
+                    return
+                try:
+                    await self._process_solana_slot(s)
+                    processed += 1
+                    if processed % 100 == 0:
+                        log.info(
+                            "chain_runner.catchup_progress",
+                            chain_id=self._chain.id, slot=s, remaining=tip - s,
+                        )
+                except Exception:  # noqa: BLE001 — match existing per-slot tolerance
+                    log.error(
+                        "chain_runner.catchup_slot_failed",
+                        chain_id=self._chain.id, slot=s,
+                    )
+                    continue
+            start_s = end_s + 1
         log.info("chain_runner.catchup_done", chain_id=self._chain.id, processed=processed)
+
+    async def _get_blocks_classified(self, start: int, end: int) -> list[int]:
+        """Wrap adapter.get_blocks, classify errors.
+
+        - Size-limit class (hint match) → raise (config error: operator must
+          lower slot_query_range_blocks).
+        - Other transient errors → log warning, return dense [start, end+1).
+        """
+        assert self._adapter is not None
+        try:
+            result: list[int] = await self._adapter.get_blocks(start, end)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if any(h in msg for h in _SOL_RANGE_TOO_LARGE_HINTS):
+                log.error(
+                    "chain_runner.get_blocks_range_too_large",
+                    chain_id=self._chain.id, start=start, end=end,
+                )
+                raise
+            log.warning(
+                "chain_runner.get_blocks_failed",
+                chain_id=self._chain.id, start=start, end=end, error=str(exc),
+            )
+            return list(range(start, end + 1))
 
     async def _handle_evm_head(self, header: BlockHeader) -> None:
         assert self._buffer is not None and self._adapter is not None
@@ -326,12 +453,37 @@ class ChainRunner:
         notifier: Notifier,
     ) -> None:
         assert self._adapter is not None and self._evm_pipeline is not None
-        # 优化1: 并行拉取 block + logs
+        assert self._evm_filter is not None
+        log_filter = self._evm_filter
+
         block_coro = self._adapter.fetch_block(number)
-        logs_coro = self._adapter.fetch_logs(number, number)
-        block, logs = await asyncio.gather(block_coro, logs_coro)
+        if log_filter.skip_logs:
+            block = await block_coro
+            logs: list[Log] = []
+        else:
+            logs_coro = self._adapter.fetch_logs(
+                number, number,
+                addresses=log_filter.addresses,
+                topics=log_filter.topics_param,
+            )
+            block, logs = await asyncio.gather(block_coro, logs_coro)
+
+        await self._process_block_with_prefetched_logs(
+            number, block, logs, matcher=matcher, notifier=notifier,
+        )
+
+    async def _process_block_with_prefetched_logs(
+        self,
+        number: int,
+        block: Block,
+        prefetched_logs: list[Log],
+        *,
+        matcher: Matcher,
+        notifier: Notifier,
+    ) -> None:
+        assert self._adapter is not None and self._evm_pipeline is not None
         from dataclasses import replace
-        block = replace(block, logs=logs)
+        block = replace(block, logs=prefetched_logs)
 
         events = list(self._evm_pipeline.run(block))
 

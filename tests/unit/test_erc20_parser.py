@@ -37,6 +37,7 @@ def _erc20_log(
         address=address,
         topics=topics,
         data=value_hex if value_hex is not None else "0x",
+        block_number=10,
     )
 
 
@@ -101,6 +102,7 @@ def test_skips_erc721_transfers_by_topic_count() -> None:
             "0x" + "0" * 62 + "07",  # tokenId = 7
         ],
         data="0x",
+        block_number=10,
     )
     p = Erc20TransferParser(chain_id="eth-mainnet")
     blk = _block([log_721])

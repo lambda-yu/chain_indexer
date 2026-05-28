@@ -106,8 +106,19 @@ class _FakeAdapter:
     async def fetch_block(self, number: int) -> Block:
         return self._blocks[number]
 
-    async def fetch_logs(self, _from: int, _to: int, _addr: list[str] | None = None) -> list[Any]:
-        return []
+    async def fetch_logs(
+        self,
+        from_block: int,
+        to_block: int,
+        addresses: list[str] | None = None,
+        topics: list[list[str]] | None = None,
+    ) -> list[Any]:
+        out: list[Any] = []
+        for n in range(from_block, to_block + 1):
+            b = self._blocks.get(n)
+            if b is not None:
+                out.extend(b.logs)
+        return out
 
     async def get_latest_block_number(self) -> int:
         return max(self._blocks) if self._blocks else 0
@@ -292,6 +303,7 @@ def _block_with_erc20_log(n: int, *, value: int = 1000) -> Block:
                     "0x" + pad + _to,
                 ],
                 data="0x" + format(value, "064x"),
+                block_number=n,
             ),
         ],
     )
@@ -456,3 +468,87 @@ def test_chain_runner_pipeline_includes_abi_call_parser_when_registry_given() ->
     assert "AbiEventParser" not in types_without
     assert "EvmNativeTransferParser" in types_with and "EvmNativeTransferParser" in types_without
     assert "Erc20TransferParser" in types_with and "Erc20TransferParser" in types_without
+
+
+@pytest.mark.asyncio
+async def test_head_following_passes_filter_to_fetch_logs() -> None:
+    """ChainRunner with a token_transfer subscription should call fetch_logs
+    with the ERC-20 topic0 in `topics`."""
+    from core.matcher.filter_set import ERC20_TRANSFER_TOPIC0
+
+    snap = ConfigSnapshot(
+        version=1,
+        subscriptions=[SnapshotSubscription(
+            id="s1", name="s1", chain_id="eth-test", address="0xaaa",
+            abi_id=None, match_kind="token_transfer", match_name=None,
+            arg_filters={}, enabled=True, channel_ids=["c1"],
+        )],
+        channels=[_ch("c1")],
+        chains=[_chain()],
+        abis=[],
+    )
+
+    captured: dict = {}
+
+    class _CapturingAdapter(_FakeAdapter):
+        async def fetch_logs(
+            self, from_block, to_block,
+            addresses=None, topics=None,
+        ):
+            captured["from"] = from_block
+            captured["to"] = to_block
+            captured["addresses"] = addresses
+            captured["topics"] = topics
+            return []
+
+    adapter = _CapturingAdapter(blocks=[_block_with_native(42, value_wei=0)])
+    runner = ChainRunner(
+        chain=_chain(),
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    await runner.start(snap)
+    await runner._process_confirmed_block(
+        42, matcher=runner._matcher, notifier=runner._notifier,
+    )
+    assert captured["from"] == 42
+    assert captured["to"] == 42
+    assert captured["addresses"] == ["0xaaa"]
+    assert captured["topics"] == [[ERC20_TRANSFER_TOPIC0]]
+
+
+@pytest.mark.asyncio
+async def test_head_following_skips_logs_when_no_log_subscription() -> None:
+    """If only native_transfer subs exist, fetch_logs should never be called."""
+    snap = ConfigSnapshot(
+        version=1,
+        subscriptions=[SnapshotSubscription(
+            id="s1", name="s1", chain_id="eth-test", address=None,
+            abi_id=None, match_kind="native_transfer", match_name=None,
+            arg_filters={}, enabled=True, channel_ids=["c1"],
+        )],
+        channels=[_ch("c1")],
+        chains=[_chain()],
+        abis=[],
+    )
+
+    fetch_logs_called = {"n": 0}
+
+    class _NoLogsAdapter(_FakeAdapter):
+        async def fetch_logs(self, *a, **kw):
+            fetch_logs_called["n"] += 1
+            return []
+
+    adapter = _NoLogsAdapter(blocks=[_block_with_native(7, value_wei=0)])
+    runner = ChainRunner(
+        chain=_chain(),
+        adapter_factory=lambda _cfg: adapter,
+        channel_factory=lambda _cfg: _CollectingChannel(),
+        checkpoint_repo=_CheckpointStub(),
+    )
+    await runner.start(snap)
+    await runner._process_confirmed_block(
+        7, matcher=runner._matcher, notifier=runner._notifier,
+    )
+    assert fetch_logs_called["n"] == 0

@@ -34,6 +34,6 @@ async def test_can_create_all_tables() -> None:
 def test_enums_have_expected_values() -> None:
     assert {e.value for e in ChainKind} == {"evm", "solana"}
     assert {e.value for e in MatchKind} == {"native_transfer", "token_transfer", "event", "call"}
-    assert {e.value for e in ChannelType} == {"mq", "http", "ws"}
+    assert {e.value for e in ChannelType} == {"mq", "http", "ws", "kafka", "rabbitmq"}
     from core.config.models import AbiKind
     assert {e.value for e in AbiKind} == {"evm_abi", "solana_idl"}

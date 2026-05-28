@@ -64,7 +64,7 @@ def test_create_chain_persists_and_publishes(db: Database) -> None:
     assert msg["id"] == "eth-mainnet"
 
 
-def test_list_chains_returns_only_enabled(db: Database) -> None:
+def test_list_chains_returns_all(db: Database) -> None:
     bus = _FakeBus()
     with _client(db, bus) as c:
         c.post("/api/chains", json={
@@ -78,7 +78,7 @@ def test_list_chains_returns_only_enabled(db: Database) -> None:
         r = c.get("/api/chains")
     assert r.status_code == 200
     ids = sorted(x["id"] for x in r.json())
-    assert ids == ["eth-mainnet"]
+    assert ids == ["bsc", "eth-mainnet"]
 
 
 def test_get_chain_by_id_404(db: Database) -> None:
@@ -96,3 +96,41 @@ def test_create_chain_invalid_kind_400(db: Database) -> None:
             "confirmations": 1, "poll_interval_ms": 1000, "enabled": True,
         })
     assert r.status_code == 422  # pydantic validation
+
+
+def test_chain_create_persists_log_and_slot_range(db: Database) -> None:
+    bus = _FakeBus()
+    payload = {
+        "id": "test-evm-range",
+        "kind": "evm",
+        "rpc_http": "http://localhost:8545",
+        "rpc_ws": None,
+        "confirmations": 1,
+        "poll_interval_ms": 1000,
+        "log_query_range_blocks": 250,
+        "slot_query_range_blocks": 500,
+        "enabled": True,
+    }
+    with _client(db, bus) as c:
+        r = c.post("/api/chains", json=payload)
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["log_query_range_blocks"] == 250
+        assert body["slot_query_range_blocks"] == 500
+
+        g = c.get(f"/api/chains/{payload['id']}")
+        assert g.status_code == 200
+        assert g.json()["log_query_range_blocks"] == 250
+
+
+def test_chain_create_rejects_zero_log_query_range(db: Database) -> None:
+    bus = _FakeBus()
+    payload = {
+        "id": "bad", "kind": "evm", "rpc_http": "http://x",
+        "rpc_ws": None, "confirmations": 1, "poll_interval_ms": 1000,
+        "log_query_range_blocks": 0,
+        "enabled": True,
+    }
+    with _client(db, bus) as c:
+        r = c.post("/api/chains", json=payload)
+    assert r.status_code == 422

@@ -277,10 +277,12 @@ class DeliveryRecordRepo:
         )
         return list(r.scalars().all())
 
-    async def list_all(self, limit: int = 100) -> list[DeliveryRecord]:
-        r = await self.s.execute(
-            select(DeliveryRecord).order_by(DeliveryRecord.created_at.desc()).limit(limit)
-        )
+    async def list_all(self, limit: int = 100, subscription_id: str | None = None) -> list[DeliveryRecord]:
+        stmt = select(DeliveryRecord)
+        if subscription_id is not None:
+            stmt = stmt.where(DeliveryRecord.subscription_id == subscription_id)
+        stmt = stmt.order_by(DeliveryRecord.created_at.desc()).limit(limit)
+        r = await self.s.execute(stmt)
         return list(r.scalars().all())
 
     async def mark_resolved(self, delivery_id: str) -> None:

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { api } from '@/api/client'
 import { Plus, Trash2, Pencil, FlaskConical } from 'lucide-react'
 
@@ -32,7 +33,15 @@ export default function Subscriptions() {
           </tr></thead>
           <tbody>{subs.map(s => (
             <tr key={s.id} className="border-b hover:bg-gray-50">
-              <td className="py-2 px-2 font-medium">{s.name}</td>
+              <td className="py-2 px-2 font-medium">
+                <Link
+                  to={`/failed?subscription_id=${s.id}`}
+                  className="text-blue-600 hover:text-blue-800 hover:underline"
+                  title="查看该订阅的推送记录"
+                >
+                  {s.name}
+                </Link>
+              </td>
               <td className="py-2 px-2 font-mono text-xs">{s.chain_id}</td>
               <td className="py-2 px-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100">{s.match_kind}</span></td>
               <td className="py-2 px-2 text-xs">{s.abi_id ? (abiNameMap[s.abi_id] ?? s.abi_id.slice(0, 8)) : '—'}</td>

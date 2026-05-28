@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '@/api/client'
-import { RefreshCw, Check, Trash2, ChevronDown, ChevronRight, AlertTriangle } from 'lucide-react'
+import { RefreshCw, Check, Trash2, ChevronDown, ChevronRight, AlertTriangle, X } from 'lucide-react'
 
 interface FailedDelivery {
   id: string; subscription_id: string; channel_id: string; chain_id: string
@@ -9,9 +10,24 @@ interface FailedDelivery {
   status: string; created_at: string; resolved_at: string | null
 }
 
+interface SubItem { id: string; name: string }
+
 export default function FailedDeliveries() {
   const qc = useQueryClient()
-  const { data: items = [], isLoading } = useQuery<FailedDelivery[]>({ queryKey: ['failed-deliveries'], queryFn: () => api.get('/failed-deliveries'), refetchInterval: 10000 })
+  const [params, setParams] = useSearchParams()
+  const subFilter = params.get('subscription_id')
+
+  const { data: items = [], isLoading } = useQuery<FailedDelivery[]>({
+    queryKey: ['failed-deliveries', subFilter],
+    queryFn: () => api.get(subFilter ? `/failed-deliveries?subscription_id=${subFilter}` : '/failed-deliveries'),
+    refetchInterval: 10000,
+  })
+  const { data: subs = [] } = useQuery<SubItem[]>({
+    queryKey: ['subscriptions'], queryFn: () => api.get('/subscriptions'),
+    enabled: !!subFilter, staleTime: 30000,
+  })
+  const subName = subFilter ? (subs.find(s => s.id === subFilter)?.name ?? subFilter.slice(0, 8) + '...') : null
+
   const retryMut = useMutation({ mutationFn: (id: string) => api.post(`/failed-deliveries/${id}/retry`, {}), onSuccess: () => qc.invalidateQueries({ queryKey: ['failed-deliveries'] }) })
   const resolveMut = useMutation({ mutationFn: (id: string) => api.post(`/failed-deliveries/${id}/resolve`, {}), onSuccess: () => qc.invalidateQueries({ queryKey: ['failed-deliveries'] }) })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/failed-deliveries/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['failed-deliveries'] }) })
@@ -20,12 +36,25 @@ export default function FailedDeliveries() {
 
   const failed = items.filter(i => i.status === 'failed')
 
+  const clearFilter = () => { setParams({}); qc.invalidateQueries({ queryKey: ['failed-deliveries'] }) }
+
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">失败投递（死信队列）</h2>
+        <h2 className="text-2xl font-bold">{subFilter ? '推送记录' : '失败投递（死信队列）'}</h2>
         {failed.length > 0 && <span className="px-2 py-1 rounded bg-red-100 text-red-700 text-sm font-medium">{failed.length} 条待处理</span>}
       </div>
+
+      {subFilter && (
+        <div className="mb-3 flex items-center gap-2 text-sm bg-blue-50 border border-blue-200 rounded px-3 py-1.5">
+          <span className="text-gray-500">订阅:</span>
+          <span className="font-medium">{subName}</span>
+          <Link to="/subscriptions" className="text-blue-600 hover:underline text-xs ml-2">← 返回订阅列表</Link>
+          <button onClick={clearFilter} className="ml-auto text-gray-500 hover:text-gray-700" title="清除过滤显示全部">
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {isLoading ? <p className="text-gray-500">加载中...</p> : items.length === 0 ? (
         <div className="text-center py-12 text-gray-400">

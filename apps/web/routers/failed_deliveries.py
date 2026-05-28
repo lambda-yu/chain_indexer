@@ -30,9 +30,10 @@ class FailedDeliveryOut(BaseModel):
 
 @router.get("", response_model=list[FailedDeliveryOut])
 async def list_failed_deliveries(
+    subscription_id: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[FailedDeliveryOut]:
-    rows = await DeliveryRecordRepo(session).list_all(limit=200)
+    rows = await DeliveryRecordRepo(session).list_all(limit=200, subscription_id=subscription_id)
     return [FailedDeliveryOut.model_validate(r) for r in rows]
 
 

@@ -5,7 +5,7 @@ import { Activity, Box, Radio, Link2, Upload, CheckCircle, XCircle, AlertTriangl
 interface Health { db: string; redis: string }
 interface Chain { id: string; kind: string; enabled: boolean }
 interface ChainStatus { chain_id: string; enabled: boolean; latest_block: number | null; latest_block_hash: string | null }
-interface FailedDelivery { id: string; status: string }
+interface DeliveryRecord { id: string; status: string }
 
 export default function Dashboard() {
   const { data: health } = useQuery<Health>({ queryKey: ['health'], queryFn: () => api.get('/healthz'), refetchInterval: 10000 })
@@ -13,7 +13,7 @@ export default function Dashboard() {
   const { data: channels = [] } = useQuery<unknown[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
   const { data: subs = [] } = useQuery<unknown[]>({ queryKey: ['subscriptions'], queryFn: () => api.get('/subscriptions') })
   const { data: abis = [] } = useQuery<unknown[]>({ queryKey: ['abis'], queryFn: () => api.get('/abis') })
-  const { data: failures = [] } = useQuery<FailedDelivery[]>({ queryKey: ['failed-deliveries'], queryFn: () => api.get('/failed-deliveries'), refetchInterval: 10000 })
+  const { data: failures = [] } = useQuery<DeliveryRecord[]>({ queryKey: ['delivery-records'], queryFn: () => api.get('/delivery-records'), refetchInterval: 10000 })
 
   const ok = (s: string) => s === 'ok'
   const failedCount = failures.filter(f => f.status === 'failed').length

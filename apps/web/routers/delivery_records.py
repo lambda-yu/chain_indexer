@@ -11,10 +11,10 @@ from core.bus.redis_bus import RedisBus
 from core.config.repositories import DeliveryRecordRepo
 from core.notifier.channel import CHANNEL_REGISTRY
 
-router = APIRouter(prefix="/api/failed-deliveries", tags=["failed-deliveries"])
+router = APIRouter(prefix="/api/delivery-records", tags=["delivery-records"])
 
 
-class FailedDeliveryOut(BaseModel):
+class DeliveryRecordOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     subscription_id: str
@@ -28,13 +28,13 @@ class FailedDeliveryOut(BaseModel):
     resolved_at: str | None
 
 
-@router.get("", response_model=list[FailedDeliveryOut])
-async def list_failed_deliveries(
+@router.get("", response_model=list[DeliveryRecordOut])
+async def list_delivery_records(
     subscription_id: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
-) -> list[FailedDeliveryOut]:
+) -> list[DeliveryRecordOut]:
     rows = await DeliveryRecordRepo(session).list_all(limit=200, subscription_id=subscription_id)
-    return [FailedDeliveryOut.model_validate(r) for r in rows]
+    return [DeliveryRecordOut.model_validate(r) for r in rows]
 
 
 @router.post("/{delivery_id}/retry", status_code=status.HTTP_200_OK)

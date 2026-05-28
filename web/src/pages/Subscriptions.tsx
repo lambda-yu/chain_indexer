@@ -35,7 +35,7 @@ export default function Subscriptions() {
             <tr key={s.id} className="border-b hover:bg-gray-50">
               <td className="py-2 px-2 font-medium">
                 <Link
-                  to={`/failed?subscription_id=${s.id}`}
+                  to={`/deliveries?subscription_id=${s.id}`}
                   className="text-blue-600 hover:text-blue-800 hover:underline"
                   title="查看该订阅的推送记录"
                 >

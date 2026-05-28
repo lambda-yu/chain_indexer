@@ -107,7 +107,7 @@ def create_app(
     from apps.web.routers import abis as abis_router  # noqa: E402
     from apps.web.routers import chains as chains_router  # noqa: E402
     from apps.web.routers import channels as channels_router  # noqa: E402
-    from apps.web.routers import failed_deliveries as fd_router  # noqa: E402
+    from apps.web.routers import delivery_records as dr_router  # noqa: E402
     from apps.web.routers import logs as logs_router  # noqa: E402
     from apps.web.routers import subscriptions as subs_router  # noqa: E402
     from apps.web.routers import test as test_router  # noqa: E402
@@ -116,7 +116,7 @@ def create_app(
     app.include_router(chains_router.router)
     app.include_router(abis_router.router)
     app.include_router(channels_router.router)
-    app.include_router(fd_router.router)
+    app.include_router(dr_router.router)
     app.include_router(logs_router.router)
     app.include_router(subs_router.router)
     app.include_router(test_router.router)

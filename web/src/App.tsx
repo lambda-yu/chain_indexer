@@ -8,7 +8,7 @@ import Subscriptions from '@/pages/Subscriptions'
 import Abis from '@/pages/Abis'
 import BlockTest from '@/pages/BlockTest'
 import EventStream from '@/pages/EventStream'
-import FailedDeliveries from '@/pages/FailedDeliveries'
+import DeliveryRecords from '@/pages/DeliveryRecords'
 import Logs from '@/pages/Logs'
 
 const queryClient = new QueryClient()
@@ -25,7 +25,8 @@ export default function App() {
             <Route path="/subscriptions" element={<Subscriptions />} />
             <Route path="/abis" element={<Abis />} />
             <Route path="/test" element={<BlockTest />} />
-            <Route path="/failed" element={<FailedDeliveries />} />
+            <Route path="/deliveries" element={<DeliveryRecords />} />
+            <Route path="/failed" element={<DeliveryRecords />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/events" element={<EventStream />} />
           </Route>

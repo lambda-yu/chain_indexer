@@ -165,7 +165,7 @@ class DeliveryStatus(enum.StrEnum):
 
 
 class DeliveryRecord(Base):
-    __tablename__ = "failed_deliveries"
+    __tablename__ = "delivery_records"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     subscription_id: Mapped[str] = mapped_column(String(36), nullable=False)

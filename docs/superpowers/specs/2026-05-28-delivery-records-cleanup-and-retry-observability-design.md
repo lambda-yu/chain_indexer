@@ -408,7 +408,7 @@ FastAPI's `Literal` validation produces a clean 422 for unknown statuses.
 **Integration tests** (`tests/integration/`):
 
 - `test_worker_cleanup.py`: spin up a real `_Worker` with a tiny `cleanup_interval_seconds` (1) and small `max_success_rows` (5); seed 20 rows; assert convergence to 5 success rows within a few seconds; assert failed rows remain.
-- `apps/web/tests/test_delivery_records_router.py`:
+- `tests/integration/test_delivery_records_router.py`:
   - GET with `status=failed` returns only failed.
   - GET with invalid status returns 422.
   - POST `/retry` failure path: verify row's `attempts` and `error` updated, response is 502.

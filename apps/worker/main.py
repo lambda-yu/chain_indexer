@@ -105,6 +105,7 @@ class _Worker:
         self._worker_id = str(_uuid_mod.uuid4())[:8]
         self._stop = asyncio.Event()
         self._ready = ready_event
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def _on_delivery_failure(
         self, subscription_id: str, channel_id: str, chain_id: str,
@@ -155,6 +156,38 @@ class _Worker:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _run_cleanup_loop(self) -> None:
+        """Periodically delete oldest status='success' delivery_records rows
+        so the table stays under settings.delivery_records.max_success_rows.
+
+        Failed/retrying/resolved rows are never touched.
+        """
+        from core.config.repositories import DeliveryRecordRepo
+        cfg = self._settings.delivery_records
+        while not self._stop.is_set():
+            try:
+                async with self._db.session() as s:
+                    deleted = await DeliveryRecordRepo(s).cleanup_success(
+                        keep=cfg.max_success_rows,
+                        batch=cfg.cleanup_batch_size,
+                    )
+                    await s.commit()
+                if deleted > 0:
+                    log.info(
+                        "delivery_records.cleanup_done",
+                        deleted=deleted,
+                        keep=cfg.max_success_rows,
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception("delivery_records.cleanup_error")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=cfg.cleanup_interval_seconds,
+                )
+            except TimeoutError:
+                pass  # interval elapsed; loop again
+
     async def start(self) -> None:
         log.info("worker.starting", worker_id=self._worker_id)
         await self._db.connect()
@@ -169,6 +202,9 @@ class _Worker:
             poll_interval_s=5.0,
         )
         await self._watcher.start()
+        self._cleanup_task = asyncio.create_task(
+            self._run_cleanup_loop(), name="delivery_records_cleanup",
+        )
 
     async def run(self) -> None:
         """Main loop: dequeue snapshots, reconcile runners, exit on _stop.
@@ -269,6 +305,11 @@ class _Worker:
             return
         self._stop.set()
         log.info("worker.shutdown_starting")
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cleanup_task
+            self._cleanup_task = None
         if self._watcher is not None:
             await self._watcher.stop()
         if self._runners:

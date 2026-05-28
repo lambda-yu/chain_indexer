@@ -39,6 +39,12 @@ class LoggingSettings(BaseModel):
     format: Literal["json", "console"] = "json"
 
 
+class DeliveryRecordsSettings(BaseModel):
+    max_success_rows: int = 50000
+    cleanup_interval_seconds: int = 300
+    cleanup_batch_size: int = 1000
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CHAIN_INDEXER_",
@@ -53,6 +59,7 @@ class Settings(BaseSettings):
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    delivery_records: DeliveryRecordsSettings = Field(default_factory=DeliveryRecordsSettings)
 
     @classmethod
     def settings_customise_sources(

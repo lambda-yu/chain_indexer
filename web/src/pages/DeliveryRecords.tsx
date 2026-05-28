@@ -34,8 +34,14 @@ export default function DeliveryRecords() {
   const statusFilter = params.get('status') ?? 'all'
 
   const { data: items = [], isLoading } = useQuery<DeliveryRecord[]>({
-    queryKey: ['delivery-records', subFilter],
-    queryFn: () => api.get(subFilter ? `/delivery-records?subscription_id=${subFilter}` : '/delivery-records'),
+    queryKey: ['delivery-records', subFilter, statusFilter],
+    queryFn: () => {
+      const q = new URLSearchParams()
+      if (subFilter) q.set('subscription_id', subFilter)
+      if (statusFilter !== 'all') q.set('status', statusFilter)
+      const qs = q.toString()
+      return api.get(`/delivery-records${qs ? `?${qs}` : ''}`)
+    },
     refetchInterval: 10000,
   })
   const { data: subs = [] } = useQuery<SubItem[]>({
@@ -44,17 +50,14 @@ export default function DeliveryRecords() {
   })
   const subName = subFilter ? (subs.find(s => s.id === subFilter)?.name ?? subFilter.slice(0, 8) + '...') : null
 
-  const retryMut = useMutation({ mutationFn: (id: string) => api.post(`/delivery-records/${id}/retry`, {}), onSuccess: () => qc.invalidateQueries({ queryKey: ['delivery-records'] }) })
+  const retryMut = useMutation({
+    mutationFn: (id: string) => api.post(`/delivery-records/${id}/retry`, {}),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['delivery-records'] }),
+  })
   const resolveMut = useMutation({ mutationFn: (id: string) => api.post(`/delivery-records/${id}/resolve`, {}), onSuccess: () => qc.invalidateQueries({ queryKey: ['delivery-records'] }) })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/delivery-records/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['delivery-records'] }) })
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const toggle = (id: string) => setExpanded(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
-
-  const counts = items.reduce<Record<string, number>>((acc, it) => {
-    acc[it.status] = (acc[it.status] ?? 0) + 1
-    return acc
-  }, {})
-  const filtered = statusFilter === 'all' ? items : items.filter(i => i.status === statusFilter)
 
   const setStatus = (v: string) => {
     const next = new URLSearchParams(params)
@@ -70,14 +73,6 @@ export default function DeliveryRecords() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-2xl font-bold">投递记录</h2>
-        <div className="flex items-center gap-2 text-xs">
-          {(['success', 'failed', 'resolved', 'retrying'] as const).map(s => {
-            const c = counts[s] ?? 0
-            if (!c) return null
-            const m = STATUS_META[s]
-            return <span key={s} className={`px-2 py-0.5 rounded ${m.chip}`}>{m.label} {c}</span>
-          })}
-        </div>
       </div>
 
       {subFilter && (
@@ -104,14 +99,14 @@ export default function DeliveryRecords() {
         ))}
       </div>
 
-      {isLoading ? <p className="text-gray-500">加载中...</p> : filtered.length === 0 ? (
+      {isLoading ? <p className="text-gray-500">加载中...</p> : items.length === 0 ? (
         <div className="text-center py-12 text-gray-400">
           <Inbox size={32} className="mx-auto mb-2 opacity-50" />
-          <p>{items.length === 0 ? '暂无投递记录' : '当前状态过滤下无记录'}</p>
+          <p>暂无投递记录</p>
         </div>
       ) : (
         <div className="space-y-2">
-          {filtered.map(item => {
+          {items.map(item => {
             const m = STATUS_META[item.status] ?? STATUS_META.failed
             return (
               <div key={item.id} className={`border rounded-lg ${m.row}`}>
@@ -121,7 +116,7 @@ export default function DeliveryRecords() {
                   <span className="text-sm font-mono truncate max-w-40">{item.subscription_id.slice(0, 8)}...</span>
                   <span className="text-xs text-gray-400">→</span>
                   <span className="text-sm font-mono truncate max-w-40">{item.channel_id.slice(0, 8)}...</span>
-                  <span className="text-xs text-gray-400 ml-auto">{item.attempts} 次</span>
+                  <span className={`text-xs ml-auto ${item.attempts > 1 ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>{item.attempts} 次</span>
                   <span className="text-xs text-gray-400">{new Date(item.created_at).toLocaleString()}</span>
                 </div>
                 {expanded.has(item.id) && (

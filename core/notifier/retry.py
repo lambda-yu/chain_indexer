@@ -17,6 +17,10 @@ class RetryAbort(Exception):
 class RetryExhausted(Exception):
     """Raised when all retry attempts have been used up. `__cause__` carries the last error."""
 
+    def __init__(self, message: str, *, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
 
 async def retry_with_backoff(
     op: Callable[[], Awaitable[T]],
@@ -58,6 +62,8 @@ async def retry_with_backoff(
                 error=str(e),
             )
             await sleep(delay)
-    out = RetryExhausted(f"giving up after {max_attempts} attempts")
+    out = RetryExhausted(
+        f"giving up after {max_attempts} attempts", attempts=max_attempts
+    )
     out.__cause__ = last_err
     raise out

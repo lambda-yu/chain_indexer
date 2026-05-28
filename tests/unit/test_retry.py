@@ -79,3 +79,23 @@ async def test_backoff_uses_exponential_delays() -> None:
     with pytest.raises(RetryExhausted):
         await retry_with_backoff(op, max_attempts=3, base_delay=0.01, factor=4.0, sleep=fake_sleep)
     assert sleeps == [0.01, 0.04]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_exposes_attempts_count() -> None:
+    async def op() -> str:
+        raise RuntimeError("always fails")
+
+    with pytest.raises(RetryExhausted) as exc:
+        await retry_with_backoff(op, max_attempts=3, base_delay=0.0)
+    assert exc.value.attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_exhausted_attempts_matches_max_attempts_when_one() -> None:
+    async def op() -> str:
+        raise RuntimeError("nope")
+
+    with pytest.raises(RetryExhausted) as exc:
+        await retry_with_backoff(op, max_attempts=1, base_delay=0.0)
+    assert exc.value.attempts == 1

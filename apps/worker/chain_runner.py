@@ -171,6 +171,8 @@ class ChainRunner:
             self._notifier = Notifier(
                 channel_factory=self._channel_factory,
                 max_concurrency=self._notifier_max_concurrency,
+                on_failure=self._on_send_failure,
+                on_success=self._on_send_success,
             )
             await self._notifier.start(snap.channels)
             self._current_snap = snap

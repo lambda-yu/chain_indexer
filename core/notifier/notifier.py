@@ -10,7 +10,6 @@ from core.config.snapshot import SnapshotChannel, SnapshotSubscription
 from core.notifier.channel import CHANNEL_REGISTRY, Channel
 from core.notifier.payload import build_payload
 from core.parser.event import Event
-from core.timing import timed
 
 log = structlog.get_logger(__name__)
 
@@ -88,13 +87,7 @@ class Notifier:
     ) -> None:
         async with self._get_sem():
             try:
-                async with timed(
-                    "channel.send",
-                    channel_type=ch.type,
-                    channel_id=channel_id,
-                    subscription_id=subscription_id,
-                ):
-                    await ch.send(payload)
+                await ch.send(payload)
                 if self._on_success:
                     try:
                         await self._on_success(

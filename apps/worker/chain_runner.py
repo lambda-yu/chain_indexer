@@ -29,7 +29,6 @@ from core.parser.pipeline import EvmParserPipeline, SolanaParserPipeline
 from core.parser.sol_native import SolNativeTransferParser
 from core.parser.spl_ops import SplOpsParser
 from core.parser.spl_transfer import SplTransferParser
-from core.timing import timed
 
 log = structlog.get_logger(__name__)
 
@@ -459,18 +458,17 @@ class ChainRunner:
         assert self._evm_filter is not None
         log_filter = self._evm_filter
 
-        async with timed("block.rpc_fetch", chain=self._chain.id, block=number, skip_logs=log_filter.skip_logs):
-            block_coro = self._adapter.fetch_block(number)
-            if log_filter.skip_logs:
-                block = await block_coro
-                logs: list[Log] = []
-            else:
-                logs_coro = self._adapter.fetch_logs(
-                    number, number,
-                    addresses=log_filter.addresses,
-                    topics=log_filter.topics_param,
-                )
-                block, logs = await asyncio.gather(block_coro, logs_coro)
+        block_coro = self._adapter.fetch_block(number)
+        if log_filter.skip_logs:
+            block = await block_coro
+            logs: list[Log] = []
+        else:
+            logs_coro = self._adapter.fetch_logs(
+                number, number,
+                addresses=log_filter.addresses,
+                topics=log_filter.topics_param,
+            )
+            block, logs = await asyncio.gather(block_coro, logs_coro)
 
         await self._process_block_with_prefetched_logs(
             number, block, logs, matcher=matcher, notifier=notifier,
@@ -489,33 +487,31 @@ class ChainRunner:
         from dataclasses import replace
         block = replace(block, logs=prefetched_logs)
 
-        async with timed("block.parse", chain=self._chain.id, block=number, n_logs=len(prefetched_logs)):
-            events = list(self._evm_pipeline.run(block))
+        events = list(self._evm_pipeline.run(block))
 
         # 优化2: 所有 event dispatch 并发而非串行
         dispatch_tasks: list[asyncio.Task[None]] = []
         matched_sub_ids: set[str] = set()
-        async with timed("block.match_dispatch", chain=self._chain.id, block=number, n_events=len(events)):
-            for event in events:
-                hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
-                if hits:
-                    dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
-                    for sub, _ in hits:
-                        matched_sub_ids.add(sub.id)
+        for event in events:
+            hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
+            if hits:
+                dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+                for sub, _ in hits:
+                    matched_sub_ids.add(sub.id)
 
-            if self._chain.trace_internal_calls and self._abi_registry is not None:
-                trace_fn = getattr(self._adapter, "trace_block", None)
-                if callable(trace_fn):
-                    traces = await trace_fn(number)
-                    if traces:
-                        internal_parser = InternalCallParser(chain_id=self._chain.id, registry=self._abi_registry)
-                        for event in internal_parser.parse(traces, block):
-                            hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
-                            if hits:
-                                dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+        if self._chain.trace_internal_calls and self._abi_registry is not None:
+            trace_fn = getattr(self._adapter, "trace_block", None)
+            if callable(trace_fn):
+                traces = await trace_fn(number)
+                if traces:
+                    internal_parser = InternalCallParser(chain_id=self._chain.id, registry=self._abi_registry)
+                    for event in internal_parser.parse(traces, block):
+                        hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
+                        if hits:
+                            dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
 
-            if dispatch_tasks:
-                await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+        if dispatch_tasks:
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
 
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
         if self._on_block_processed and matched_sub_ids:

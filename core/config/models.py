@@ -175,7 +175,7 @@ class DeliveryRecord(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[DeliveryStatus] = mapped_column(
-        SAEnum(DeliveryStatus, name="delivery_status"), nullable=False, default=DeliveryStatus.success
+        String(16), nullable=False, default=DeliveryStatus.success
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

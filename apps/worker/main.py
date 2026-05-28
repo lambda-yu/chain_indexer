@@ -140,8 +140,8 @@ class _Worker:
                     status="success",
                 )
                 await s.commit()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.error("worker.delivery_success_save_error", error=repr(exc))
 
     async def _on_block_processed(self, sub_ids: set[str], block_number: int) -> None:
         from core.config.repositories import SubscriptionRepo

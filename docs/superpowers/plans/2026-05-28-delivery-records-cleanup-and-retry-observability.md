@@ -581,7 +581,8 @@ async def test_cleanup_success_deletes_oldest_excess(db) -> None:
 @pytest.mark.asyncio
 async def test_cleanup_success_respects_batch_cap(db) -> None:
     """200 success rows, keep=50, batch=30 → 30 deleted per call.
-    Six iterations needed to converge (200 → 170 → 140 → 110 → 80 → 50)."""
+    Need to delete 150 total; with batch=30 that's 5 full-batch iterations.
+    Run 7 iterations (5 needed + slack) and assert final count = 50."""
     from core.config.repositories import DeliveryRecordRepo
 
     async with db.session() as s:
@@ -599,7 +600,7 @@ async def test_cleanup_success_respects_batch_cap(db) -> None:
         await s.commit()
         assert deleted == 30
 
-    # 6 more iterations converges (5 more full-batch + 1 partial of 20 = 170/30 = 5.67)
+    # Run additional iterations until converged (150 to delete, 30/call → 5 calls total).
     for _ in range(6):
         async with db.session() as s:
             repo = DeliveryRecordRepo(s)
@@ -809,13 +810,16 @@ from core.settings import DeliveryRecordsSettings, Settings
 
 
 def _build_worker_with_mock_db(
-    *, max_success_rows: int = 100, interval_s: int = 30, batch: int = 1000,
+    monkeypatch,
+    *,
+    max_success_rows: int = 100, interval_s: int = 30, batch: int = 1000,
     cleanup_return_value: int = 0,
 ) -> tuple[Any, AsyncMock]:
     """Construct a _Worker with patched _db.session() / DeliveryRecordRepo.
 
     Returns (worker, cleanup_mock) where cleanup_mock is the AsyncMock backing
-    DeliveryRecordRepo.cleanup_success calls.
+    DeliveryRecordRepo.cleanup_success calls. Uses monkeypatch so the global
+    repo module is restored after each test.
     """
     from apps.worker.main import _Worker
 
@@ -837,19 +841,19 @@ def _build_worker_with_mock_db(
     worker._db.session = MagicMock(return_value=session_cm)
 
     cleanup_mock = AsyncMock(return_value=cleanup_return_value)
-    # Patch the repo class import inside the loop.
+    # Patch the repo class via monkeypatch so other tests aren't poisoned.
     import core.config.repositories as repo_mod
     monkey_repo = MagicMock()
     monkey_repo.return_value.cleanup_success = cleanup_mock
-    repo_mod.DeliveryRecordRepo = monkey_repo  # type: ignore[misc]
+    monkeypatch.setattr(repo_mod, "DeliveryRecordRepo", monkey_repo)
     return worker, cleanup_mock
 
 
 @pytest.mark.asyncio
-async def test_cleanup_loop_stops_promptly_on_stop_event() -> None:
+async def test_cleanup_loop_stops_promptly_on_stop_event(monkeypatch) -> None:
     """Even with a long cleanup_interval_seconds, _stop.set() unblocks the loop
     within milliseconds (not minutes)."""
-    worker, cleanup_mock = _build_worker_with_mock_db(interval_s=3600)
+    worker, cleanup_mock = _build_worker_with_mock_db(monkeypatch, interval_s=3600)
     task = asyncio.create_task(worker._run_cleanup_loop())
     # Let the loop run one iteration so cleanup_success is called once,
     # then enter the sleep-on-stop branch.
@@ -861,9 +865,9 @@ async def test_cleanup_loop_stops_promptly_on_stop_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_loop_logs_exception_and_continues() -> None:
+async def test_cleanup_loop_logs_exception_and_continues(monkeypatch) -> None:
     """A DB error in one iteration must not kill the loop."""
-    worker, cleanup_mock = _build_worker_with_mock_db(interval_s=0)
+    worker, cleanup_mock = _build_worker_with_mock_db(monkeypatch, interval_s=0)
     cleanup_mock.side_effect = [RuntimeError("db down"), 5, 0]
     task = asyncio.create_task(worker._run_cleanup_loop())
     await asyncio.sleep(0.1)
@@ -874,9 +878,9 @@ async def test_cleanup_loop_logs_exception_and_continues() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_loop_passes_settings_to_repo() -> None:
+async def test_cleanup_loop_passes_settings_to_repo(monkeypatch) -> None:
     worker, cleanup_mock = _build_worker_with_mock_db(
-        max_success_rows=42, batch=7, interval_s=3600,
+        monkeypatch, max_success_rows=42, batch=7, interval_s=3600,
     )
     task = asyncio.create_task(worker._run_cleanup_loop())
     await asyncio.sleep(0.05)
@@ -991,8 +995,10 @@ async def test_worker_cleanup_loop_converges(db, redis_url) -> None:
             )
         await s.commit()
 
+    # Database URL doesn't matter here — we overwrite worker._db with the
+    # test's existing Database instance below. Use any valid scheme.
     settings = Settings(
-        database=DatabaseSettings(url=db.url),
+        database=DatabaseSettings(url="sqlite+aiosqlite:///:memory:"),
         redis=RedisSettings(url=redis_url),
         delivery_records=DeliveryRecordsSettings(
             max_success_rows=5,
@@ -1002,7 +1008,7 @@ async def test_worker_cleanup_loop_converges(db, redis_url) -> None:
     )
     # Construct worker but ONLY exercise the cleanup loop (skip full start()).
     worker = _Worker(settings)
-    worker._db = db  # reuse the test's Database directly
+    worker._db = db  # reuse the test's already-connected Database
     task = asyncio.create_task(worker._run_cleanup_loop())
     try:
         # Wait up to 3s for convergence.
@@ -1034,8 +1040,6 @@ async def test_worker_cleanup_loop_converges(db, redis_url) -> None:
         worker._stop.set()
         await asyncio.wait_for(task, timeout=2.0)
 ```
-
-Note: this test uses `db.url` — confirm `Database` exposes the original URL; if not, we can store it via `Database._url` or construct settings differently. Read `core/config/db.py` to confirm.
 
 - [ ] **Step 6: Verify integration test passes**
 
@@ -1157,13 +1161,15 @@ async def test_retry_failure_bumps_attempts(db: Database, redis_url: str) -> Non
         from core.config.models import ChannelType
 
         async with db.session() as s:
-            # Seed a channel and a failed record pointing at it
+            # ChannelRepo.create auto-generates the id (uuid). Capture it from the
+            # returned row and use it for the delivery record's channel_id.
             ch = await ChannelRepo(s).create(
-                id="ch1", name="bad-webhook", type=ChannelType.http,
+                name="bad-webhook",
+                type=ChannelType.http,
                 config={"url": "http://127.0.0.1:1"},  # connection refused
             )
             row = await DeliveryRecordRepo(s).create(
-                subscription_id="sub", channel_id="ch1", chain_id="eth",
+                subscription_id="sub", channel_id=ch.id, chain_id="eth",
                 event_payload={"x": 1}, error="initial", attempts=2, status="failed",
             )
             await s.commit()
@@ -1189,7 +1195,7 @@ async def test_retry_failure_bumps_attempts(db: Database, redis_url: str) -> Non
         await bus.disconnect()
 ```
 
-> Note on the failure path: `ChannelRepo.create` may have a different exact signature. Re-read `core/config/repositories.py:ChannelRepo.create` and adjust the kwargs to match. If `ChannelType.http` isn't the right enum value (consult `core/config/models.py:ChannelType`), use the actual value. If creating a channel through the repo is awkward in tests, insert the row via raw SQLAlchemy `Channel(...)` and `s.add(...)`.
+> The exact `ChannelType` enum values live at `core/config/models.py:48` — confirm `ChannelType.http` matches whatever the codebase uses (likely `http`). If the value differs, substitute it.
 
 - [ ] **Step 2: Run failing tests**
 
@@ -1203,33 +1209,50 @@ Expected: FAILs:
 
 In `apps/web/routers/delivery_records.py`:
 
-**Top of file**, add to imports:
+**Replace the imports block (top of file)**:
 
 ```python
+from __future__ import annotations
+
+from datetime import datetime
 from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from apps.web.deps import get_bus, get_session
+from core.bus.redis_bus import RedisBus
+from core.config.repositories import DeliveryRecordRepo
+from core.notifier.channel import CHANNEL_REGISTRY
 ```
 
-(`Literal` import; `Any` is already there)
+(Additions: `Literal` from typing, `Query` from fastapi.)
 
-**Replace** `list_delivery_records` (around lines 32–38):
+**Add the status type alias** just after the imports, before `router = ...`:
 
 ```python
 StatusFilter = Literal["success", "failed", "retrying", "resolved"]
+```
 
+**Replace** `list_delivery_records` (currently around lines 32–38). Use `Query(alias="status")` to avoid shadowing the `fastapi.status` module name inside the function scope:
 
+```python
 @router.get("", response_model=list[DeliveryRecordOut])
 async def list_delivery_records(
     subscription_id: str | None = None,
-    status: StatusFilter | None = None,
+    status_filter: StatusFilter | None = Query(None, alias="status"),
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[DeliveryRecordOut]:
     rows = await DeliveryRecordRepo(session).list_all(
-        limit=200, subscription_id=subscription_id, status=status,
+        limit=200, subscription_id=subscription_id, status=status_filter,
     )
     return [DeliveryRecordOut.model_validate(r) for r in rows]
 ```
 
-**Replace** the existing `retry_delivery` function with the version that bumps attempts on failure (around lines 41–73):
+The query string still uses `?status=failed` (alias), but the Python parameter is `status_filter` so `fastapi.status` remains usable inside the function body if ever needed.
+
+**Replace** the existing `retry_delivery` function (currently around lines 41–73) with the version that bumps attempts on failure:
 
 ```python
 @router.post("/{delivery_id}/retry", status_code=status.HTTP_200_OK)
@@ -1271,29 +1294,7 @@ async def retry_delivery(
     return {"status": "resolved", "delivery_id": delivery_id}
 ```
 
-**Important shape change:** The `try` block now only wraps the channel send. Marking resolved + commit happens **after** the try (success path). Failure path: rollback (drops any side-effect of the failed send attempt), then `bump_attempt` + commit, then raise 502.
-
-Note on the watch: `status.HTTP_200_OK` uses the `status` module from `fastapi`. After adding `from typing import Literal` we now have *another* `status` query parameter in `list_delivery_records`. The `fastapi.status` module reference in `retry_delivery`'s decorator (`status_code=status.HTTP_200_OK`) and `resolve_delivery`'s decorator (`status_code=status.HTTP_200_OK`) refer to the module imported as `from fastapi import APIRouter, Depends, HTTPException, status`. **The local parameter name `status` shadows that module name inside the function scope, but decorators are evaluated at import time at module scope, so the existing decorators continue to use `fastapi.status`.** No collision. To be extra safe, rename the local parameter:
-
-Update `list_delivery_records` to avoid shadowing — rename the query param. Wait, FastAPI requires the param name to be exactly `status` for it to map to the `?status=` query string. We can use an alias:
-
-Actually FastAPI's `Query(..., alias="status")` syntax can decouple parameter name from query key:
-
-```python
-from fastapi import Query
-
-async def list_delivery_records(
-    subscription_id: str | None = None,
-    status_filter: StatusFilter | None = Query(None, alias="status"),
-    session: AsyncSession = Depends(get_session),  # noqa: B008
-) -> list[DeliveryRecordOut]:
-    rows = await DeliveryRecordRepo(session).list_all(
-        limit=200, subscription_id=subscription_id, status=status_filter,
-    )
-    ...
-```
-
-Use this form to avoid the shadowing concern entirely. Add `Query` to the fastapi imports.
+**Important shape change vs. the old function:** The `try` block now wraps *only* the channel start/send/stop. Resolve + commit happens **after** the try on the success path. Failure path: rollback (drops any side-effect of the partially-completed send transaction), then `bump_attempt` + commit in a fresh implicit transaction, then raise 502. The `session` is reusable after `rollback()` — SQLAlchemy starts a new implicit transaction on the next `execute()`.
 
 - [ ] **Step 4: Verify tests pass**
 

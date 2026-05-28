@@ -3,6 +3,17 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from sqlalchemy import func, select
+
+from apps.worker.main import _Worker
+from core.config.models import DeliveryRecord, DeliveryStatus
+from core.config.repositories import DeliveryRecordRepo
+from core.settings import (
+    DatabaseSettings,
+    DeliveryRecordsSettings,
+    RedisSettings,
+    Settings,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -12,15 +23,6 @@ async def test_worker_cleanup_loop_converges(db, redis_url) -> None:
     """Real _Worker against real DB. Insert 20 success rows + 5 failed;
     set keep=5; assert convergence to 5 success rows within a few seconds
     while failed rows remain untouched."""
-    from apps.worker.main import _Worker
-    from core.config.repositories import DeliveryRecordRepo
-    from core.settings import (
-        DatabaseSettings,
-        DeliveryRecordsSettings,
-        RedisSettings,
-        Settings,
-    )
-
     # Seed data
     async with db.session() as s:
         repo = DeliveryRecordRepo(s)
@@ -55,8 +57,6 @@ async def test_worker_cleanup_loop_converges(db, redis_url) -> None:
         # Wait up to 3s for convergence.
         for _ in range(30):
             async with db.session() as s:
-                from core.config.models import DeliveryRecord, DeliveryStatus
-                from sqlalchemy import select, func
                 r = await s.execute(
                     select(func.count())
                     .select_from(DeliveryRecord)
@@ -69,8 +69,6 @@ async def test_worker_cleanup_loop_converges(db, redis_url) -> None:
             pytest.fail("cleanup loop did not converge within 3 seconds")
         # Failed rows must still be present.
         async with db.session() as s:
-            from core.config.models import DeliveryRecord, DeliveryStatus
-            from sqlalchemy import select, func
             r = await s.execute(
                 select(func.count())
                 .select_from(DeliveryRecord)

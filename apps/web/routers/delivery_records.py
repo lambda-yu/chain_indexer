@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -21,11 +22,11 @@ class DeliveryRecordOut(BaseModel):
     channel_id: str
     chain_id: str
     event_payload: dict[str, Any]
-    error: str
+    error: str | None
     attempts: int
     status: str
-    created_at: str
-    resolved_at: str | None
+    created_at: datetime
+    resolved_at: datetime | None
 
 
 @router.get("", response_model=list[DeliveryRecordOut])

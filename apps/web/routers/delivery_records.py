@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +11,8 @@ from apps.web.deps import get_bus, get_session
 from core.bus.redis_bus import RedisBus
 from core.config.repositories import DeliveryRecordRepo
 from core.notifier.channel import CHANNEL_REGISTRY
+
+StatusFilter = Literal["success", "failed", "retrying", "resolved"]
 
 router = APIRouter(prefix="/api/delivery-records", tags=["delivery-records"])
 
@@ -32,9 +34,12 @@ class DeliveryRecordOut(BaseModel):
 @router.get("", response_model=list[DeliveryRecordOut])
 async def list_delivery_records(
     subscription_id: str | None = None,
+    status_filter: StatusFilter | None = Query(None, alias="status"),  # noqa: B008
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> list[DeliveryRecordOut]:
-    rows = await DeliveryRecordRepo(session).list_all(limit=200, subscription_id=subscription_id)
+    rows = await DeliveryRecordRepo(session).list_all(
+        limit=200, subscription_id=subscription_id, status=status_filter,
+    )
     return [DeliveryRecordOut.model_validate(r) for r in rows]
 
 
@@ -65,12 +70,16 @@ async def retry_delivery(
             await ch.send(row.event_payload)
         finally:
             await ch.stop()
-        await repo.mark_resolved(delivery_id)
-        await session.commit()
-        return {"status": "resolved", "delivery_id": delivery_id}
     except Exception as exc:
         await session.rollback()
+        # Persist the failed retry so attempts and error reflect reality.
+        await repo.bump_attempt(delivery_id, error=repr(exc))
+        await session.commit()
         raise HTTPException(status_code=502, detail=f"重推失败: {exc!r}") from exc
+
+    await repo.mark_resolved(delivery_id)
+    await session.commit()
+    return {"status": "resolved", "delivery_id": delivery_id}
 
 
 @router.post("/{delivery_id}/resolve", status_code=status.HTTP_200_OK)

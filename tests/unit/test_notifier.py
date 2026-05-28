@@ -150,3 +150,97 @@ async def test_semaphore_caps_concurrent_sends() -> None:
         assert peak <= 2
     finally:
         await notifier.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_failure_receives_attempts_from_retry_exhausted() -> None:
+    """When a channel raises RetryExhausted, on_failure sees the real attempts."""
+    from core.notifier.retry import RetryExhausted
+
+    class _Boom(Channel):
+        type = "boom"
+        config_schema: dict = {}
+
+        async def start(self) -> None: ...
+        async def stop(self) -> None: ...
+        async def send(self, payload: dict[str, Any]) -> None:
+            raise RetryExhausted("dead", attempts=5)
+
+    captured: list[tuple[str, int]] = []
+
+    async def on_failure(
+        sub_id: str, ch_id: str, chain_id: str,
+        payload: dict[str, Any], error: str, attempts: int,
+    ) -> None:
+        captured.append((error, attempts))
+
+    notifier = Notifier(
+        channel_factory=lambda cfg: _Boom(),
+        max_concurrency=10,
+        on_failure=on_failure,
+    )
+    await notifier.start([_ch("c-boom")])
+    try:
+        await notifier.dispatch(_event(), [(_sub(["c-boom"]), [_ch("c-boom")])])
+    finally:
+        await notifier.stop()
+    assert len(captured) == 1
+    assert captured[0][1] == 5  # attempts
+
+
+@pytest.mark.asyncio
+async def test_on_failure_defaults_attempts_to_one_for_plain_exception() -> None:
+    """Non-RetryExhausted exceptions don't carry attempts; default to 1."""
+
+    class _Boom(Channel):
+        type = "boom-plain"
+        config_schema: dict = {}
+
+        async def start(self) -> None: ...
+        async def stop(self) -> None: ...
+        async def send(self, payload: dict[str, Any]) -> None:
+            raise RuntimeError("plain")
+
+    captured: list[int] = []
+
+    async def on_failure(
+        sub_id: str, ch_id: str, chain_id: str,
+        payload: dict[str, Any], error: str, attempts: int,
+    ) -> None:
+        captured.append(attempts)
+
+    notifier = Notifier(
+        channel_factory=lambda cfg: _Boom(),
+        max_concurrency=10,
+        on_failure=on_failure,
+    )
+    await notifier.start([_ch("c-plain")])
+    try:
+        await notifier.dispatch(_event(), [(_sub(["c-plain"]), [_ch("c-plain")])])
+    finally:
+        await notifier.stop()
+    assert captured == [1]
+
+
+@pytest.mark.asyncio
+async def test_on_success_receives_attempts_one() -> None:
+    """Success path always passes attempts=1."""
+    captured: list[int] = []
+
+    async def on_success(
+        sub_id: str, ch_id: str, chain_id: str,
+        payload: dict[str, Any], _err: None, attempts: int,
+    ) -> None:
+        captured.append(attempts)
+
+    notifier = Notifier(
+        channel_factory=lambda cfg: _CollectingChannel(),
+        max_concurrency=10,
+        on_success=on_success,
+    )
+    await notifier.start([_ch("c-ok")])
+    try:
+        await notifier.dispatch(_event(), [(_sub(["c-ok"]), [_ch("c-ok")])])
+    finally:
+        await notifier.stop()
+    assert captured == [1]

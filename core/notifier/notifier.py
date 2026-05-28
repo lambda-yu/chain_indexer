@@ -19,7 +19,8 @@ def _default_factory(cfg: SnapshotChannel) -> Channel:
     return cls(config=cfg.config)  # type: ignore[call-arg]
 
 
-FailureCallback = Callable[[str, str, str, dict[str, Any], str], Any] | None
+FailureCallback = Callable[[str, str, str, dict[str, Any], str, int], Any] | None
+SuccessCallback = Callable[[str, str, str, dict[str, Any], None, int], Any] | None
 
 
 class Notifier:
@@ -31,7 +32,7 @@ class Notifier:
         channel_factory: Callable[[SnapshotChannel], Channel] = _default_factory,
         max_concurrency: int = 50,
         on_failure: FailureCallback = None,
-        on_success: FailureCallback = None,
+        on_success: SuccessCallback = None,
     ) -> None:
         self._factory = channel_factory
         self._max_concurrency = max_concurrency
@@ -92,16 +93,18 @@ class Notifier:
                         await self._on_success(
                             subscription_id, channel_id,
                             payload.get("chain_id", ""),
-                            payload, None,
+                            payload, None, 1,
                         )
                     except Exception:  # noqa: BLE001
                         pass
             except Exception as exc:  # noqa: BLE001
+                attempts = getattr(exc, "attempts", 1)
                 log.error(
                     "notifier.send_failed",
                     subscription_id=subscription_id,
                     channel_id=channel_id,
                     delivery_id=payload.get("delivery_id"),
+                    attempts=attempts,
                     error=repr(exc),
                 )
                 if self._on_failure:
@@ -109,7 +112,7 @@ class Notifier:
                         await self._on_failure(
                             subscription_id, channel_id,
                             payload.get("chain_id", ""),
-                            payload, repr(exc),
+                            payload, repr(exc), attempts,
                         )
                     except Exception:  # noqa: BLE001
                         log.error("notifier.on_failure_callback_error")

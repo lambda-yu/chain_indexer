@@ -174,7 +174,7 @@ async def cleanup_success(self, *, keep: int, batch: int) -> int:
     inner = (
         select(DeliveryRecord.id)
         .where(DeliveryRecord.status == DeliveryStatus.success)
-        .order_by(DeliveryRecord.created_at.asc())
+        .order_by(DeliveryRecord.created_at.desc())
         .offset(keep)
         .limit(batch)
     )
@@ -184,7 +184,7 @@ async def cleanup_success(self, *, keep: int, batch: int) -> int:
     return result.rowcount or 0
 ```
 
-**Note on SQL approach**: The original brainstorm proposed a `LIMIT (COUNT-keep)` subquery. The OFFSET form above is equivalent in result and simpler to reason about — "skip the newest `keep` success rows, then delete up to `batch` of the oldest remainder". SQLite and PostgreSQL both support `IN (SELECT ... ORDER BY ... OFFSET ... LIMIT ...)` reliably.
+**Note on SQL approach**: The original brainstorm proposed a `LIMIT (COUNT-keep)` subquery. The OFFSET form above is equivalent and simpler: "sort success rows newest-first, skip the newest `keep` rows, then take up to `batch` of the rest — those are the oldest excess rows we want gone." `DESC` ordering is essential; using `ASC` here would delete the *newest* rows instead. SQLite and PostgreSQL both support `IN (SELECT ... ORDER BY ... OFFSET ... LIMIT ...)` reliably.
 
 ```python
 async def bump_attempt(self, delivery_id: str, *, error: str) -> None:

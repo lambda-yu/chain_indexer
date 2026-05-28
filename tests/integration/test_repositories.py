@@ -1,3 +1,5 @@
+from datetime import UTC
+
 import pytest
 
 from core.config.models import AbiKind, ChainKind, ChannelType, MatchKind
@@ -185,3 +187,186 @@ async def test_abi_repo_delete_unknown_id_is_noop(db) -> None:
     async with db.session() as s:
         await AbiRepo(s).delete("no-such-id")
         await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_success_deletes_oldest_excess(db) -> None:
+    """Insert 60 success + 10 failed; with keep=50, batch=100,
+    expect 10 success deleted (oldest), all 10 failed untouched,
+    and the 50 newest success rows remain."""
+    from datetime import datetime, timedelta
+
+    from core.config.models import DeliveryRecord, DeliveryStatus
+    from core.config.repositories import DeliveryRecordRepo
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        # Insert oldest first so created_at orders monotonically.
+        # We set created_at manually because SQLite's CURRENT_TIMESTAMP only has
+        # second-level resolution — without explicit timestamps, the "oldest 10"
+        # set would be non-deterministic in a tight insert loop.
+        success_ids: list[str] = []
+        for i in range(60):
+            row = await repo.create(
+                subscription_id="sub", channel_id="ch", chain_id="eth",
+                event_payload={"i": i}, status="success",
+            )
+            row.created_at = base + timedelta(seconds=i)
+            success_ids.append(row.id)
+        failed_ids: list[str] = []
+        for i in range(10):
+            row = await repo.create(
+                subscription_id="sub", channel_id="ch", chain_id="eth",
+                event_payload={"f": i}, error="err", status="failed",
+            )
+            row.created_at = base + timedelta(seconds=100 + i)
+            failed_ids.append(row.id)
+        await s.commit()
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        deleted = await repo.cleanup_success(keep=50, batch=100)
+        await s.commit()
+        assert deleted == 10
+
+    # Verify exactly the 10 oldest success rows are gone; failed untouched
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        from sqlalchemy import select
+
+        from core.config.models import DeliveryRecord, DeliveryStatus
+        r = await s.execute(
+            select(DeliveryRecord).where(DeliveryRecord.status == DeliveryStatus.success)
+        )
+        remaining_success = [row.id for row in r.scalars().all()]
+        assert len(remaining_success) == 50
+        # The 10 deleted should be the oldest = success_ids[0:10]
+        assert all(i not in remaining_success for i in success_ids[:10])
+        assert all(i in remaining_success for i in success_ids[10:])
+        r = await s.execute(
+            select(DeliveryRecord).where(DeliveryRecord.status == DeliveryStatus.failed)
+        )
+        assert len(list(r.scalars().all())) == 10
+
+
+@pytest.mark.asyncio
+async def test_cleanup_success_respects_batch_cap(db) -> None:
+    """200 success rows, keep=50, batch=30 → 30 deleted per call.
+    Need to delete 150 total; with batch=30 that's 5 full-batch iterations.
+    Run 7 iterations (5 needed + slack) and assert final count = 50."""
+    from datetime import datetime, timedelta
+
+    from core.config.repositories import DeliveryRecordRepo
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        for i in range(200):
+            row = await repo.create(
+                subscription_id="sub", channel_id="ch", chain_id="eth",
+                event_payload={"i": i}, status="success",
+            )
+            row.created_at = base + timedelta(seconds=i)
+        await s.commit()
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        deleted = await repo.cleanup_success(keep=50, batch=30)
+        await s.commit()
+        assert deleted == 30
+
+    # Run additional iterations until converged (150 to delete, 30/call → 5 calls total).
+    for _ in range(6):
+        async with db.session() as s:
+            repo = DeliveryRecordRepo(s)
+            await repo.cleanup_success(keep=50, batch=30)
+            await s.commit()
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        from sqlalchemy import func, select
+
+        from core.config.models import DeliveryRecord, DeliveryStatus
+        r = await s.execute(
+            select(func.count())
+            .select_from(DeliveryRecord)
+            .where(DeliveryRecord.status == DeliveryStatus.success)
+        )
+        assert r.scalar() == 50
+
+
+@pytest.mark.asyncio
+async def test_cleanup_success_noop_when_under_cap(db) -> None:
+    from core.config.repositories import DeliveryRecordRepo
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        for i in range(10):
+            await repo.create(
+                subscription_id="sub", channel_id="ch", chain_id="eth",
+                event_payload={"i": i}, status="success",
+            )
+        await s.commit()
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        deleted = await repo.cleanup_success(keep=50, batch=1000)
+        await s.commit()
+        assert deleted == 0
+
+
+@pytest.mark.asyncio
+async def test_bump_attempt_increments_and_overwrites_error(db) -> None:
+    from core.config.repositories import DeliveryRecordRepo
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        row = await repo.create(
+            subscription_id="sub", channel_id="ch", chain_id="eth",
+            event_payload={}, error="first failure", attempts=2, status="failed",
+        )
+        await s.commit()
+        delivery_id = row.id
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        await repo.bump_attempt(delivery_id, error="second failure")
+        await s.commit()
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        row = await repo.get(delivery_id)
+        assert row is not None
+        assert row.attempts == 3
+        assert row.error == "second failure"
+
+
+@pytest.mark.asyncio
+async def test_list_all_filters_by_status(db) -> None:
+    from core.config.repositories import DeliveryRecordRepo
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        await repo.create(
+            subscription_id="sub", channel_id="ch", chain_id="eth",
+            event_payload={"ok": 1}, status="success",
+        )
+        await repo.create(
+            subscription_id="sub", channel_id="ch", chain_id="eth",
+            event_payload={"bad": 1}, error="err", status="failed",
+        )
+        await s.commit()
+
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        only_failed = await repo.list_all(status="failed")
+        assert len(only_failed) == 1
+        assert only_failed[0].status == "failed"
+        only_success = await repo.list_all(status="success")
+        assert len(only_success) == 1
+        assert only_success[0].status == "success"
+        all_rows = await repo.list_all()
+        assert len(all_rows) == 2

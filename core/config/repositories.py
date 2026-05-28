@@ -267,20 +267,18 @@ class DeliveryRecordRepo:
         r = await self.s.execute(select(DeliveryRecord).where(DeliveryRecord.id == delivery_id))
         return r.scalar_one_or_none()
 
-    async def list_failed(self, limit: int = 100) -> list[DeliveryRecord]:
+    async def list_all(
+        self,
+        limit: int = 100,
+        subscription_id: str | None = None,
+        status: str | None = None,
+    ) -> list[DeliveryRecord]:
         from core.config.models import DeliveryStatus
-        r = await self.s.execute(
-            select(DeliveryRecord)
-            .where(DeliveryRecord.status == DeliveryStatus.failed)
-            .order_by(DeliveryRecord.created_at.desc())
-            .limit(limit)
-        )
-        return list(r.scalars().all())
-
-    async def list_all(self, limit: int = 100, subscription_id: str | None = None) -> list[DeliveryRecord]:
         stmt = select(DeliveryRecord)
         if subscription_id is not None:
             stmt = stmt.where(DeliveryRecord.subscription_id == subscription_id)
+        if status is not None:
+            stmt = stmt.where(DeliveryRecord.status == DeliveryStatus(status))
         stmt = stmt.order_by(DeliveryRecord.created_at.desc()).limit(limit)
         r = await self.s.execute(stmt)
         return list(r.scalars().all())
@@ -292,6 +290,39 @@ class DeliveryRecordRepo:
             sa_update(DeliveryRecord)
             .where(DeliveryRecord.id == delivery_id)
             .values(status=DeliveryStatus.resolved, resolved_at=datetime.now(timezone.utc))
+        )
+
+    async def cleanup_success(self, *, keep: int, batch: int) -> int:
+        """Delete oldest status='success' rows so at most `keep` remain.
+
+        Returns the number of rows actually deleted (≤ batch). Only touches
+        status='success'; failed/retrying/resolved rows are never affected.
+        """
+        from sqlalchemy.engine import CursorResult
+
+        from core.config.models import DeliveryStatus
+        inner = (
+            select(DeliveryRecord.id)
+            .where(DeliveryRecord.status == DeliveryStatus.success)
+            .order_by(DeliveryRecord.created_at.desc())
+            .offset(keep)
+            .limit(batch)
+        )
+        result = await self.s.execute(
+            sa_delete(DeliveryRecord).where(DeliveryRecord.id.in_(inner))
+        )
+        assert isinstance(result, CursorResult)
+        return result.rowcount or 0
+
+    async def bump_attempt(self, delivery_id: str, *, error: str) -> None:
+        """Increment attempts and overwrite error. Used by manual retry on failure."""
+        await self.s.execute(
+            sa_update(DeliveryRecord)
+            .where(DeliveryRecord.id == delivery_id)
+            .values(
+                attempts=DeliveryRecord.attempts + 1,
+                error=error,
+            )
         )
 
     async def delete(self, delivery_id: str) -> None:

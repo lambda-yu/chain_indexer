@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useState, Fragment } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/api/client'
-import { RefreshCw, Trash2, Search } from 'lucide-react'
+import { RefreshCw, Trash2, Search, ChevronRight, ChevronDown } from 'lucide-react'
 
 interface LogEntry { event?: string; level?: string; timestamp?: string; [key: string]: unknown }
 
@@ -14,8 +14,17 @@ export default function Logs() {
   const { data: logs = [], isLoading } = useQuery<LogEntry[]>({ queryKey: ['logs'], queryFn: () => api.get('/logs?limit=300'), refetchInterval: 3000 })
   const clearMut = useMutation({ mutationFn: () => api.del('/logs'), onSuccess: () => qc.invalidateQueries({ queryKey: ['logs'] }) })
   const [search, setSearch] = useState('')
+  const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   const filtered = search ? logs.filter(l => JSON.stringify(l).toLowerCase().includes(search.toLowerCase())) : logs
+
+  const toggle = (i: number) => {
+    setExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(i)) next.delete(i); else next.add(i)
+      return next
+    })
+  }
 
   return (
     <div>
@@ -32,7 +41,7 @@ export default function Logs() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索日志..." className="w-full border rounded pl-8 pr-3 py-1.5 text-sm" />
       </div>
 
-      <p className="text-xs text-gray-400 mb-2">{filtered.length} 条日志（3 秒自动刷新）</p>
+      <p className="text-xs text-gray-400 mb-2">{filtered.length} 条日志（3 秒自动刷新，点击行展开/折叠详情）</p>
 
       {isLoading ? <p className="text-gray-500">加载中...</p> : filtered.length === 0 ? (
         <p className="text-gray-400 text-sm">暂无日志。Worker 启动后日志会自动出现。</p>
@@ -40,6 +49,7 @@ export default function Logs() {
         <div className="border rounded-lg overflow-hidden">
           <table className="w-full text-xs font-mono">
             <thead><tr className="bg-gray-50 text-left text-gray-500">
+              <th className="py-1.5 px-2 w-6"></th>
               <th className="py-1.5 px-2 w-44">时间</th>
               <th className="py-1.5 px-2 w-16">级别</th>
               <th className="py-1.5 px-2">事件</th>
@@ -48,15 +58,30 @@ export default function Logs() {
             <tbody>{filtered.map((log, i) => {
               const { event, level, timestamp, ...rest } = log
               const details = Object.entries(rest).filter(([k]) => k !== 'message')
+              const isOpen = expanded.has(i)
+              const detailLine = details.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ')
               return (
-                <tr key={i} className="border-t hover:bg-gray-50">
-                  <td className="py-1 px-2 text-gray-400">{timestamp ? new Date(String(timestamp)).toLocaleTimeString() : '—'}</td>
-                  <td className={`py-1 px-2 font-medium ${LEVEL_COLOR[String(level)] ?? ''}`}>{String(level ?? '').toUpperCase()}</td>
-                  <td className="py-1 px-2 font-medium">{String(event ?? log.message ?? '')}</td>
-                  <td className="py-1 px-2 text-gray-500 truncate max-w-96">
-                    {details.length > 0 ? details.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ') : ''}
-                  </td>
-                </tr>
+                <Fragment key={i}>
+                  <tr className="border-t hover:bg-gray-50 cursor-pointer" onClick={() => toggle(i)}>
+                    <td className="py-1 px-2 text-gray-400">
+                      {details.length > 0 ? (isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />) : null}
+                    </td>
+                    <td className="py-1 px-2 text-gray-400">{timestamp ? new Date(String(timestamp)).toLocaleTimeString() : '—'}</td>
+                    <td className={`py-1 px-2 font-medium ${LEVEL_COLOR[String(level)] ?? ''}`}>{String(level ?? '').toUpperCase()}</td>
+                    <td className="py-1 px-2 font-medium">{String(event ?? log.message ?? '')}</td>
+                    <td className="py-1 px-2 text-gray-500 truncate max-w-96">{detailLine}</td>
+                  </tr>
+                  {isOpen && details.length > 0 && (
+                    <tr className="border-t bg-gray-50/50">
+                      <td></td>
+                      <td colSpan={4} className="py-2 px-2">
+                        <pre className="whitespace-pre-wrap break-all text-gray-700 text-[11px] leading-relaxed">
+{JSON.stringify(Object.fromEntries(details), null, 2)}
+                        </pre>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               )
             })}</tbody>
           </table>

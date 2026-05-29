@@ -35,6 +35,8 @@ async def test_fetch_logs_passes_addresses_and_topics():
         confirmations=0, poll_interval_ms=1000,
     )
     adapter._w3 = _StubW3()  # type: ignore[assignment]
+    from core.chains.rpc_pool import EndpointPool
+    adapter._pool = EndpointPool("x", [adapter._w3])  # type: ignore[arg-type]
     await adapter.fetch_logs(
         from_block=10, to_block=20,
         addresses=["0xaaa", "0xbbb"],
@@ -54,6 +56,8 @@ async def test_fetch_logs_omits_topics_when_none():
         confirmations=0, poll_interval_ms=1000,
     )
     adapter._w3 = _StubW3()  # type: ignore[assignment]
+    from core.chains.rpc_pool import EndpointPool
+    adapter._pool = EndpointPool("x", [adapter._w3])  # type: ignore[arg-type]
     await adapter.fetch_logs(from_block=1, to_block=1, addresses=None, topics=None)
     call = adapter._w3.eth._logs.calls[0]  # type: ignore[attr-defined]
     assert "address" not in call

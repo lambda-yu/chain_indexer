@@ -13,6 +13,7 @@ from web3.utils.subscriptions import (
     NewHeadsSubscriptionContext,
 )
 
+from core.chains.rpc_pool import EndpointPool
 from core.chains.types import Block, BlockHeader, InternalCall, Log, Tx
 from core.metrics import track_rpc
 
@@ -54,41 +55,65 @@ class EvmAdapter:
         rpc_ws: str | None,
         confirmations: int,
         poll_interval_ms: int = 1000,
+        rpc_http_fallbacks: list[str] | None = None,
+        rpc_timeout_ms: int = 10000,
+        failure_threshold: int = 3,
+        cooldown_s: float = 30.0,
     ) -> None:
         self.chain_id = chain_id
         self.confirmations = confirmations
-        self._rpc_http = rpc_http
+        self._http_urls = [rpc_http, *(rpc_http_fallbacks or [])]
         self._rpc_ws = rpc_ws
         self._poll_interval_s = poll_interval_ms / 1000.0
+        self._rpc_timeout_s = rpc_timeout_ms / 1000.0
+        self._failure_threshold = failure_threshold
+        self._cooldown_s = cooldown_s
         self._w3: AsyncWeb3[Any] | None = None
+        self._pool: EndpointPool[AsyncWeb3[Any]] | None = None
 
     async def connect(self) -> None:
-        self._w3 = AsyncWeb3(AsyncHTTPProvider(self._rpc_http))
-        # Inject PoA middleware for chains like Polygon that use >32 byte extraData
         from web3.middleware import ExtraDataToPOAMiddleware
-        self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        await self._w3.eth.block_number
+        handles: list[AsyncWeb3[Any]] = []
+        for url in self._http_urls:
+            w3 = AsyncWeb3(AsyncHTTPProvider(url))
+            # Inject PoA middleware for chains like Polygon that use >32 byte extraData
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            handles.append(w3)
+        self._pool = EndpointPool(
+            self.chain_id,
+            handles,
+            timeout_s=self._rpc_timeout_s,
+            failure_threshold=self._failure_threshold,
+            cooldown_s=self._cooldown_s,
+        )
+        self._w3 = handles[0]
+        # block_number is an awaitable property; closure returns it (no ()).
+        await self._pool.call(lambda w3: w3.eth.block_number)
 
     async def disconnect(self) -> None:
-        if self._w3 is not None:
+        if self._pool is not None:
             # AsyncHTTPProvider holds an aiohttp session. Closing it explicitly
             # avoids "Unclosed client session" warnings.
-            with contextlib.suppress(Exception):  # best-effort cleanup
-                await self._w3.provider.disconnect()
+            for w3 in self._pool.handles():
+                with contextlib.suppress(Exception):  # best-effort cleanup
+                    await w3.provider.disconnect()
+            self._pool = None
             self._w3 = None
 
     async def get_latest_block_number(self) -> int:
-        assert self._w3 is not None
+        assert self._pool is not None
         async with track_rpc(self.chain_id, "eth_blockNumber"):
-            return int(await self._w3.eth.block_number)
+            return int(await self._pool.call(lambda w3: w3.eth.block_number))
 
     async def fetch_block(self, number: int) -> Block:
         """Fetch block header + transactions. Logs are NOT embedded; callers
         (ChainListener / ConfirmationBuffer) call ``fetch_logs`` separately to
         avoid double RPC cost when batching."""
-        assert self._w3 is not None
+        assert self._pool is not None
         async with track_rpc(self.chain_id, "eth_getBlockByNumber"):
-            raw = await self._w3.eth.get_block(number, full_transactions=True)
+            raw = await self._pool.call(
+                lambda w3: w3.eth.get_block(number, full_transactions=True)
+            )
             header = BlockHeader(
                 number=int(raw["number"]),
                 hash=_hexify(raw["hash"]),
@@ -122,7 +147,7 @@ class EvmAdapter:
         addresses: list[str] | None = None,
         topics: list[list[str]] | None = None,
     ) -> list[Log]:
-        assert self._w3 is not None
+        assert self._pool is not None
         async with track_rpc(self.chain_id, "eth_getLogs"):
             params: dict[str, Any] = {"fromBlock": from_block, "toBlock": to_block}
             if addresses:
@@ -130,7 +155,9 @@ class EvmAdapter:
             if topics:
                 params["topics"] = topics
             # FilterParams is a TypedDict; the runtime dict matches its shape.
-            raw_logs = await self._w3.eth.get_logs(cast(FilterParams, params))
+            raw_logs = await self._pool.call(
+                lambda w3: w3.eth.get_logs(cast(FilterParams, params))
+            )
             out: list[Log] = []
             for lg in raw_logs:
                 out.append(

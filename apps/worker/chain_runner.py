@@ -399,6 +399,13 @@ class ChainRunner:
             return list(range(start, end + 1))
 
     async def _handle_evm_head(self, header: BlockHeader) -> None:
+        # Live-head tip update (EVM catchup goes through
+        # _process_block_with_prefetched_logs directly, so this never runs there).
+        from core.metrics import CHAIN_TIP_BLOCK
+        CHAIN_TIP_BLOCK.labels(chain=self._chain.id).set(header.number)
+        if self._tip_publisher is not None:
+            await self._tip_publisher(self._chain.id, header.number)
+
         assert self._buffer is not None and self._adapter is not None
         assert self._matcher is not None and self._notifier is not None
         matcher = self._matcher

@@ -124,8 +124,8 @@ async def test_run_solana_live_loop_updates_tip_gauge_and_publisher(monkeypatch)
 async def test_evm_per_block_metrics_advance_after_processing(monkeypatch) -> None:
     """BLOCKS_PROCESSED_TOTAL + CHAIN_LAST_PROCESSED_BLOCK update after each
     successfully-processed block (covers both live and catchup paths)."""
-    from core.metrics import BLOCKS_PROCESSED_TOTAL, CHAIN_LAST_PROCESSED_BLOCK
     from core.chains.types import Block, BlockHeader
+    from core.metrics import BLOCKS_PROCESSED_TOTAL, CHAIN_LAST_PROCESSED_BLOCK
 
     runner, _ = _build_runner("evm")
     runner._matcher = MagicMock()
@@ -141,7 +141,6 @@ async def test_evm_per_block_metrics_advance_after_processing(monkeypatch) -> No
     block = Block(header=header, txs=[], logs=[])
 
     before_count = BLOCKS_PROCESSED_TOTAL.labels(chain="test-chain")._value.get()
-    before_gauge = CHAIN_LAST_PROCESSED_BLOCK.labels(chain="test-chain")._value.get()
 
     await runner._process_block_with_prefetched_logs(
         42, block, [], matcher=runner._matcher, notifier=runner._notifier,

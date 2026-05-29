@@ -5,6 +5,12 @@ import { Activity, Box, Radio, Link2, Upload, CheckCircle, XCircle, AlertTriangl
 interface Health { db: string; redis: string }
 interface Chain { id: string; kind: string; enabled: boolean }
 interface ChainStatus { chain_id: string; enabled: boolean; latest_block: number | null; latest_block_hash: string | null }
+interface ChainLag {
+  chain_id: string
+  tip_block: number | null
+  last_processed_block: number | null
+  lag_blocks: number | null
+}
 interface DeliveryRecord { id: string; status: string }
 
 export default function Dashboard() {
@@ -51,6 +57,13 @@ export default function Dashboard() {
   )
 }
 
+function lagMeta(lag: number | null): { color: string; bg: string; label: string } {
+  if (lag === null) return { color: 'text-gray-400', bg: 'bg-gray-100',   label: '未知' }
+  if (lag < 5)      return { color: 'text-green-700', bg: 'bg-green-100', label: `落后 ${lag}` }
+  if (lag < 100)    return { color: 'text-amber-700', bg: 'bg-amber-100', label: `落后 ${lag}` }
+  return                   { color: 'text-red-700',   bg: 'bg-red-100',   label: `落后 ${lag}` }
+}
+
 function ChainCard({ chain }: { chain: Chain }) {
   const { data: status } = useQuery<ChainStatus>({
     queryKey: ['chain-status', chain.id],
@@ -58,18 +71,34 @@ function ChainCard({ chain }: { chain: Chain }) {
     refetchInterval: 5000,
     enabled: chain.enabled,
   })
+  const { data: lag } = useQuery<ChainLag>({
+    queryKey: ['chain-lag', chain.id],
+    queryFn: () => api.get(`/chains/${chain.id}/lag`),
+    refetchInterval: 5000,
+    enabled: chain.enabled,
+  })
+  const lm = lagMeta(lag?.lag_blocks ?? null)
+
   return (
     <div className={`border rounded-lg p-4 ${chain.enabled ? '' : 'opacity-50'}`}>
       <div className="flex items-center justify-between mb-2">
         <span className="font-mono text-sm font-medium">{chain.id}</span>
-        <span className={`px-2 py-0.5 rounded text-xs ${chain.kind === 'evm' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'}`}>{chain.kind}</span>
+        <div className="flex items-center gap-1.5">
+          <span className={`px-2 py-0.5 rounded text-xs ${chain.kind === 'evm' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'}`}>{chain.kind}</span>
+          {chain.enabled && (
+            <span className={`px-2 py-0.5 rounded text-xs font-medium ${lm.bg} ${lm.color}`}>{lm.label}</span>
+          )}
+        </div>
       </div>
       <div className="flex items-center gap-1 text-xs mb-2">
         {chain.enabled ? <><Activity size={12} className="text-green-600" /><span className="text-green-600">运行中</span></> : <span className="text-gray-400">已停用</span>}
       </div>
       {status && status.latest_block !== null ? (
         <div className="bg-gray-50 rounded p-2 text-xs space-y-1">
-          <div className="flex justify-between"><span className="text-gray-500">最新区块</span><span className="font-mono font-medium">{status.latest_block.toLocaleString()}</span></div>
+          <div className="flex justify-between"><span className="text-gray-500">已处理</span><span className="font-mono font-medium">{status.latest_block.toLocaleString()}</span></div>
+          {lag?.tip_block != null && (
+            <div className="flex justify-between"><span className="text-gray-500">链头</span><span className="font-mono">{lag.tip_block.toLocaleString()}</span></div>
+          )}
           <div className="flex justify-between"><span className="text-gray-500">区块哈希</span><span className="font-mono truncate max-w-32">{status.latest_block_hash?.slice(0, 18)}...</span></div>
         </div>
       ) : chain.enabled ? (

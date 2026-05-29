@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.web.deps import get_bus, get_session
@@ -102,3 +103,43 @@ async def chain_status(
         "latest_block": cp.last_block if cp else None,
         "latest_block_hash": cp.last_block_hash if cp else None,
     }
+
+
+class ChainLagOut(BaseModel):
+    chain_id: str
+    tip_block: int | None
+    last_processed_block: int | None
+    lag_blocks: int | None
+
+
+@router.get("/{chain_id}/lag", response_model=ChainLagOut)
+async def get_chain_lag(
+    chain_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> ChainLagOut:
+    from core.config.repositories import CheckpointRepo
+
+    chain = await ChainRepo(session).get(chain_id)
+    if chain is None:
+        raise HTTPException(status_code=404, detail="chain not found")
+
+    # Tip is published to Redis by the worker on every live head.
+    tip_raw = await bus.client.get(f"chain:{chain_id}:tip")
+    tip_block: int | None = int(tip_raw) if tip_raw is not None else None
+
+    checkpoint = await CheckpointRepo(session).get(chain_id)
+    last_processed = checkpoint.last_block if checkpoint is not None else None
+
+    lag = (
+        max(0, tip_block - last_processed)
+        if tip_block is not None and last_processed is not None
+        else None
+    )
+
+    return ChainLagOut(
+        chain_id=chain_id,
+        tip_block=tip_block,
+        last_processed_block=last_processed,
+        lag_blocks=lag,
+    )

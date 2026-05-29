@@ -179,7 +179,8 @@ RPC_REQUESTS_TOTAL = Counter(
 )
 CHANNEL_SEND_SECONDS = Histogram(
     "chain_indexer_channel_send_seconds",
-    "Channel send latency (single attempt).", ["channel_type"],
+    "End-to-end Channel.send latency (includes in-channel retry sleeps).",
+    ["channel_type"],
 )
 CHANNEL_SENDS_TOTAL = Counter(
     "chain_indexer_channel_sends_total",
@@ -550,7 +551,7 @@ Thresholds (hard-coded in v1):
 | `core/metrics.py` | NEW. All metric singletons + `track_rpc`. |
 | `core/settings.py` | +`MetricsSettings`, +`Settings.metrics`. |
 | `apps/worker/main.py` | +`_publish_tip`. `start()` launches `/metrics` server, sets `WORKER_UP`, `WORKER_INFO`. Pass `tip_publisher=self._publish_tip` to `ChainRunner(...)`. |
-| `apps/worker/chain_runner.py` | +`tip_publisher` ctor param. `_handle_evm_head` / `_process_solana_slot` update tip gauge + call publisher. `_process_block_with_prefetched_logs` increments counter + sets last-processed gauge. `_tracked_dispatch` helper wraps `notifier.dispatch`. |
+| `apps/worker/chain_runner.py` | +`tip_publisher` ctor param. `_handle_evm_head` updates tip gauge + calls publisher (EVM live loop only). `_run_solana`'s live `async for slot` loop does the same inline before calling `_process_solana_slot` (Solana live loop only; catchup never updates the tip). `_process_block_with_prefetched_logs` and `_process_solana_slot` increment `BLOCKS_PROCESSED_TOTAL` + set `CHAIN_LAST_PROCESSED_BLOCK`. `_tracked_dispatch` helper wraps `notifier.dispatch`. |
 | `core/chains/evm.py` | Each RPC method wraps with `track_rpc`. |
 | `core/chains/solana.py` | Each RPC method wraps with `track_rpc`. |
 | `core/notifier/notifier.py` | `_send_one` records `CHANNEL_SEND_SECONDS` + `CHANNEL_SENDS_TOTAL`. |

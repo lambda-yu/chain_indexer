@@ -616,7 +616,6 @@ def _build_runner(chain_kind: str = "evm"):
         rpc_ws=None,
         confirmations=12,
         poll_interval_ms=1000,
-        enabled=True,
         commitment="confirmed" if chain_kind == "solana" else None,
         trace_internal_calls=False,
         log_query_range_blocks=100,
@@ -826,7 +825,7 @@ async def test_evm_per_block_metrics_advance_after_processing(monkeypatch) -> No
     runner._cp.save = AsyncMock()
 
     header = BlockHeader(number=42, hash="0xa", parent_hash="0xb", timestamp=0)
-    block = Block(header=header, transactions=[], logs=[])
+    block = Block(header=header, txs=[], logs=[])
 
     before_count = BLOCKS_PROCESSED_TOTAL.labels(chain="test-chain")._value.get()
     before_gauge = CHAIN_LAST_PROCESSED_BLOCK.labels(chain="test-chain")._value.get()
@@ -973,9 +972,15 @@ git commit -m "feat(runner): DISPATCH_IN_FLIGHT gauge via _tracked_dispatch wrap
 **Files:**
 - Modify: `core/chains/evm.py`
 
-- [ ] **Step 1: Wrap each public RPC method**
+- [ ] **Step 1: Add module-level import + wrap each public RPC method**
 
-In `core/chains/evm.py`, wrap each public method that issues an RPC. Method bodies stay the same; only the outer `async with track_rpc(...)` is added. The adapter exposes `self.chain_id` (verified at evm.py:57).
+In `core/chains/evm.py`, add to the top-of-file imports (after the `from core.chains.types import ...` line):
+
+```python
+from core.metrics import track_rpc
+```
+
+Then wrap each public method that issues an RPC. Method bodies stay the same; only the outer `async with track_rpc(...)` is added. The adapter exposes `self.chain_id` (verified at evm.py:57).
 
 Modify each of these methods:
 
@@ -984,16 +989,14 @@ Modify each of these methods:
 ```python
     async def get_latest_block_number(self) -> int:
         assert self._w3 is not None
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "eth_blockNumber"):
-            return await self._w3.eth.block_number
+            return int(await self._w3.eth.block_number)
 ```
 
 **`fetch_block`** (around line 83):
 
 ```python
     async def fetch_block(self, number: int) -> Block:
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "eth_getBlockByNumber"):
             ...  # entire existing body
 ```
@@ -1008,7 +1011,6 @@ Modify each of these methods:
         addresses: list[str] | None = None,
         topics: list[list[str]] | None = None,
     ) -> list[Log]:
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "eth_getLogs"):
             ...  # entire existing body
 ```
@@ -1017,7 +1019,6 @@ Modify each of these methods:
 
 ```python
     async def trace_transaction(self, tx_hash: str) -> InternalCall | None:
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "debug_traceTransaction"):
             ...  # entire existing body
 ```
@@ -1030,7 +1031,6 @@ Modify each of these methods:
         # this method batches per-tx traces; one observation = one block. The
         # inner self._w3.eth.get_block call is intentionally NOT separately
         # metered to keep the instrumentation surface small.
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "trace_block"):
             ...  # entire existing body
 ```
@@ -1126,16 +1126,21 @@ git commit -m "feat(evm): instrument adapter RPC methods with track_rpc"
 **Files:**
 - Modify: `core/chains/solana.py`
 
-- [ ] **Step 1: Wrap each public RPC method**
+- [ ] **Step 1: Add module-level import + wrap each public RPC method**
 
-In `core/chains/solana.py`, wrap each public RPC method (verified at solana.py:39, attribute is `self.chain_id`):
+In `core/chains/solana.py`, add to the top-of-file imports (after the `from core.chains.types import ...` block):
+
+```python
+from core.metrics import track_rpc
+```
+
+Then wrap each public RPC method (verified at solana.py:39, attribute is `self.chain_id`):
 
 **`get_latest_slot`** (around line 54):
 
 ```python
     async def get_latest_slot(self) -> int:
         assert self._client is not None
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "getSlot"):
             ...  # existing body
 ```
@@ -1145,7 +1150,6 @@ In `core/chains/solana.py`, wrap each public RPC method (verified at solana.py:3
 ```python
     async def fetch_block(self, slot: int) -> SolanaBlock | None:
         assert self._client is not None
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "getBlock"):
             ...  # existing body
 ```
@@ -1154,7 +1158,6 @@ In `core/chains/solana.py`, wrap each public RPC method (verified at solana.py:3
 
 ```python
     async def get_blocks(self, start_slot: int, end_slot: int) -> list[int]:
-        from core.metrics import track_rpc
         async with track_rpc(self.chain_id, "getBlocks"):
             ...  # existing body
 ```

@@ -44,6 +44,11 @@ class MetricsSettings(BaseModel):
     port: int = 9091
 
 
+class RpcPoolSettings(BaseModel):
+    failure_threshold: int = 3
+    cooldown_s: float = 30.0
+
+
 class DeliveryRecordsSettings(BaseModel):
     max_success_rows: int = 50000
     cleanup_interval_seconds: int = 300
@@ -66,6 +71,7 @@ class Settings(BaseSettings):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     delivery_records: DeliveryRecordsSettings = Field(default_factory=DeliveryRecordsSettings)
     metrics: MetricsSettings = Field(default_factory=MetricsSettings)
+    rpc_pool: RpcPoolSettings = Field(default_factory=RpcPoolSettings)
 
     @classmethod
     def settings_customise_sources(

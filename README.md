@@ -210,6 +210,43 @@ worker 内置后台清理任务，自动按上限滚动删除最旧的 **成功*
 
 UI 上的投递记录页面支持按状态服务端过滤，并对 `attempts > 1` 的记录用琥珀色高亮，方便排查反复失败的投递。
 
+## 可观测性 (Observability)
+
+Worker 和 web 各自暴露 Prometheus `/metrics` 端点：
+
+| 进程 | 地址 | 用途 |
+|------|------|------|
+| worker | `http://worker:9091/metrics` | 区块处理速率、RPC 延迟分布、channel 发送延迟、dispatch in-flight |
+| web    | `http://web:8000/metrics` | API 请求计数 + 延迟 |
+
+Prometheus 配置示例（`prometheus.yml`）：
+
+```yaml
+scrape_configs:
+  - job_name: chain-indexer-worker
+    static_configs:
+      - targets: ['worker:9091']
+  - job_name: chain-indexer-web
+    static_configs:
+      - targets: ['web:8000']
+```
+
+常用 PromQL：
+
+```promql
+# 每条链的 lag（也可直接看 Dashboard ChainCard 状态灯）
+chain_indexer_chain_tip_block - chain_indexer_chain_last_processed_block
+
+# 每条链的 RPC p99 延迟
+histogram_quantile(0.99, sum by (chain, le) (rate(chain_indexer_rpc_request_seconds_bucket[5m])))
+
+# Channel 失败率（按类型）
+sum by (channel_type) (rate(chain_indexer_channel_sends_total{status="failed"}[5m]))
+  / sum by (channel_type) (rate(chain_indexer_channel_sends_total[5m]))
+```
+
+`CHAIN_INDEXER_METRICS__ENABLED=false` 可关闭 worker 的 `/metrics` 服务（调试时偶尔需要避免端口冲突）。
+
 ## 开发命令
 
 ```bash

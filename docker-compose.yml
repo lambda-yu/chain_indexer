@@ -51,6 +51,8 @@ services:
   worker:
     build: .
     command: uv run python -m apps.worker.main
+    ports:
+      - "9091:9091"
     environment:
       CHAIN_INDEXER_DATABASE__URL: postgresql+asyncpg://indexer:indexer@db:5432/chain_indexer
       CHAIN_INDEXER_REDIS__URL: redis://redis:6379/0

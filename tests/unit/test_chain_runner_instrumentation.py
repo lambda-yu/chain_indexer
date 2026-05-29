@@ -118,3 +118,36 @@ async def test_run_solana_live_loop_updates_tip_gauge_and_publisher(monkeypatch)
 
     assert seen_tip_at_call == [555], "tip must be set before _process_solana_slot"
     tip_publisher.assert_awaited_once_with("test-chain", 555)
+
+
+@pytest.mark.asyncio
+async def test_evm_per_block_metrics_advance_after_processing(monkeypatch) -> None:
+    """BLOCKS_PROCESSED_TOTAL + CHAIN_LAST_PROCESSED_BLOCK update after each
+    successfully-processed block (covers both live and catchup paths)."""
+    from core.metrics import BLOCKS_PROCESSED_TOTAL, CHAIN_LAST_PROCESSED_BLOCK
+    from core.chains.types import Block, BlockHeader
+
+    runner, _ = _build_runner("evm")
+    runner._matcher = MagicMock()
+    runner._matcher.match = MagicMock(return_value=[])  # no hits
+    runner._notifier = MagicMock()
+    runner._evm_pipeline = MagicMock()
+    runner._evm_pipeline.run = MagicMock(return_value=[])
+    runner._adapter = MagicMock()
+    runner._cp = MagicMock()
+    runner._cp.save = AsyncMock()
+
+    header = BlockHeader(number=42, hash="0xa", parent_hash="0xb", timestamp=0)
+    block = Block(header=header, txs=[], logs=[])
+
+    before_count = BLOCKS_PROCESSED_TOTAL.labels(chain="test-chain")._value.get()
+    before_gauge = CHAIN_LAST_PROCESSED_BLOCK.labels(chain="test-chain")._value.get()
+
+    await runner._process_block_with_prefetched_logs(
+        42, block, [], matcher=runner._matcher, notifier=runner._notifier,
+    )
+
+    after_count = BLOCKS_PROCESSED_TOTAL.labels(chain="test-chain")._value.get()
+    after_gauge = CHAIN_LAST_PROCESSED_BLOCK.labels(chain="test-chain")._value.get()
+    assert after_count - before_count == 1
+    assert after_gauge == 42

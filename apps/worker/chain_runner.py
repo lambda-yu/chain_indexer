@@ -530,6 +530,9 @@ class ChainRunner:
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
 
         await self._cp.save(self._chain.id, block.header.number, block.header.hash)
+        from core.metrics import BLOCKS_PROCESSED_TOTAL, CHAIN_LAST_PROCESSED_BLOCK
+        BLOCKS_PROCESSED_TOTAL.labels(chain=self._chain.id).inc()
+        CHAIN_LAST_PROCESSED_BLOCK.labels(chain=self._chain.id).set(block.header.number)
         if self._on_block_processed and matched_sub_ids:
             try:
                 await self._on_block_processed(matched_sub_ids, block.header.number)
@@ -558,6 +561,9 @@ class ChainRunner:
         if dispatch_tasks:
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
         await self._cp.save(self._chain.id, block.slot, block.block_hash)
+        from core.metrics import BLOCKS_PROCESSED_TOTAL, CHAIN_LAST_PROCESSED_BLOCK
+        BLOCKS_PROCESSED_TOTAL.labels(chain=self._chain.id).inc()
+        CHAIN_LAST_PROCESSED_BLOCK.labels(chain=self._chain.id).set(block.slot)
         if self._on_block_processed and matched_sub_ids:
             try:
                 await self._on_block_processed(matched_sub_ids, block.slot)

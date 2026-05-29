@@ -29,6 +29,8 @@ class ChainCreate(BaseModel):
     trace_internal_calls: bool = False
     log_query_range_blocks: int = Field(ge=1, le=10_000, default=100)
     slot_query_range_blocks: int = Field(ge=1, le=500_000, default=1000)
+    rpc_http_fallbacks: list[str] = Field(default_factory=list)
+    rpc_timeout_ms: int = Field(ge=100, le=120_000, default=10000)
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -37,6 +39,18 @@ class ChainCreate(BaseModel):
             raise ValueError("Solana chains must specify commitment")
         if self.kind == "evm" and self.commitment is not None:
             raise ValueError("EVM chains must not specify commitment")
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_fallbacks(self) -> ChainCreate:
+        cleaned = [u.strip() for u in self.rpc_http_fallbacks if u and u.strip()]
+        seen: set[str] = set()
+        out: list[str] = []
+        for u in cleaned:
+            if u != self.rpc_http and u not in seen:
+                seen.add(u)
+                out.append(u)
+        self.rpc_http_fallbacks = out
         return self
 
 
@@ -53,6 +67,8 @@ class ChainOut(BaseModel):
     trace_internal_calls: bool | None
     log_query_range_blocks: int
     slot_query_range_blocks: int
+    rpc_http_fallbacks: list[str]
+    rpc_timeout_ms: int
     enabled: bool
 
 

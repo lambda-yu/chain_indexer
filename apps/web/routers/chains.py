@@ -35,6 +35,8 @@ async def create_chain(
         trace_internal_calls=payload.trace_internal_calls,
         log_query_range_blocks=payload.log_query_range_blocks,
         slot_query_range_blocks=payload.slot_query_range_blocks,
+        rpc_http_fallbacks=payload.rpc_http_fallbacks,
+        rpc_timeout_ms=payload.rpc_timeout_ms,
     )
     await bump_and_publish(session, bus, entity="chain", entity_id=row.id, action="create")
     return ChainOut.model_validate(row)
@@ -62,6 +64,8 @@ async def update_chain(
         trace_internal_calls=payload.trace_internal_calls,
         log_query_range_blocks=payload.log_query_range_blocks,
         slot_query_range_blocks=payload.slot_query_range_blocks,
+        rpc_http_fallbacks=payload.rpc_http_fallbacks,
+        rpc_timeout_ms=payload.rpc_timeout_ms,
     )
     await bump_and_publish(session, bus, entity="chain", entity_id=chain_id, action="update")
     await session.refresh(row)

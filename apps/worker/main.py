@@ -156,6 +156,22 @@ class _Worker:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _publish_tip(self, chain_id: str, block_number: int) -> None:
+        """Write chain:{chain_id}:tip to Redis (TTL 60s) for the web's /lag endpoint.
+
+        Errors are logged and swallowed: a Redis hiccup must not kill the
+        chain runner. The Dashboard chip just goes ⚪ "unknown" until the
+        next live head re-publishes the key.
+        """
+        try:
+            await self._bus.client.set(
+                f"chain:{chain_id}:tip", block_number, ex=60,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "worker.publish_tip_failed", chain_id=chain_id, error=repr(exc),
+            )
+
     async def _run_cleanup_loop(self) -> None:
         """Periodically delete oldest status='success' delivery_records rows
         so the table stays under settings.delivery_records.max_success_rows.

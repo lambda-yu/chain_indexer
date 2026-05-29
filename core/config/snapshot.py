@@ -48,6 +48,8 @@ class SnapshotChain:
     trace_internal_calls: bool = False
     log_query_range_blocks: int = 100
     slot_query_range_blocks: int = 1000
+    rpc_http_fallbacks: list[str] = field(default_factory=list)
+    rpc_timeout_ms: int = 10000
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ async def load_snapshot(session: AsyncSession) -> ConfigSnapshot:
             trace_internal_calls=bool(c.trace_internal_calls) if c.trace_internal_calls is not None else False,
             log_query_range_blocks=c.log_query_range_blocks,
             slot_query_range_blocks=c.slot_query_range_blocks,
+            rpc_http_fallbacks=c.rpc_http_fallbacks,
+            rpc_timeout_ms=c.rpc_timeout_ms,
         )
         for c in chains_rows
     ]

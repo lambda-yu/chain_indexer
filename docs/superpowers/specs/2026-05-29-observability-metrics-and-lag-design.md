@@ -117,11 +117,11 @@ Names use the `chain_indexer_` prefix; counters end in `_total`; durations end i
 | Metric | Type | Labels | Notes |
 |--------|------|--------|-------|
 | `chain_indexer_blocks_processed_total` | Counter | `chain` | Incremented at end of `_process_block_with_prefetched_logs`. |
-| `chain_indexer_chain_tip_block` | Gauge | `chain` | Set on every `_handle_evm_head` / `_process_solana_slot`. |
+| `chain_indexer_chain_tip_block` | Gauge | `chain` | Set on every `_handle_evm_head` (EVM live loop) or every iteration of `_run_solana`'s `subscribe_heads` loop (Solana live loop). **Not updated during catchup** — the gauge reflects the live tip only. |
 | `chain_indexer_chain_last_processed_block` | Gauge | `chain` | Set after `_cp.save(...)`. |
 | `chain_indexer_rpc_request_seconds` | Histogram | `chain`, `method` | Default buckets. Method is the adapter-internal name (`eth_getBlockByNumber`, `eth_getLogs`, `getBlock`, etc.). |
 | `chain_indexer_rpc_requests_total` | Counter | `chain`, `method`, `status` | `status ∈ {success, error}`. |
-| `chain_indexer_channel_send_seconds` | Histogram | `channel_type` | Per-attempt latency, no retry-backoff inflation. |
+| `chain_indexer_channel_send_seconds` | Histogram | `channel_type` | End-to-end `Channel.send` latency including any in-channel retry sleeps. Not a per-attempt metric (each driver's `Channel.send` wraps its own `retry_with_backoff`). |
 | `chain_indexer_channel_sends_total` | Counter | `channel_type`, `status` | `status ∈ {success, failed}`. |
 | `chain_indexer_dispatch_in_flight` | Gauge | — | Inc when an event's dispatch task starts, dec on completion. Spot backpressure. |
 | `chain_indexer_worker_up` | Gauge | — | Set to 1 after `start_http_server` returns. |
@@ -228,11 +228,16 @@ The module is import-side-effect-free except for metric registration. Importing 
 
 ```python
 if self._settings.metrics.enabled:
+    from importlib.metadata import version as pkg_version
     from prometheus_client import start_http_server
     from core.metrics import WORKER_INFO, WORKER_UP
     start_http_server(self._settings.metrics.port)
     WORKER_UP.set(1)
-    WORKER_INFO.labels(worker_id=self._worker_id, version="dev").set(1)
+    try:
+        v = pkg_version("chain-indexer")
+    except Exception:  # noqa: BLE001 — dev tree without installed package
+        v = "dev"
+    WORKER_INFO.labels(worker_id=self._worker_id, version=v).set(1)
     log.info("worker.metrics_server_started", port=self._settings.metrics.port)
 ```
 
@@ -240,23 +245,28 @@ if self._settings.metrics.enabled:
 
 ## Component 3: Adapter instrumentation
 
-Each method in `core/chains/evm.py` that issues an RPC wraps the call with `track_rpc`:
+Each method in `core/chains/evm.py` that issues an RPC wraps the call with `track_rpc`. Adapter exposes its chain id as `self.chain_id` (no leading underscore — verify against the current EvmAdapter / SolanaAdapter):
 
 ```python
 async def fetch_block(self, number: int) -> Block:
-    async with track_rpc(self._chain_id, "eth_getBlockByNumber"):
+    async with track_rpc(self.chain_id, "eth_getBlockByNumber"):
         return await self._fetch_block_impl(number)
 
 async def fetch_logs(self, from_block, to_block, addresses, topics):
-    async with track_rpc(self._chain_id, "eth_getLogs"):
+    async with track_rpc(self.chain_id, "eth_getLogs"):
         return await self._fetch_logs_impl(...)
 
 async def get_latest_block_number(self) -> int:
-    async with track_rpc(self._chain_id, "eth_blockNumber"):
+    async with track_rpc(self.chain_id, "eth_blockNumber"):
         return await self._latest_impl()
 
 async def trace_block(self, number):
-    async with track_rpc(self._chain_id, "debug_traceTransaction"):
+    # The outer wrap labels the *batch* (one observation per block-trace request,
+    # even though internally trace_block loops over per-tx debug_traceTransaction
+    # calls and also issues an eth_getBlockByNumber for the full-tx body).
+    # Use a "trace_block" label to make the batched nature explicit; do NOT label
+    # as "debug_traceTransaction" since the count semantics differ.
+    async with track_rpc(self.chain_id, "trace_block"):
         return await self._trace_impl(number)
 ```
 
@@ -280,20 +290,31 @@ if self._tip_publisher is not None:
     await self._tip_publisher(self._chain.id, header.number)
 ```
 
-**`_process_solana_slot(slot)`** — analogous treatment using `slot` as the tip:
+This is safe because `_handle_evm_head` is only called from `_run_evm`'s live `async for header in self._adapter.subscribe_heads()` loop. EVM catchup goes through `_process_block_with_prefetched_logs` directly and never touches the tip gauge.
+
+**Solana live loop** — `_run_solana` updates the tip gauge inline at the top of the `async for slot` body, *before* `_process_solana_slot(slot)`. Solana's `_process_solana_slot` is shared between live AND catchup paths, so the tip update must happen at the call site that is live-only, not inside the shared per-slot processor.
 
 ```python
-CHAIN_TIP_BLOCK.labels(chain=self._chain.id).set(slot)
-if self._tip_publisher is not None:
-    await self._tip_publisher(self._chain.id, slot)
+# apps/worker/chain_runner.py, in _run_solana:
+async for slot in self._adapter.subscribe_heads():
+    if self._stop.is_set():
+        break
+    CHAIN_TIP_BLOCK.labels(chain=self._chain.id).set(slot)
+    if self._tip_publisher is not None:
+        await self._tip_publisher(self._chain.id, slot)
+    await self._process_solana_slot(slot)
 ```
 
-**`_process_block_with_prefetched_logs`** — after `await self._cp.save(...)`:
+`_catchup_solana`'s loop (which also calls `_process_solana_slot`) does NOT update the tip gauge; otherwise the gauge would regress to historical slots during backfill.
+
+**`_process_block_with_prefetched_logs` / `_process_solana_slot`** — after the block save (the EVM end-of-function spot, and the equivalent end-of-`_process_solana_slot`):
 
 ```python
 BLOCKS_PROCESSED_TOTAL.labels(chain=self._chain.id).inc()
 CHAIN_LAST_PROCESSED_BLOCK.labels(chain=self._chain.id).set(block.header.number)
 ```
+
+These metrics legitimately advance during catchup, so they live in the shared per-block / per-slot processor.
 
 **Dispatch wrapper** — replace the `asyncio.create_task(notifier.dispatch(...))` call with a tracked helper:
 
@@ -322,7 +343,7 @@ async def _publish_tip(self, chain_id: str, block_number: int) -> None:
         log.warning("worker.publish_tip_failed", chain_id=chain_id, error=repr(exc))
 ```
 
-Wired into `ChainRunner(... tip_publisher=self._publish_tip)` at both runner construction sites (initial + reconcile).
+Wired into `ChainRunner(... tip_publisher=self._publish_tip)` at the single runner construction site (`_Worker._reconcile` in `apps/worker/main.py`). `apply_snapshot` does not re-create the runner, so there is no second site to update.
 
 A Redis hiccup must not kill the chain runner — exceptions are logged and swallowed. Lag staleness manifests in the UI as a stale chip; the chain runner keeps processing.
 

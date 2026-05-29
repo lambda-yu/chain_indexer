@@ -14,6 +14,7 @@ from web3.utils.subscriptions import (
 )
 
 from core.chains.types import Block, BlockHeader, InternalCall, Log, Tx
+from core.metrics import track_rpc
 
 
 def _hexify(v: object) -> str:
@@ -78,39 +79,41 @@ class EvmAdapter:
 
     async def get_latest_block_number(self) -> int:
         assert self._w3 is not None
-        return int(await self._w3.eth.block_number)
+        async with track_rpc(self.chain_id, "eth_blockNumber"):
+            return int(await self._w3.eth.block_number)
 
     async def fetch_block(self, number: int) -> Block:
         """Fetch block header + transactions. Logs are NOT embedded; callers
         (ChainListener / ConfirmationBuffer) call ``fetch_logs`` separately to
         avoid double RPC cost when batching."""
         assert self._w3 is not None
-        raw = await self._w3.eth.get_block(number, full_transactions=True)
-        header = BlockHeader(
-            number=int(raw["number"]),
-            hash=_hexify(raw["hash"]),
-            parent_hash=_hexify(raw["parentHash"]),
-            timestamp=int(raw["timestamp"]),
-        )
-        txs: list[Tx] = []
-        # full_transactions=True guarantees TxData dicts (not HexBytes hashes).
-        raw_txs: list[TxData] = list(raw.get("transactions", []))  # type: ignore[arg-type]
-        for t in raw_txs:
-            txs.append(
-                Tx(
-                    hash=_hexify(t["hash"]),
-                    index=int(t.get("transactionIndex", 0) or 0),
-                    from_addr=str(t["from"]),
-                    to_addr=str(t["to"]) if t.get("to") else None,
-                    value=int(t.get("value", 0) or 0),
-                    input=_hexify(t.get("input", "0x")),
-                    # M1: status is not fetched (would require per-tx receipts).
-                    # Downstream parsers in M1 don't depend on status. M2 will
-                    # add an optional receipts-fetch pass for failed-tx filtering.
-                    status=1,
-                )
+        async with track_rpc(self.chain_id, "eth_getBlockByNumber"):
+            raw = await self._w3.eth.get_block(number, full_transactions=True)
+            header = BlockHeader(
+                number=int(raw["number"]),
+                hash=_hexify(raw["hash"]),
+                parent_hash=_hexify(raw["parentHash"]),
+                timestamp=int(raw["timestamp"]),
             )
-        return Block(header=header, txs=txs, logs=[])
+            txs: list[Tx] = []
+            # full_transactions=True guarantees TxData dicts (not HexBytes hashes).
+            raw_txs: list[TxData] = list(raw.get("transactions", []))  # type: ignore[arg-type]
+            for t in raw_txs:
+                txs.append(
+                    Tx(
+                        hash=_hexify(t["hash"]),
+                        index=int(t.get("transactionIndex", 0) or 0),
+                        from_addr=str(t["from"]),
+                        to_addr=str(t["to"]) if t.get("to") else None,
+                        value=int(t.get("value", 0) or 0),
+                        input=_hexify(t.get("input", "0x")),
+                        # M1: status is not fetched (would require per-tx receipts).
+                        # Downstream parsers in M1 don't depend on status. M2 will
+                        # add an optional receipts-fetch pass for failed-tx filtering.
+                        status=1,
+                    )
+                )
+            return Block(header=header, txs=txs, logs=[])
 
     async def fetch_logs(
         self,
@@ -120,26 +123,27 @@ class EvmAdapter:
         topics: list[list[str]] | None = None,
     ) -> list[Log]:
         assert self._w3 is not None
-        params: dict[str, Any] = {"fromBlock": from_block, "toBlock": to_block}
-        if addresses:
-            params["address"] = addresses
-        if topics:
-            params["topics"] = topics
-        # FilterParams is a TypedDict; the runtime dict matches its shape.
-        raw_logs = await self._w3.eth.get_logs(cast(FilterParams, params))
-        out: list[Log] = []
-        for lg in raw_logs:
-            out.append(
-                Log(
-                    tx_hash=_hexify(lg["transactionHash"]),
-                    log_index=int(lg["logIndex"]),
-                    address=str(lg["address"]),
-                    topics=[_hexify(t) for t in lg["topics"]],
-                    data=lg["data"] if isinstance(lg["data"], str) else _hexify(lg["data"]),
-                    block_number=int(lg["blockNumber"]),
+        async with track_rpc(self.chain_id, "eth_getLogs"):
+            params: dict[str, Any] = {"fromBlock": from_block, "toBlock": to_block}
+            if addresses:
+                params["address"] = addresses
+            if topics:
+                params["topics"] = topics
+            # FilterParams is a TypedDict; the runtime dict matches its shape.
+            raw_logs = await self._w3.eth.get_logs(cast(FilterParams, params))
+            out: list[Log] = []
+            for lg in raw_logs:
+                out.append(
+                    Log(
+                        tx_hash=_hexify(lg["transactionHash"]),
+                        log_index=int(lg["logIndex"]),
+                        address=str(lg["address"]),
+                        topics=[_hexify(t) for t in lg["topics"]],
+                        data=lg["data"] if isinstance(lg["data"], str) else _hexify(lg["data"]),
+                        block_number=int(lg["blockNumber"]),
+                    )
                 )
-            )
-        return out
+            return out
 
     def subscribe_heads(self) -> AsyncIterator[BlockHeader]:
         """Return an async iterator of new heads. WS if configured, else poll.
@@ -213,32 +217,38 @@ class EvmAdapter:
     _log = structlog.get_logger(__name__)
 
     async def trace_transaction(self, tx_hash: str) -> InternalCall | None:
-        try:
-            result = await self._w3.provider.make_request(  # type: ignore[union-attr]
-                "debug_traceTransaction",
-                [tx_hash, {"tracer": "callTracer", "tracerConfig": {"withLog": False}}],
-            )
-        except Exception as exc:  # noqa: BLE001
-            if "-32601" in str(exc):
+        async with track_rpc(self.chain_id, "debug_traceTransaction"):
+            try:
+                result = await self._w3.provider.make_request(  # type: ignore[union-attr]
+                    "debug_traceTransaction",
+                    [tx_hash, {"tracer": "callTracer", "tracerConfig": {"withLog": False}}],
+                )
+            except Exception as exc:  # noqa: BLE001
+                if "-32601" in str(exc):
+                    return None
+                self._log.warning("evm.trace_transaction_failed", tx_hash=tx_hash, error=str(exc))
                 return None
-            self._log.warning("evm.trace_transaction_failed", tx_hash=tx_hash, error=str(exc))
-            return None
-        raw = result.get("result")
-        if raw is None:
-            return None
-        return self._parse_call(raw)
+            raw = result.get("result")
+            if raw is None:
+                return None
+            return self._parse_call(raw)
 
     async def trace_block(self, number: int) -> list[InternalCall]:
+        # Labeled "trace_block" rather than "debug_traceTransaction" because
+        # this method batches per-tx traces; one observation = one block. The
+        # inner self._w3.eth.get_block call is intentionally NOT separately
+        # metered to keep the instrumentation surface small.
         assert self._w3 is not None
-        block = await self._w3.eth.get_block(number, full_transactions=True)
-        out: list[InternalCall] = []
-        for tx in block.get("transactions", []):
-            tx_hash = tx.get("hash", tx) if isinstance(tx, dict) else tx
-            h = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
-            call = await self.trace_transaction(h)
-            if call is not None:
-                out.append(call)
-        return out
+        async with track_rpc(self.chain_id, "trace_block"):
+            block = await self._w3.eth.get_block(number, full_transactions=True)
+            out: list[InternalCall] = []
+            for tx in block.get("transactions", []):
+                tx_hash = tx.get("hash", tx) if isinstance(tx, dict) else tx
+                h = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
+                call = await self.trace_transaction(h)
+                if call is not None:
+                    out.append(call)
+            return out
 
     @classmethod
     def _parse_call(cls, raw: dict[str, Any], depth: int = 0) -> InternalCall | None:

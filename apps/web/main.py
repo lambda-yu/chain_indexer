@@ -122,6 +122,12 @@ def create_app(
     app.include_router(test_router.router)
     app.include_router(ws_router.router)
 
+    # Prometheus exposition endpoint. Importing core.metrics here ensures
+    # all metric singletons are registered before the first scrape.
+    import core.metrics  # noqa: F401 — side-effect: register metrics
+    from prometheus_client import make_asgi_app
+    app.mount("/metrics", make_asgi_app())
+
     import pathlib
     spa_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "web" / "dist"
     if spa_dir.is_dir():

@@ -82,6 +82,7 @@ class ChainRunner:
         on_send_failure: Any = None,
         on_send_success: Any = None,
         on_block_processed: Any = None,
+        tip_publisher: Any = None,
     ) -> None:
         self._chain = chain
         self._adapter_factory = adapter_factory
@@ -92,6 +93,7 @@ class ChainRunner:
         self._on_send_failure = on_send_failure
         self._on_send_success = on_send_success
         self._on_block_processed = on_block_processed
+        self._tip_publisher = tip_publisher
 
         self._adapter: Any = None
         self._buffer: ConfirmationBuffer | None = None

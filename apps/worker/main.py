@@ -304,6 +304,7 @@ class _Worker:
                     on_send_failure=self._on_delivery_failure,
                     on_send_success=self._on_delivery_success,
                     on_block_processed=self._on_block_processed,
+                    tip_publisher=self._publish_tip,
                 )
                 try:
                     await runner.start(snap)

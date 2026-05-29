@@ -48,6 +48,17 @@ RPC_REQUESTS_TOTAL = Counter(
     ["chain", "method", "status"],
 )
 
+RPC_ENDPOINT_UP = Gauge(
+    "chain_indexer_rpc_endpoint_up",
+    "Per-endpoint health (1=healthy, 0=in cooldown).",
+    ["chain", "endpoint_index"],
+)
+RPC_FAILOVER_TOTAL = Counter(
+    "chain_indexer_rpc_failover_total",
+    "Count of failovers (a call moving from one endpoint to the next).",
+    ["chain"],
+)
+
 CHANNEL_SEND_SECONDS = Histogram(
     "chain_indexer_channel_send_seconds",
     "End-to-end Channel.send latency (includes in-channel retry sleeps).",

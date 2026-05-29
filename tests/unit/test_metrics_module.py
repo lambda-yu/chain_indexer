@@ -62,3 +62,9 @@ async def test_track_rpc_observes_histogram_on_both_success_and_error() -> None:
             raise ValueError("x")
     after_e = h_error._sum.get()
     assert after_e >= before_e
+
+
+def test_rpc_pool_metrics_exist() -> None:
+    from core import metrics as M
+    assert hasattr(M, "RPC_ENDPOINT_UP")
+    assert hasattr(M, "RPC_FAILOVER_TOTAL")

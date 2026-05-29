@@ -30,25 +30,48 @@ from core.settings import Settings, load_settings
 log = structlog.get_logger(__name__)
 
 
-def _default_adapter_factory(cfg: SnapshotChain) -> EvmAdapter | SolanaAdapter:
-    if cfg.kind == "evm":
-        return EvmAdapter(
-            chain_id=cfg.id,
-            rpc_http=cfg.rpc_http,
-            rpc_ws=cfg.rpc_ws,
-            confirmations=cfg.confirmations,
-            poll_interval_ms=cfg.poll_interval_ms,
-        )
-    if cfg.kind == "solana":
-        assert cfg.commitment is not None, "Solana chain must have commitment set"
-        return SolanaAdapter(
-            chain_id=cfg.id,
-            rpc_http=cfg.rpc_http,
-            commitment=cfg.commitment,
-            poll_interval_ms=cfg.poll_interval_ms,
-            rpc_ws=cfg.rpc_ws,
-        )
-    raise NotImplementedError(f"chain kind {cfg.kind!r} not supported")
+def _make_adapter_factory(
+    settings: Settings,
+) -> Callable[[SnapshotChain], EvmAdapter | SolanaAdapter]:
+    """Build a closure that constructs chain adapters from a `SnapshotChain`,
+    threading the per-chain RPC pool endpoints (`rpc_http_fallbacks`,
+    `rpc_timeout_ms`) plus the global circuit-breaker params
+    (`failure_threshold`, `cooldown_s`) from `settings.rpc_pool`.
+
+    Mirrors `_make_channel_factory(bus)` — settings are captured once and
+    reused for every chain reconciled by the runner.
+    """
+    pool = settings.rpc_pool
+
+    def factory(cfg: SnapshotChain) -> EvmAdapter | SolanaAdapter:
+        if cfg.kind == "evm":
+            return EvmAdapter(
+                chain_id=cfg.id,
+                rpc_http=cfg.rpc_http,
+                rpc_ws=cfg.rpc_ws,
+                confirmations=cfg.confirmations,
+                poll_interval_ms=cfg.poll_interval_ms,
+                rpc_http_fallbacks=cfg.rpc_http_fallbacks,
+                rpc_timeout_ms=cfg.rpc_timeout_ms,
+                failure_threshold=pool.failure_threshold,
+                cooldown_s=pool.cooldown_s,
+            )
+        if cfg.kind == "solana":
+            assert cfg.commitment is not None, "Solana chain must have commitment set"
+            return SolanaAdapter(
+                chain_id=cfg.id,
+                rpc_http=cfg.rpc_http,
+                commitment=cfg.commitment,
+                poll_interval_ms=cfg.poll_interval_ms,
+                rpc_ws=cfg.rpc_ws,
+                rpc_http_fallbacks=cfg.rpc_http_fallbacks,
+                rpc_timeout_ms=cfg.rpc_timeout_ms,
+                failure_threshold=pool.failure_threshold,
+                cooldown_s=pool.cooldown_s,
+            )
+        raise NotImplementedError(f"chain kind {cfg.kind!r} not supported")
+
+    return factory
 
 
 def _make_channel_factory(bus: RedisBus) -> Callable[[SnapshotChannel], Channel]:
@@ -285,6 +308,7 @@ class _Worker:
                 await self._stop_runner(chain_id)
                 if chain_id in self._locks:
                     await self._locks.pop(chain_id).release()
+        adapter_factory = _make_adapter_factory(self._settings)
         for chain_id, cfg in enabled.items():
             if chain_id in self._runners:
                 runner, _ = self._runners[chain_id]
@@ -297,7 +321,7 @@ class _Worker:
                 self._locks[chain_id] = lock
                 runner = ChainRunner(
                     chain=cfg,
-                    adapter_factory=_default_adapter_factory,
+                    adapter_factory=adapter_factory,
                     channel_factory=_make_channel_factory(self._bus),
                     checkpoint_repo=self._checkpoint_adapter,
                     abi_registry=self._registry,

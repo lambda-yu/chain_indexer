@@ -202,6 +202,26 @@ class _Worker:
             poll_interval_s=5.0,
         )
         await self._watcher.start()
+        # Prometheus metrics server (daemon thread; survives until process exit)
+        if self._settings.metrics.enabled:
+            from importlib.metadata import PackageNotFoundError
+            from importlib.metadata import version as pkg_version
+
+            from prometheus_client import start_http_server
+
+            from core.metrics import WORKER_INFO, WORKER_UP
+
+            start_http_server(self._settings.metrics.port)
+            WORKER_UP.set(1)
+            try:
+                v = pkg_version("chain-indexer")
+            except PackageNotFoundError:
+                v = "dev"
+            WORKER_INFO.labels(worker_id=self._worker_id, version=v).set(1)
+            log.info(
+                "worker.metrics_server_started",
+                port=self._settings.metrics.port,
+            )
         self._cleanup_task = asyncio.create_task(
             self._run_cleanup_loop(), name="delivery_records_cleanup",
         )

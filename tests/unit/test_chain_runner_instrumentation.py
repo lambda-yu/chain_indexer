@@ -65,3 +65,56 @@ async def test_handle_evm_head_updates_tip_gauge_and_publisher() -> None:
     assert after == 12345
     assert after != before or before == 12345  # gauge moved (or was already there)
     tip_publisher.assert_awaited_once_with("test-chain", 12345)
+
+
+@pytest.mark.asyncio
+async def test_process_solana_slot_does_NOT_update_tip_gauge() -> None:
+    """The shared per-slot processor must NOT touch the tip; tip is live-only.
+    Verified by calling _process_solana_slot directly (no live-loop wrapper)
+    and asserting the tip gauge for this chain is untouched."""
+    runner, tip_publisher = _build_runner("solana")
+    runner._matcher = MagicMock()
+    runner._notifier = MagicMock()
+    runner._adapter = MagicMock()
+    runner._adapter.fetch_block = AsyncMock(return_value=None)  # skip body
+    runner._solana_pipeline = MagicMock()
+
+    before = CHAIN_TIP_BLOCK.labels(chain="test-chain")._value.get()
+    await runner._process_solana_slot(99999)
+    after = CHAIN_TIP_BLOCK.labels(chain="test-chain")._value.get()
+
+    assert after == before
+    tip_publisher.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_solana_live_loop_updates_tip_gauge_and_publisher(monkeypatch) -> None:
+    """The live `async for slot` loop in _run_solana must update the tip BEFORE
+    calling _process_solana_slot."""
+    runner, tip_publisher = _build_runner("solana")
+    runner._matcher = MagicMock()
+    runner._notifier = MagicMock()
+    runner._adapter = MagicMock()
+
+    # Make catchup a no-op and yield exactly one slot.
+    async def _no_catchup() -> None:
+        pass
+    monkeypatch.setattr(runner, "_catchup_solana", _no_catchup)
+
+    async def _heads():
+        yield 555
+        runner._stop.set()  # exit loop after one
+    runner._adapter.subscribe_heads = _heads
+
+    # Stub _process_solana_slot to capture if tip was set before it ran.
+    seen_tip_at_call = []
+    async def _stub_process(slot):
+        seen_tip_at_call.append(
+            CHAIN_TIP_BLOCK.labels(chain="test-chain")._value.get()
+        )
+    monkeypatch.setattr(runner, "_process_solana_slot", _stub_process)
+
+    await runner._run_solana()
+
+    assert seen_tip_at_call == [555], "tip must be set before _process_solana_slot"
+    tip_publisher.assert_awaited_once_with("test-chain", 555)

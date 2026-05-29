@@ -313,9 +313,16 @@ class ChainRunner:
     async def _run_solana(self) -> None:
         # 快速追块：从 checkpoint 追到最新 slot
         await self._catchup_solana()
+        from core.metrics import CHAIN_TIP_BLOCK
         async for slot in self._adapter.subscribe_heads():
             if self._stop.is_set():
                 break
+            # Live-loop tip update. Critically NOT inside _process_solana_slot,
+            # which is shared with catchup — putting it there would regress the
+            # tip gauge to historical slot values during backfill.
+            CHAIN_TIP_BLOCK.labels(chain=self._chain.id).set(slot)
+            if self._tip_publisher is not None:
+                await self._tip_publisher(self._chain.id, slot)
             await self._process_solana_slot(slot)
 
     async def _catchup_solana(self) -> None:

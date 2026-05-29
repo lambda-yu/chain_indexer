@@ -39,6 +39,11 @@ class LoggingSettings(BaseModel):
     format: Literal["json", "console"] = "json"
 
 
+class MetricsSettings(BaseModel):
+    enabled: bool = True
+    port: int = 9091
+
+
 class DeliveryRecordsSettings(BaseModel):
     max_success_rows: int = 50000
     cleanup_interval_seconds: int = 300
@@ -60,6 +65,7 @@ class Settings(BaseSettings):
     web: WebSettings = Field(default_factory=WebSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     delivery_records: DeliveryRecordsSettings = Field(default_factory=DeliveryRecordsSettings)
+    metrics: MetricsSettings = Field(default_factory=MetricsSettings)
 
     @classmethod
     def settings_customise_sources(

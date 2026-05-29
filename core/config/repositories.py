@@ -41,6 +41,8 @@ class ChainRepo:
         trace_internal_calls: bool = False,
         log_query_range_blocks: int = 100,
         slot_query_range_blocks: int = 1000,
+        rpc_http_fallbacks: list[str] | None = None,
+        rpc_timeout_ms: int = 10000,
     ) -> Chain:
         c = Chain(
             id=id, kind=kind, rpc_http=rpc_http, rpc_ws=rpc_ws,
@@ -49,6 +51,8 @@ class ChainRepo:
             trace_internal_calls=trace_internal_calls,
             log_query_range_blocks=log_query_range_blocks,
             slot_query_range_blocks=slot_query_range_blocks,
+            rpc_http_fallbacks=rpc_http_fallbacks if rpc_http_fallbacks is not None else [],
+            rpc_timeout_ms=rpc_timeout_ms,
         )
         self.s.add(c)
         await self.s.flush()

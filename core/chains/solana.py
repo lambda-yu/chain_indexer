@@ -17,6 +17,7 @@ from core.chains.types import (
     SolanaTokenBalance,
     SolanaTransaction,
 )
+from core.metrics import track_rpc
 
 log = structlog.get_logger(__name__)
 
@@ -53,41 +54,43 @@ class SolanaAdapter:
 
     async def get_latest_slot(self) -> int:
         assert self._client is not None
-        req = GetSlot(RpcContextConfig(commitment=self._commitment))
-        resp = await self._client.post(
-            self._rpc_url,
-            content=req.to_json(),
-            headers={"content-type": "application/json"},
-        )
-        resp.raise_for_status()
-        parsed = GetSlotResp.from_json(resp.text)
-        return parsed.value  # type: ignore[union-attr]
+        async with track_rpc(self.chain_id, "getSlot"):
+            req = GetSlot(RpcContextConfig(commitment=self._commitment))
+            resp = await self._client.post(
+                self._rpc_url,
+                content=req.to_json(),
+                headers={"content-type": "application/json"},
+            )
+            resp.raise_for_status()
+            parsed = GetSlotResp.from_json(resp.text)
+            return parsed.value  # type: ignore[union-attr]
 
     async def fetch_block(self, slot: int) -> SolanaBlock | None:
         assert self._client is not None
-        config: dict[str, Any] = {
-            "commitment": str(self._commitment).lower(),
-            "transactionDetails": "full",
-            "rewards": False,
-            "maxSupportedTransactionVersion": 0,
-        }
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBlock",
-            "params": [slot, config],
-        }
-        resp = await self._client.post(
-            self._rpc_url,
-            json=payload,
-            headers={"content-type": "application/json"},
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        result = body.get("result")
-        if result is None:
-            return None
-        return self._parse_block(slot, result)
+        async with track_rpc(self.chain_id, "getBlock"):
+            config: dict[str, Any] = {
+                "commitment": str(self._commitment).lower(),
+                "transactionDetails": "full",
+                "rewards": False,
+                "maxSupportedTransactionVersion": 0,
+            }
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBlock",
+                "params": [slot, config],
+            }
+            resp = await self._client.post(
+                self._rpc_url,
+                json=payload,
+                headers={"content-type": "application/json"},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            result = body.get("result")
+            if result is None:
+                return None
+            return self._parse_block(slot, result)
 
     async def get_blocks(self, start_slot: int, end_slot: int) -> list[int]:
         """Return slots in [start_slot, end_slot] that contain confirmed blocks.
@@ -101,20 +104,21 @@ class SolanaAdapter:
         `slot_query_range_blocks`); this method does not internally chunk.
         """
         assert self._client is not None
-        payload = {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getBlocks",
-            "params": [start_slot, end_slot, {"commitment": "finalized"}],
-        }
-        resp = await self._client.post(
-            self._rpc_url,
-            json=payload,
-            headers={"content-type": "application/json"},
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        result = body.get("result")
-        return list(result or [])
+        async with track_rpc(self.chain_id, "getBlocks"):
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getBlocks",
+                "params": [start_slot, end_slot, {"commitment": "finalized"}],
+            }
+            resp = await self._client.post(
+                self._rpc_url,
+                json=payload,
+                headers={"content-type": "application/json"},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            result = body.get("result")
+            return list(result or [])
 
     def _parse_block(self, slot: int, result: dict[str, Any]) -> SolanaBlock:
         txs: list[SolanaTransaction] = []

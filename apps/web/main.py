@@ -124,9 +124,40 @@ def create_app(
 
     # Prometheus exposition endpoint. Importing core.metrics here ensures
     # all metric singletons are registered before the first scrape.
-    import core.metrics  # noqa: F401 — side-effect: register metrics
     from prometheus_client import make_asgi_app
+
+    import core.metrics  # noqa: F401 — side-effect: register metrics
     app.mount("/metrics", make_asgi_app())
+
+    # API request metric middleware. Registered AFTER the /metrics mount
+    # so the middleware can short-circuit on /metrics requests.
+    from time import perf_counter
+
+    from fastapi import Request
+
+    from core.metrics import API_REQUEST_SECONDS, API_REQUESTS_TOTAL
+
+    @app.middleware("http")
+    async def track_api_metrics(request: Request, call_next):  # type: ignore[no-untyped-def]
+        # Skip /metrics itself: a scrape of /metrics would otherwise produce
+        # a chain_indexer_api_requests_total{path="/metrics"} series that
+        # dominates everything once Prometheus is wired in.
+        if request.url.path == "/metrics":
+            return await call_next(request)
+
+        t0 = perf_counter()
+        response = await call_next(request)
+        elapsed = perf_counter() - t0
+
+        # Use route template ("/api/chains/{chain_id}") not raw URL.
+        route = request.scope.get("route")
+        path = getattr(route, "path", request.url.path)
+
+        API_REQUEST_SECONDS.labels(method=request.method, path=path).observe(elapsed)
+        API_REQUESTS_TOTAL.labels(
+            method=request.method, path=path, status=str(response.status_code),
+        ).inc()
+        return response
 
     import pathlib
     spa_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "web" / "dist"

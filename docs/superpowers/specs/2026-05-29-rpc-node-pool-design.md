@@ -212,6 +212,8 @@ async def connect(self) -> None:
     await self._pool.call(lambda w3: w3.eth.block_number)  # health probe
 ```
 
+> **Implementer note**: `w3.eth.block_number` is an awaitable *property* (the current code does `await self._w3.eth.block_number`). The closure `lambda w3: w3.eth.block_number` returns that awaitable, which `asyncio.wait_for` then awaits — correct. Do NOT add `()` after `block_number` (it is not a method).
+
 Each HTTP RPC method delegates the bare RPC call through the pool, keeping `track_rpc` outermost and parsing OUTSIDE the closure (so a parse error is not mistaken for an endpoint failure):
 
 ```python
@@ -287,6 +289,8 @@ async def fetch_block(self, slot: int) -> SolanaBlock | None:
 
 `get_latest_slot` and `get_blocks` follow the same pattern (`getSlot` uses `solders` parsing, which stays outside the closure too — the closure returns the raw `resp.text` / parsed JSON and the adapter parses after).
 
+> **Implementer note**: `get_latest_slot` currently POSTs with `content=req.to_json()` (a solders `GetSlot` request serialized to JSON), NOT `json=payload`. Preserve that `content=...` form inside its closure — do not copy the `json=payload` shape shown for `getBlock`. The closure returns `resp.text`; `GetSlotResp.from_json(...)` parsing happens outside `pool.call`.
+
 `subscribe_heads` (Solana's slot poller) calls `get_latest_slot`, which is now pooled — it benefits automatically.
 
 `disconnect()` closes the shared httpx client (unchanged) and drops the pool reference.
@@ -336,9 +340,11 @@ def downgrade() -> None:
 
 `load_snapshot` reads the two new columns into the snapshot.
 
-### Repository (`core/config/repositories.py`)
+### Repository + router (`core/config/repositories.py`, `apps/web/routers/chains.py`)
 
-`ChainRepo.create` and `update` accept and pass through `rpc_http_fallbacks` and `rpc_timeout_ms` (same pattern as the existing `log_query_range_blocks` / `slot_query_range_blocks`).
+`ChainRepo.create` has a fixed signature — add `rpc_http_fallbacks` and `rpc_timeout_ms` params (same pattern as `log_query_range_blocks`). `ChainRepo.update(self, chain_id, **fields)` already accepts arbitrary kwargs, so it needs no signature change.
+
+The router endpoints enumerate each field explicitly (they do NOT splat the payload), so BOTH `create_chain` and `update_chain` in `apps/web/routers/chains.py` must thread the two new fields from the `ChainCreate` payload into the repo call.
 
 ### API schema (`apps/web/schemas.py`)
 
@@ -466,7 +472,8 @@ Mock endpoints are plain async callables receiving a fake handle. Control cooldo
 | `core/chains/solana.py` | `connect` builds pool (URL handles); RPC methods route through `pool.call`. |
 | `core/config/models.py` | Chain +`rpc_http_fallbacks`, +`rpc_timeout_ms`. |
 | `core/config/snapshot.py` | SnapshotChain +2 fields; `load_snapshot` reads them. |
-| `core/config/repositories.py` | ChainRepo create/update pass-through. |
+| `core/config/repositories.py` | ChainRepo.create signature +2 params; `update` already splats kwargs. |
+| `apps/web/routers/chains.py` | `create_chain` + `update_chain` thread the 2 new fields into the repo call (they enumerate fields explicitly, no payload splat). |
 | `apps/web/schemas.py` | ChainCreate/ChainOut +2 fields; ChainCreate dedup/non-empty validator. |
 | `apps/worker/main.py` | `_make_adapter_factory(settings)` closure passes endpoints + breaker params. |
 | `core/settings.py` | +`RpcPoolSettings`. |

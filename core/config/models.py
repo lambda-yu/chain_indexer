@@ -83,6 +83,12 @@ class Chain(Base, TimestampMixin):
     slot_query_range_blocks: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1000, server_default="1000"
     )
+    rpc_http_fallbacks: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    rpc_timeout_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10000, server_default="10000"
+    )
 
 
 class Abi(Base, TimestampMixin):

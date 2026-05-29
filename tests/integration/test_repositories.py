@@ -370,3 +370,41 @@ async def test_list_all_filters_by_status(db) -> None:
         assert only_success[0].status == "success"
         all_rows = await repo.list_all()
         assert len(all_rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_chain_rpc_pool_fields_round_trip(db) -> None:
+    from core.config.repositories import ChainRepo
+    async with db.session() as s:
+        repo = ChainRepo(s)
+        await repo.create(
+            id="eth-pool", kind=ChainKind.evm,
+            rpc_http="http://a", rpc_ws=None, confirmations=1, poll_interval_ms=1000,
+            enabled=True,
+            rpc_http_fallbacks=["http://b", "http://c"],
+            rpc_timeout_ms=5000,
+        )
+        await s.commit()
+    async with db.session() as s:
+        row = await ChainRepo(s).get("eth-pool")
+        assert row is not None
+        assert row.rpc_http_fallbacks == ["http://b", "http://c"]
+        assert row.rpc_timeout_ms == 5000
+
+
+@pytest.mark.asyncio
+async def test_chain_rpc_pool_fields_default_empty(db) -> None:
+    from core.config.repositories import ChainRepo
+    async with db.session() as s:
+        repo = ChainRepo(s)
+        await repo.create(
+            id="eth-nopool", kind=ChainKind.evm,
+            rpc_http="http://a", rpc_ws=None, confirmations=1, poll_interval_ms=1000,
+            enabled=True,
+        )
+        await s.commit()
+    async with db.session() as s:
+        row = await ChainRepo(s).get("eth-nopool")
+        assert row is not None
+        assert row.rpc_http_fallbacks == []
+        assert row.rpc_timeout_ms == 10000

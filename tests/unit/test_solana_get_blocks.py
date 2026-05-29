@@ -25,6 +25,8 @@ async def test_get_blocks_returns_valid_slots():
         return _FakeResp({"jsonrpc": "2.0", "id": 1, "result": [10, 12, 15]})
 
     adapter._client = type("C", (), {"post": staticmethod(fake_post)})()
+    from core.chains.rpc_pool import EndpointPool
+    adapter._pool = EndpointPool("sol", ["http://x"])
     out = await adapter.get_blocks(10, 20)
     assert out == [10, 12, 15]
     assert captured["json"]["method"] == "getBlocks"
@@ -43,5 +45,7 @@ async def test_get_blocks_returns_empty_list_when_result_null():
         return _FakeResp({"jsonrpc": "2.0", "id": 1, "result": None})
 
     adapter._client = type("C", (), {"post": staticmethod(fake_post)})()
+    from core.chains.rpc_pool import EndpointPool
+    adapter._pool = EndpointPool("sol", ["http://x"])
     out = await adapter.get_blocks(10, 20)
     assert out == []

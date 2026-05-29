@@ -11,6 +11,7 @@ from solders.rpc.config import RpcContextConfig
 from solders.rpc.requests import GetSlot
 from solders.rpc.responses import GetSlotResp
 
+from core.chains.rpc_pool import EndpointPool
 from core.chains.types import (
     SolanaBlock,
     SolanaInstruction,
@@ -36,37 +37,59 @@ class SolanaAdapter:
         commitment: str,
         poll_interval_ms: int = 2000,
         rpc_ws: str | None = None,
+        rpc_http_fallbacks: list[str] | None = None,
+        rpc_timeout_ms: int = 10000,
+        failure_threshold: int = 3,
+        cooldown_s: float = 30.0,
     ) -> None:
         self.chain_id = chain_id
-        self._rpc_url = rpc_http
+        self._http_urls = [rpc_http, *(rpc_http_fallbacks or [])]
         self._rpc_ws = rpc_ws
         self._commitment = _COMMITMENT_MAP[commitment]
         self._poll_interval_s = poll_interval_ms / 1000.0
+        self._rpc_timeout_s = rpc_timeout_ms / 1000.0
+        self._failure_threshold = failure_threshold
+        self._cooldown_s = cooldown_s
         self._client: httpx.AsyncClient | None = None
+        self._pool: EndpointPool[str] | None = None
 
     async def connect(self) -> None:
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=self._rpc_timeout_s)
+        self._pool = EndpointPool(
+            self.chain_id,
+            self._http_urls,
+            timeout_s=self._rpc_timeout_s,
+            failure_threshold=self._failure_threshold,
+            cooldown_s=self._cooldown_s,
+        )
 
     async def disconnect(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        self._pool = None
 
     async def get_latest_slot(self) -> int:
-        assert self._client is not None
+        assert self._client is not None and self._pool is not None
         async with track_rpc(self.chain_id, "getSlot"):
             req = GetSlot(RpcContextConfig(commitment=self._commitment))
-            resp = await self._client.post(
-                self._rpc_url,
-                content=req.to_json(),
-                headers={"content-type": "application/json"},
-            )
-            resp.raise_for_status()
-            parsed = GetSlotResp.from_json(resp.text)
+
+            async def _do(url: str) -> str:
+                assert self._client is not None
+                resp = await self._client.post(
+                    url,
+                    content=req.to_json(),
+                    headers={"content-type": "application/json"},
+                )
+                resp.raise_for_status()
+                return resp.text
+
+            text = await self._pool.call(_do)
+            parsed = GetSlotResp.from_json(text)
             return parsed.value  # type: ignore[union-attr]
 
     async def fetch_block(self, slot: int) -> SolanaBlock | None:
-        assert self._client is not None
+        assert self._client is not None and self._pool is not None
         async with track_rpc(self.chain_id, "getBlock"):
             config: dict[str, Any] = {
                 "commitment": str(self._commitment).lower(),
@@ -80,17 +103,21 @@ class SolanaAdapter:
                 "method": "getBlock",
                 "params": [slot, config],
             }
-            resp = await self._client.post(
-                self._rpc_url,
-                json=payload,
-                headers={"content-type": "application/json"},
-            )
-            resp.raise_for_status()
-            body = resp.json()
+
+            async def _do(url: str) -> dict[str, Any]:
+                assert self._client is not None
+                resp = await self._client.post(
+                    url,
+                    json=payload,
+                    headers={"content-type": "application/json"},
+                )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                return data
+
+            body = await self._pool.call(_do)
             result = body.get("result")
-            if result is None:
-                return None
-            return self._parse_block(slot, result)
+            return None if result is None else self._parse_block(slot, result)
 
     async def get_blocks(self, start_slot: int, end_slot: int) -> list[int]:
         """Return slots in [start_slot, end_slot] that contain confirmed blocks.
@@ -103,22 +130,27 @@ class SolanaAdapter:
         The caller is responsible for window sizing (per-chain
         `slot_query_range_blocks`); this method does not internally chunk.
         """
-        assert self._client is not None
+        assert self._client is not None and self._pool is not None
         async with track_rpc(self.chain_id, "getBlocks"):
             payload = {
                 "jsonrpc": "2.0", "id": 1,
                 "method": "getBlocks",
                 "params": [start_slot, end_slot, {"commitment": "finalized"}],
             }
-            resp = await self._client.post(
-                self._rpc_url,
-                json=payload,
-                headers={"content-type": "application/json"},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            result = body.get("result")
-            return list(result or [])
+
+            async def _do(url: str) -> dict[str, Any]:
+                assert self._client is not None
+                resp = await self._client.post(
+                    url,
+                    json=payload,
+                    headers={"content-type": "application/json"},
+                )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                return data
+
+            body = await self._pool.call(_do)
+            return list(body.get("result") or [])
 
     def _parse_block(self, slot: int, result: dict[str, Any]) -> SolanaBlock:
         txs: list[SolanaTransaction] = []

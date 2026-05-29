@@ -151,3 +151,25 @@ async def test_evm_per_block_metrics_advance_after_processing(monkeypatch) -> No
     after_gauge = CHAIN_LAST_PROCESSED_BLOCK.labels(chain="test-chain")._value.get()
     assert after_count - before_count == 1
     assert after_gauge == 42
+
+
+@pytest.mark.asyncio
+async def test_tracked_dispatch_increments_and_decrements_gauge() -> None:
+    """The wrapper helper must inc on entry and dec on exit (even on exception)."""
+    from apps.worker.chain_runner import _tracked_dispatch
+    from core.metrics import DISPATCH_IN_FLIGHT
+
+    notifier = MagicMock()
+    notifier.dispatch = AsyncMock()
+
+    before = DISPATCH_IN_FLIGHT._value.get()
+    await _tracked_dispatch(notifier, "event-stub", "hits-stub")
+    after = DISPATCH_IN_FLIGHT._value.get()
+    assert before == after  # net zero after success
+
+    notifier.dispatch = AsyncMock(side_effect=RuntimeError("boom"))
+    before = DISPATCH_IN_FLIGHT._value.get()
+    with pytest.raises(RuntimeError):
+        await _tracked_dispatch(notifier, "event-stub", "hits-stub")
+    after = DISPATCH_IN_FLIGHT._value.get()
+    assert before == after  # net zero after exception too

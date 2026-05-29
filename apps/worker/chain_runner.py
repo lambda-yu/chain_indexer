@@ -55,6 +55,16 @@ def _bucket_by_block(logs: list[Log]) -> dict[int, list[Log]]:
     return out
 
 
+async def _tracked_dispatch(notifier: Notifier, event: Any, hits: Any) -> None:
+    """Wrap notifier.dispatch() to maintain the DISPATCH_IN_FLIGHT gauge."""
+    from core.metrics import DISPATCH_IN_FLIGHT
+    DISPATCH_IN_FLIGHT.inc()
+    try:
+        await notifier.dispatch(event, hits)
+    finally:
+        DISPATCH_IN_FLIGHT.dec()
+
+
 class _CheckpointRepo(Protocol):
     async def get(self, chain_id: str) -> tuple[int, str] | None: ...
     async def save(self, chain_id: str, last_block: int, last_block_hash: str) -> None: ...
@@ -511,7 +521,7 @@ class ChainRunner:
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
             if hits:
-                dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+                dispatch_tasks.append(asyncio.create_task(_tracked_dispatch(notifier, event, hits)))
                 for sub, _ in hits:
                     matched_sub_ids.add(sub.id)
 
@@ -524,7 +534,7 @@ class ChainRunner:
                     for event in internal_parser.parse(traces, block):
                         hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
                         if hits:
-                            dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+                            dispatch_tasks.append(asyncio.create_task(_tracked_dispatch(notifier, event, hits)))
 
         if dispatch_tasks:
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
@@ -555,7 +565,7 @@ class ChainRunner:
         for event in events:
             hits = [(sub, chans) for sub, chans in matcher.match(event) if chans]
             if hits:
-                dispatch_tasks.append(asyncio.create_task(notifier.dispatch(event, hits)))
+                dispatch_tasks.append(asyncio.create_task(_tracked_dispatch(notifier, event, hits)))
                 for sub, _ in hits:
                     matched_sub_ids.add(sub.id)
         if dispatch_tasks:

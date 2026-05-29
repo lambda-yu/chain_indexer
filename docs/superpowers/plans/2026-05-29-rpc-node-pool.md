@@ -638,16 +638,48 @@ from core.chains.rpc_pool import EndpointPool
             # --- existing parse of raw_logs, unchanged ---
 ```
 
-For `trace_transaction` and `trace_block`: wrap the actual RPC call(s) with `self._pool.call(...)`, keeping the existing `track_rpc` labels. In `trace_block`, both the per-tx trace calls AND the internal `eth.get_block(number, full_transactions=True)` should go through `self._pool.call(...)`.
+For `trace_transaction` and `trace_block`: **keep them on `self._w3` (the primary), UNPOOLED.** Do not route them through `pool.call`. Rationale: `trace_transaction` returns `None` on a `-32601` (method-not-found) error — a *capability* signal, not a *health* signal. Routing it through the pool would mark a node that simply lacks `debug_traceTransaction` as "unhealthy" and waste a failover, polluting the circuit breaker. Tracing is an opt-in secondary feature (only runs when `trace_internal_calls=True`); the primary data path (`fetch_block`/`fetch_logs`) is pooled and that's what carries the resilience win. So leave `trace_transaction` / `trace_block` bodies referencing `self._w3` exactly as they are today (they already guard with `assert self._w3` / swallow errors to `None`).
+
+> This is a deliberate deviation from the spec's "trace_block's internal get_block also goes through the pool" line — the reviewer surfaced that pooling trace would corrupt breaker health on `-32601`. Keeping trace on the primary is the correct call. Note it in the commit message.
 
 > **Critical**: only the bare RPC awaitable goes inside `pool.call`. All parsing/dataclass construction stays OUTSIDE so a parse error isn't mistaken for an endpoint failure.
 
 `_poll_heads` and `_subscribe_heads_ws` are UNCHANGED — they keep using `self._w3` (primary) / their own WS provider.
 
+- [ ] **Step 3b: Migrate existing EVM unit tests that set `_w3` directly**
+
+These existing tests set `adapter._w3 = <stub>` and then call methods that now route through `self._pool`, so they need a single-endpoint pool injected. The stub is the SAME object in both, so readbacks via `adapter._w3` still observe calls made through the pool.
+
+In `tests/unit/test_evm_fetch_logs_topics.py` — BOTH tests: after `adapter._w3 = _StubW3()`, add:
+
+```python
+    from core.chains.rpc_pool import EndpointPool
+    adapter._pool = EndpointPool("x", [adapter._w3])  # type: ignore[arg-type]
+```
+
+In `tests/unit/test_evm_adapter_metrics.py`:
+
+- `test_get_latest_block_number_records_rpc_metric`: after `type(adapter._w3.eth).block_number = property(lambda self: _bn())`, add:
+  ```python
+      from core.chains.rpc_pool import EndpointPool
+      adapter._pool = EndpointPool("test-eth", [adapter._w3])  # type: ignore[arg-type]
+  ```
+  The success-counter assertion is unchanged (still 1).
+
+- `test_rpc_error_records_error_status`: inject the pool the same way. **Also change the expected exception**: with a single endpoint that raises, `pool.call` re-raises as `AllEndpointsFailed` (not the bare `RuntimeError`). Change `with pytest.raises(RuntimeError):` to:
+  ```python
+      from core.chains.rpc_pool import AllEndpointsFailed
+      with pytest.raises(AllEndpointsFailed):
+          await adapter.get_latest_block_number()
+  ```
+  The `error`-counter assertion is unchanged — `track_rpc` records `status="error"` for any exception, including `AllEndpointsFailed`.
+
+(The new `test_fetch_block_fails_over_transparently` already injects its own `_pool`, so it needs no change.)
+
 - [ ] **Step 4: Run the new test + existing EVM tests**
 
 Run: `uv run pytest tests/unit/test_evm_adapter_metrics.py tests/integration/test_evm_adapter.py tests/unit/test_evm_catchup_range.py tests/unit/test_evm_fetch_logs_topics.py tests/unit/test_evm_fetch_logs_degrade.py -v`
-Expected: all PASS. The single-endpoint integration tests must pass unchanged (pool with one endpoint = equivalent behavior + timeout).
+Expected: all PASS — the unit tests that set `_w3` now also inject a single-endpoint pool (Step 3b); the integration tests use real single-endpoint config (pool with one endpoint = equivalent behavior + timeout).
 
 - [ ] **Step 5: Lint + type-check**
 
@@ -833,11 +865,26 @@ from core.chains.rpc_pool import EndpointPool
         self._pool = None
 ```
 
+- [ ] **Step 3b: Migrate existing Solana unit tests that set `_client` directly**
+
+These set `adapter._client` and call methods now routed through `self._pool`, so inject a single-endpoint pool. The closures call `self._client.post(url, ...)` with the pool-supplied URL, so the existing `fake_post(url, ...)` stubs still work.
+
+In `tests/unit/test_solana_get_blocks.py` — BOTH tests: after `adapter._client = ...`, add:
+
+```python
+    from core.chains.rpc_pool import EndpointPool
+    adapter._pool = EndpointPool("sol", ["http://x"])
+```
+
+In `tests/unit/test_solana_adapter_metrics.py` — `test_get_latest_slot_records_rpc_metric`: after `adapter._client = MagicMock()` (with `.post` set), add the same pool injection with the test's chain_id (`"test-sol"`) and a `["http://x"]` URL list.
+
+(The new `test_get_blocks_fails_over_transparently` injects its own `_pool`.)
+
 - [ ] **Step 4: Run the new test + existing Solana tests**
 
-Run: `uv run pytest tests/unit/test_solana_adapter_metrics.py -v`
+Run: `uv run pytest tests/unit/test_solana_adapter_metrics.py tests/unit/test_solana_get_blocks.py -v`
 Run: `uv run pytest tests/ -m "not e2e" -k solana -v`
-Expected: all PASS.
+Expected: all PASS — existing tests now inject a single-endpoint pool (Step 3b).
 
 - [ ] **Step 5: Lint + type-check**
 

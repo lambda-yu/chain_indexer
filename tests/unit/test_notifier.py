@@ -244,3 +244,48 @@ async def test_on_success_receives_attempts_one() -> None:
     finally:
         await notifier.stop()
     assert captured == [1]
+
+
+@pytest.mark.asyncio
+async def test_channel_send_metric_records_on_success() -> None:
+    from core.metrics import CHANNEL_SENDS_TOTAL
+
+    before = CHANNEL_SENDS_TOTAL.labels("collect-notifier", "success")._value.get()
+    notifier = Notifier(
+        channel_factory=lambda cfg: _CollectingChannel(),
+        max_concurrency=10,
+    )
+    await notifier.start([_ch("c-ok")])
+    try:
+        await notifier.dispatch(_event(), [(_sub(["c-ok"]), [_ch("c-ok")])])
+    finally:
+        await notifier.stop()
+    after = CHANNEL_SENDS_TOTAL.labels("collect-notifier", "success")._value.get()
+    assert after - before == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_send_metric_records_on_failure() -> None:
+    from core.metrics import CHANNEL_SENDS_TOTAL
+
+    class _Boom(Channel):
+        type = "boom-metric"
+        config_schema: dict = {}
+
+        async def start(self) -> None: ...
+        async def stop(self) -> None: ...
+        async def send(self, payload: dict[str, Any]) -> None:
+            raise RuntimeError("dead")
+
+    before = CHANNEL_SENDS_TOTAL.labels("boom-metric", "failed")._value.get()
+    notifier = Notifier(
+        channel_factory=lambda cfg: _Boom(),
+        max_concurrency=10,
+    )
+    await notifier.start([_ch("c-boom-m")])
+    try:
+        await notifier.dispatch(_event(), [(_sub(["c-boom-m"]), [_ch("c-boom-m")])])
+    finally:
+        await notifier.stop()
+    after = CHANNEL_SENDS_TOTAL.labels("boom-metric", "failed")._value.get()
+    assert after - before == 1

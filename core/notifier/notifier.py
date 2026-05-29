@@ -85,9 +85,16 @@ class Notifier:
     async def _send_one(
         self, ch: Channel, payload: dict[str, Any], subscription_id: str, channel_id: str
     ) -> None:
+        import time
+
+        from core.metrics import CHANNEL_SEND_SECONDS, CHANNEL_SENDS_TOTAL
+
+        t0 = time.perf_counter()
+        send_status = "failed"  # pessimistic default
         async with self._get_sem():
             try:
                 await ch.send(payload)
+                send_status = "success"
                 if self._on_success:
                     try:
                         await self._on_success(
@@ -116,3 +123,6 @@ class Notifier:
                         )
                     except Exception:  # noqa: BLE001
                         log.error("notifier.on_failure_callback_error")
+            finally:
+                CHANNEL_SEND_SECONDS.labels(ch.type).observe(time.perf_counter() - t0)
+                CHANNEL_SENDS_TOTAL.labels(ch.type, send_status).inc()

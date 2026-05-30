@@ -123,3 +123,31 @@ async def bind_channel(
         raise HTTPException(status_code=409, detail="channel already bound") from e
     await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="bind_channel")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{sub_id}/pause", status_code=status.HTTP_200_OK)
+async def pause_subscription(
+    sub_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> dict[str, str]:
+    repo = SubscriptionRepo(session)
+    if await repo.get(sub_id) is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    await repo.update(sub_id, enabled=False)
+    await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="pause")
+    return {"status": "paused", "id": sub_id}
+
+
+@router.post("/{sub_id}/resume", status_code=status.HTTP_200_OK)
+async def resume_subscription(
+    sub_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> dict[str, str]:
+    repo = SubscriptionRepo(session)
+    if await repo.get(sub_id) is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    await repo.update(sub_id, enabled=True)
+    await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="resume")
+    return {"status": "resumed", "id": sub_id}

@@ -55,6 +55,10 @@ class DeliveryRecordsSettings(BaseModel):
     cleanup_batch_size: int = 1000
 
 
+class ReplaySettings(BaseModel):
+    max_replay_blocks: int = 10000
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CHAIN_INDEXER_",
@@ -72,6 +76,7 @@ class Settings(BaseSettings):
     delivery_records: DeliveryRecordsSettings = Field(default_factory=DeliveryRecordsSettings)
     metrics: MetricsSettings = Field(default_factory=MetricsSettings)
     rpc_pool: RpcPoolSettings = Field(default_factory=RpcPoolSettings)
+    replay: ReplaySettings = Field(default_factory=ReplaySettings)
 
     @classmethod
     def settings_customise_sources(

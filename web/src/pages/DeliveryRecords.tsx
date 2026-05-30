@@ -7,7 +7,7 @@ import { RefreshCw, Check, Trash2, ChevronDown, ChevronRight, Inbox, X } from 'l
 interface DeliveryRecord {
   id: string; subscription_id: string; channel_id: string; chain_id: string
   event_payload: Record<string, unknown>; error: string | null; attempts: number
-  status: string; created_at: string; resolved_at: string | null
+  status: string; created_at: string; resolved_at: string | null; is_replay: boolean
 }
 
 interface SubItem { id: string; name: string }
@@ -113,6 +113,7 @@ export default function DeliveryRecords() {
                 <div className="flex items-center gap-2 px-3 py-2 cursor-pointer" onClick={() => toggle(item.id)}>
                   {expanded.has(item.id) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                   <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${m.chip}`}>{m.label}</span>
+                  {item.is_replay && <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-100 text-purple-700">重放</span>}
                   <span className="text-sm font-mono truncate max-w-40">{item.subscription_id.slice(0, 8)}...</span>
                   <span className="text-xs text-gray-400">→</span>
                   <span className="text-sm font-mono truncate max-w-40">{item.channel_id.slice(0, 8)}...</span>

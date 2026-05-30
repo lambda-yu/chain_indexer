@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { api } from '@/api/client'
-import { Plus, Trash2, Pencil, FlaskConical, Pause, Play } from 'lucide-react'
+import { Plus, Trash2, Pencil, FlaskConical, Pause, Play, History } from 'lucide-react'
 
 interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null; last_processed_block: number | null }
 interface AbiItem { id: string; name: string; kind: string; body: unknown }
@@ -12,6 +12,7 @@ export default function Subscriptions() {
   const [editing, setEditing] = useState<Sub | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [testingSub, setTestingSub] = useState<Sub | null>(null)
+  const [replayFor, setReplayFor] = useState<Sub | null>(null)
   const { data: subs = [], isLoading } = useQuery<Sub[]>({ queryKey: ['subscriptions'], queryFn: () => api.get('/subscriptions') })
   const { data: abis = [] } = useQuery<AbiItem[]>({ queryKey: ['abis'], queryFn: () => api.get('/abis') })
   const { data: allChannels = [] } = useQuery<{ id: string; name: string; type: string }[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
@@ -20,6 +21,10 @@ export default function Subscriptions() {
     mutationFn: ({ id, action }: { id: string; action: 'pause' | 'resume' }) =>
       api.post(`/subscriptions/${id}/${action}`, {}),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['subscriptions'] }),
+  })
+  const replayMut = useMutation({
+    mutationFn: ({ id, from_block, to_block }: { id: string; from_block: number; to_block: number }) =>
+      api.post(`/subscriptions/${id}/replay`, { from_block, to_block }),
   })
 
   const abiNameMap = useMemo(() => Object.fromEntries(abis.map(a => [a.id, a.name])), [abis])
@@ -63,6 +68,7 @@ export default function Subscriptions() {
                 {s.enabled
                   ? <button onClick={() => pauseMut.mutate({ id: s.id, action: 'pause' })} className="text-amber-600 hover:text-amber-800" title="暂停"><Pause size={14} /></button>
                   : <button onClick={() => pauseMut.mutate({ id: s.id, action: 'resume' })} className="text-green-600 hover:text-green-800" title="恢复"><Play size={14} /></button>}
+                <button onClick={() => setReplayFor(s)} className="text-blue-500 hover:text-blue-700" title="重放"><History size={14} /></button>
                 <button onClick={() => delMut.mutate(s.id)} className="text-red-500 hover:text-red-700" title="删除"><Trash2 size={14} /></button>
               </td>
             </tr>
@@ -71,6 +77,28 @@ export default function Subscriptions() {
       )}
       {showForm && <SubForm initial={editing} abis={abis} onClose={() => { setShowForm(false); setEditing(null) }} />}
       {testingSub && <TestSubModal sub={testingSub} onClose={() => setTestingSub(null)} />}
+      {replayFor && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <form onSubmit={(e) => {
+            e.preventDefault(); const fd = new FormData(e.currentTarget)
+            replayMut.mutate({
+              id: replayFor.id,
+              from_block: Number(fd.get('from_block')),
+              to_block: Number(fd.get('to_block')),
+            }, { onSuccess: () => setReplayFor(null) })
+          }} className="bg-white rounded-lg p-6 w-80 space-y-3">
+            <h3 className="text-lg font-bold">重放订阅「{replayFor.name}」</h3>
+            <input name="from_block" type="number" placeholder="起始区块" required className="w-full border rounded px-3 py-1.5 text-sm" />
+            <input name="to_block" type="number" placeholder="结束区块" required className="w-full border rounded px-3 py-1.5 text-sm" />
+            <div className="flex gap-2 pt-2">
+              <button type="button" onClick={() => setReplayFor(null)} className="flex-1 border rounded py-1.5 text-sm">取消</button>
+              <button type="submit" className="flex-1 bg-black text-white rounded py-1.5 text-sm">提交重放</button>
+            </div>
+            {replayMut.isError && <p className="text-red-500 text-xs">{String(replayMut.error)}</p>}
+            {replayMut.isSuccess && <p className="text-green-600 text-xs">已接受，后台处理中</p>}
+          </form>
+        </div>
+      )}
     </div>
   )
 }

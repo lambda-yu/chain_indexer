@@ -152,7 +152,7 @@ async def replay_subscription(
             "address": sub.address, "abi_id": sub.abi_id,
             "match_kind": sub.match_kind.value, "match_name": sub.match_name,
             "arg_filters": sub.arg_filters, "enabled": True,  # force-true for replay matcher
-            "channel_ids": channel_ids, "start_block": sub.start_block,
+            "channel_ids": channel_ids, "start_block": None,  # replay range is authoritative; see note
         },
         "channels": channels,
         "from_block": payload.from_block,
@@ -164,7 +164,11 @@ async def replay_subscription(
     }
 ```
 
-The `subscription` dict mirrors `SnapshotSubscription` fields (including `channel_ids` and a force-`enabled=True` so the replay matcher always indexes it regardless of the live pause state). The `channels` list mirrors `SnapshotChannel`. The message is self-contained — the runner rebuilds config from it, not from the live snapshot.
+The `subscription` dict mirrors `SnapshotSubscription` fields (including `channel_ids`). Two fields are overridden for replay:
+- `enabled: True` — so the replay matcher always indexes the sub regardless of the live pause state.
+- `start_block: None` — the operator-specified `[from_block, to_block]` is the authoritative replay bound. If we passed the sub's real `start_block`, the `Matcher` (which drops events where `block_number < sub.start_block`) would silently discard replayed events earlier than `start_block`, surprising the operator who asked for that exact range. Setting `None` disables that gate for replay.
+
+The `channels` list mirrors `SnapshotChannel`. The message is self-contained — the runner rebuilds config from it, not from the live snapshot.
 
 `to_block ≤ tip` is NOT validated here (the web process has no chain adapter); the worker clamps it (Component 4).
 

@@ -145,6 +145,7 @@ class _Worker:
                     error=error,
                     attempts=attempts,
                     status="failed",
+                    is_replay=bool(payload.get("replay", False)),
                 )
                 await s.commit()
         except Exception as exc:  # noqa: BLE001
@@ -163,6 +164,7 @@ class _Worker:
                     chain_id=chain_id,
                     event_payload=payload,
                     status="success",
+                    is_replay=bool(payload.get("replay", False)),
                 )
                 await s.commit()
         except Exception as exc:  # noqa: BLE001

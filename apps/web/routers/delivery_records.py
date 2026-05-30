@@ -27,6 +27,7 @@ class DeliveryRecordOut(BaseModel):
     error: str | None
     attempts: int
     status: str
+    is_replay: bool
     created_at: datetime
     resolved_at: datetime | None
 

@@ -429,3 +429,19 @@ async def test_delivery_record_is_replay_round_trip(db) -> None:
         repo = DeliveryRecordRepo(s)
         assert (await repo.get(id1)).is_replay is True
         assert (await repo.get(id2)).is_replay is False
+
+
+@pytest.mark.asyncio
+async def test_worker_callback_marks_is_replay(db) -> None:
+    from apps.worker.main import _Worker
+    from core.settings import Settings
+    from core.config.repositories import DeliveryRecordRepo
+
+    worker = _Worker(Settings())
+    worker._db = db  # reuse the test DB
+    await worker._on_delivery_success(
+        "sub", "ch", "eth", {"replay": True}, None, 1,
+    )
+    async with db.session() as s:
+        rows = await DeliveryRecordRepo(s).list_all(limit=10)
+        assert any(r.is_replay for r in rows)

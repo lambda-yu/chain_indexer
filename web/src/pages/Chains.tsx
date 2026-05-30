@@ -7,6 +7,7 @@ interface Chain {
   id: string; kind: string; rpc_http: string; rpc_ws: string | null
   confirmations: number; poll_interval_ms: number; commitment: string | null
   trace_internal_calls: boolean | null; enabled: boolean
+  rpc_http_fallbacks?: string[]; rpc_timeout_ms?: number
 }
 
 export default function Chains() {
@@ -58,7 +59,9 @@ function ChainForm({ initial, onClose }: { initial: Chain | null; onClose: () =>
   const mut = isEdit ? updateMut : createMut
   const submit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault(); const fd = new FormData(e.currentTarget)
-    mut.mutate({ id: fd.get('id') || initial?.id, kind, rpc_http: fd.get('rpc_http'), rpc_ws: fd.get('rpc_ws') || null, confirmations: kind === 'evm' ? Number(fd.get('confirmations')) : 0, commitment: kind === 'solana' ? fd.get('commitment') : null, poll_interval_ms: Number(fd.get('poll_interval_ms')), enabled: fd.get('enabled') === 'on' })
+    const rpc_http_fallbacks = String(fd.get('rpc_http_fallbacks') ?? '')
+      .split('\n').map(s => s.trim()).filter(Boolean)
+    mut.mutate({ id: fd.get('id') || initial?.id, kind, rpc_http: fd.get('rpc_http'), rpc_ws: fd.get('rpc_ws') || null, confirmations: kind === 'evm' ? Number(fd.get('confirmations')) : 0, commitment: kind === 'solana' ? fd.get('commitment') : null, poll_interval_ms: Number(fd.get('poll_interval_ms')), rpc_http_fallbacks, rpc_timeout_ms: Number(fd.get('rpc_timeout_ms')) || 10000, enabled: fd.get('enabled') === 'on' })
   }
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
@@ -67,7 +70,9 @@ function ChainForm({ initial, onClose }: { initial: Chain | null; onClose: () =>
         <input name="id" defaultValue={initial?.id ?? ''} placeholder="链 ID（如 eth-mainnet）" required disabled={isEdit} className="w-full border rounded px-3 py-1.5 text-sm disabled:bg-gray-100" />
         <div className="flex gap-2">{(['evm','solana'] as const).map(k => <button key={k} type="button" onClick={() => !isEdit && setKind(k)} className={`flex-1 py-1.5 rounded text-sm ${kind===k?'bg-black text-white':'border'} ${isEdit?'opacity-60':''}`}>{k.toUpperCase()}</button>)}</div>
         <input name="rpc_http" defaultValue={initial?.rpc_http ?? ''} placeholder="RPC HTTP 地址" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <textarea name="rpc_http_fallbacks" defaultValue={(initial?.rpc_http_fallbacks ?? []).join('\n')} placeholder="备用 RPC HTTP 地址（每行一个，可选）" rows={2} className="w-full border rounded px-3 py-1.5 text-sm font-mono" />
         <input name="rpc_ws" defaultValue={initial?.rpc_ws ?? ''} placeholder="RPC WS 地址（可选）" className="w-full border rounded px-3 py-1.5 text-sm" />
+        <input name="rpc_timeout_ms" type="number" defaultValue={initial?.rpc_timeout_ms ?? 10000} placeholder="单请求超时 (ms)" className="w-full border rounded px-3 py-1.5 text-sm" />
         {kind === 'evm' ? <input name="confirmations" type="number" defaultValue={initial?.confirmations ?? 12} className="w-full border rounded px-3 py-1.5 text-sm" /> : <select name="commitment" defaultValue={initial?.commitment ?? 'confirmed'} className="w-full border rounded px-3 py-1.5 text-sm"><option value="confirmed">confirmed</option><option value="finalized">finalized</option></select>}
         <input name="poll_interval_ms" type="number" defaultValue={initial?.poll_interval_ms ?? 3000} placeholder="轮询间隔 (ms)" className="w-full border rounded px-3 py-1.5 text-sm" />
         <label className="flex items-center gap-2 text-sm"><input name="enabled" type="checkbox" defaultChecked={initial?.enabled ?? true} /> 启用</label>

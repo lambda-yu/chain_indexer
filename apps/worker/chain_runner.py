@@ -13,6 +13,7 @@ from core.config.snapshot import (
     ConfigSnapshot,
     SnapshotChain,
     SnapshotChannel,
+    SnapshotSubscription,
 )
 from core.matcher.filter_set import EvmLogFilterSet, build_evm_log_filter
 from core.matcher.matcher import Matcher
@@ -195,6 +196,97 @@ class ChainRunner:
                 chain_id=self._chain.id,
                 version=snap.version,
             )
+
+    async def replay(self, msg: dict[str, Any]) -> None:
+        sub = SnapshotSubscription(**msg["subscription"])
+        channels = [SnapshotChannel(**c) for c in msg["channels"]]
+        one = ConfigSnapshot(
+            version=-1, chains=[], subscriptions=[sub], channels=channels, abis=[],
+        )
+        matcher = Matcher(one)
+        notifier = Notifier(
+            channel_factory=self._channel_factory,
+            max_concurrency=self._notifier_max_concurrency,
+            on_failure=self._on_send_failure,
+            on_success=self._on_send_success,
+        )
+        await notifier.start(channels)
+        try:
+            if self._chain.kind == "solana":
+                await self._replay_solana(msg, sub, matcher, notifier)
+            else:
+                await self._replay_evm(msg, sub, matcher, notifier)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "chain_runner.replay_failed",
+                chain_id=self._chain.id, request_id=msg.get("request_id"),
+            )
+        finally:
+            await notifier.stop()
+
+    async def _replay_evm(
+        self, msg: dict[str, Any], sub: SnapshotSubscription,
+        matcher: Matcher, notifier: Notifier,
+    ) -> None:
+        from dataclasses import replace
+
+        one = ConfigSnapshot(version=-1, chains=[], subscriptions=[sub], channels=[], abis=[])
+        log_filter = build_evm_log_filter(one, self._chain.id, self._abi_registry)
+        from_block = msg["from_block"]
+        tip = await self._adapter.get_latest_block_number()
+        to_block = min(msg["to_block"], tip - self._chain.confirmations)
+        if to_block < from_block:
+            log.warning("chain_runner.replay_nothing_to_do",
+                        request_id=msg.get("request_id"),
+                        from_block=from_block, to_block=to_block)
+            return
+        log.info("chain_runner.replay_starting", request_id=msg.get("request_id"),
+                 sub=sub.id, from_block=from_block, to_block=to_block)
+        n = from_block
+        while n <= to_block:
+            if self._stop.is_set():
+                break
+            block = await self._adapter.fetch_block(n)
+            logs = [] if log_filter.skip_logs else await self._adapter.fetch_logs(
+                n, n, addresses=log_filter.addresses, topics=log_filter.topics_param)
+            block = replace(block, logs=logs)
+            assert self._evm_pipeline is not None
+            for event in self._evm_pipeline.run(block):
+                hits = [(s, ch) for s, ch in matcher.match(event) if ch]
+                if hits:
+                    await notifier.dispatch(event, hits, replay=True)
+            n += 1
+        log.info("chain_runner.replay_done", request_id=msg.get("request_id"),
+                 blocks=to_block - from_block + 1)
+
+    async def _replay_solana(
+        self, msg: dict[str, Any], sub: SnapshotSubscription,
+        matcher: Matcher, notifier: Notifier,
+    ) -> None:
+        from_slot = msg["from_block"]
+        tip = await self._adapter.get_latest_slot()
+        to_slot = min(msg["to_block"], tip)
+        if to_slot < from_slot:
+            log.warning("chain_runner.replay_nothing_to_do",
+                        request_id=msg.get("request_id"),
+                        from_block=from_slot, to_block=to_slot)
+            return
+        log.info("chain_runner.replay_starting", request_id=msg.get("request_id"),
+                 sub=sub.id, from_block=from_slot, to_block=to_slot)
+        s = from_slot
+        while s <= to_slot:
+            if self._stop.is_set():
+                break
+            block = await self._adapter.fetch_block(s)
+            if block is not None:
+                assert self._solana_pipeline is not None
+                for event in self._solana_pipeline.run(block):
+                    hits = [(sub_, ch) for sub_, ch in matcher.match(event) if ch]
+                    if hits:
+                        await notifier.dispatch(event, hits, replay=True)
+            s += 1
+        log.info("chain_runner.replay_done", request_id=msg.get("request_id"),
+                 blocks=to_slot - from_slot + 1)
 
     async def run(self) -> None:
         assert self._adapter is not None

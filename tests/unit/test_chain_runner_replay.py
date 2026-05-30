@@ -7,6 +7,10 @@ import pytest
 from core.chains.types import Block, BlockHeader
 
 
+def _hdr(n: int) -> BlockHeader:
+    return BlockHeader(number=n, hash=f"0x{n}", parent_hash="0x0", timestamp=0)
+
+
 def _build_evm_runner():
     from apps.worker.chain_runner import ChainRunner
     from core.config.snapshot import SnapshotChain
@@ -44,8 +48,7 @@ async def test_replay_dispatches_with_replay_flag_and_no_checkpoint(monkeypatch)
     runner = _build_evm_runner()
     adapter = MagicMock()
     adapter.get_latest_block_number = AsyncMock(return_value=1000)
-    hdr = lambda n: BlockHeader(number=n, hash=f"0x{n}", parent_hash="0x0", timestamp=0)
-    adapter.fetch_block = AsyncMock(side_effect=lambda n: Block(header=hdr(n), txs=[], logs=[]))
+    adapter.fetch_block = AsyncMock(side_effect=lambda n: Block(header=_hdr(n), txs=[], logs=[]))
     adapter.fetch_logs = AsyncMock(return_value=[])
     runner._adapter = adapter
     runner._abi_registry = MagicMock()
@@ -71,17 +74,19 @@ async def test_replay_clamps_to_safe_tip(monkeypatch) -> None:
     runner = _build_evm_runner()
     adapter = MagicMock()
     adapter.get_latest_block_number = AsyncMock(return_value=15)  # safe_tip = 15 - 1 = 14
-    hdr = lambda n: BlockHeader(number=n, hash=f"0x{n}", parent_hash="0x0", timestamp=0)
-    adapter.fetch_block = AsyncMock(side_effect=lambda n: Block(header=hdr(n), txs=[], logs=[]))
+    adapter.fetch_block = AsyncMock(side_effect=lambda n: Block(header=_hdr(n), txs=[], logs=[]))
     adapter.fetch_logs = AsyncMock(return_value=[])
     runner._adapter = adapter
     runner._abi_registry = MagicMock()
-    runner._cp = MagicMock(); runner._cp.save = AsyncMock()
+    runner._cp = MagicMock()
+    runner._cp.save = AsyncMock()
     runner._channel_factory = lambda c: MagicMock()
-    runner._evm_pipeline = MagicMock(); runner._evm_pipeline.run = MagicMock(return_value=[])
+    runner._evm_pipeline = MagicMock()
+    runner._evm_pipeline.run = MagicMock(return_value=[])
 
     import apps.worker.chain_runner as mod
-    fake_filter = MagicMock(); fake_filter.skip_logs = True
+    fake_filter = MagicMock()
+    fake_filter.skip_logs = True
     monkeypatch.setattr(mod, "build_evm_log_filter", lambda *a, **k: fake_filter)
 
     await runner.replay(_replay_msg(10, 100))

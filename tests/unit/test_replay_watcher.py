@@ -51,6 +51,7 @@ async def test_replay_watcher_survives_callback_error() -> None:
 @pytest.mark.asyncio
 async def test_on_replay_request_routes_to_runner() -> None:
     from unittest.mock import AsyncMock, MagicMock
+
     from apps.worker.main import _Worker
     from core.settings import Settings
 

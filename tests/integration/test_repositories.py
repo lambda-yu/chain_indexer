@@ -434,8 +434,8 @@ async def test_delivery_record_is_replay_round_trip(db) -> None:
 @pytest.mark.asyncio
 async def test_worker_callback_marks_is_replay(db) -> None:
     from apps.worker.main import _Worker
-    from core.settings import Settings
     from core.config.repositories import DeliveryRecordRepo
+    from core.settings import Settings
 
     worker = _Worker(Settings())
     worker._db = db  # reuse the test DB

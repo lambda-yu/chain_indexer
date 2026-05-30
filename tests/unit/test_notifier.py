@@ -289,3 +289,23 @@ async def test_channel_send_metric_records_on_failure() -> None:
         await notifier.stop()
     after = CHANNEL_SENDS_TOTAL.labels("boom-metric", "failed")._value.get()
     assert after - before == 1
+
+
+def test_build_payload_replay_flag() -> None:
+    from core.notifier.payload import build_payload
+    sub = _sub([])
+    ev = _event()
+    assert "replay" not in build_payload(event=ev, subscription=sub)
+    assert build_payload(event=ev, subscription=sub, replay=True)["replay"] is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_threads_replay_to_payload() -> None:
+    ch = _CollectingChannel()
+    notifier = Notifier(channel_factory=lambda cfg: ch, max_concurrency=10)
+    await notifier.start([_ch("c1")])
+    try:
+        await notifier.dispatch(_event(), [(_sub(["c1"]), [_ch("c1")])], replay=True)
+    finally:
+        await notifier.stop()
+    assert ch.calls[0]["replay"] is True

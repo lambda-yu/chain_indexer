@@ -28,8 +28,10 @@ def _safe(obj: Any) -> Any:
     return str(obj)
 
 
-def build_payload(*, event: Event, subscription: SnapshotSubscription) -> dict[str, Any]:
-    return {
+def build_payload(
+    *, event: Event, subscription: SnapshotSubscription, replay: bool = False
+) -> dict[str, Any]:
+    payload = {
         "subscription_id": subscription.id,
         "subscription_name": subscription.name,
         "chain_id": event.chain_id,
@@ -48,3 +50,6 @@ def build_payload(*, event: Event, subscription: SnapshotSubscription) -> dict[s
         "delivered_at": _now_unix(),
         "delivery_id": _gen_id(),
     }
+    if replay:
+        payload["replay"] = True
+    return payload

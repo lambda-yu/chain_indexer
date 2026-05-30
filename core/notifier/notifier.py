@@ -64,11 +64,13 @@ class Notifier:
         self,
         event: Event,
         hits: Sequence[tuple[SnapshotSubscription, Sequence[SnapshotChannel]]],
+        *,
+        replay: bool = False,
     ) -> None:
         """Build one payload per (sub, channel) pair and send concurrently."""
         tasks: list[asyncio.Task[None]] = []
         for sub, chans in hits:
-            payload = build_payload(event=event, subscription=sub)
+            payload = build_payload(event=event, subscription=sub, replay=replay)
             for ch_cfg in chans:
                 ch = self._channels.get(ch_cfg.id)
                 if ch is None:

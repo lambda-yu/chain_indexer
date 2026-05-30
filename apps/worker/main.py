@@ -3,14 +3,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+import uuid as _uuid_mod
 from collections.abc import Callable
+from typing import Any
 
 import structlog
 
-import uuid as _uuid_mod
-
 from apps.worker.chain_runner import ChainRunner
 from apps.worker.config_watcher import ConfigWatcher
+from apps.worker.replay_watcher import ReplayWatcher
 from core.abi.registry import AbiRegistry
 from core.bus.redis_bus import RedisBus
 from core.chains.evm import EvmAdapter
@@ -123,6 +124,7 @@ class _Worker:
         self._registry = AbiRegistry()
         self._snap_queue: asyncio.Queue[ConfigSnapshot] = asyncio.Queue(maxsize=8)
         self._watcher: ConfigWatcher | None = None
+        self._replay_watcher: ReplayWatcher | None = None
         self._runners: dict[str, tuple[ChainRunner, asyncio.Task[None]]] = {}
         self._locks: dict[str, Any] = {}
         self._worker_id = str(_uuid_mod.uuid4())[:8]
@@ -180,6 +182,20 @@ class _Worker:
                 await s.commit()
         except Exception:  # noqa: BLE001
             pass
+
+    async def _on_replay_request(self, msg: dict[str, Any]) -> None:
+        chain_id = msg.get("chain_id")
+        entry = self._runners.get(chain_id) if chain_id is not None else None
+        if entry is None:
+            log.warning(
+                "worker.replay_no_runner",
+                chain_id=chain_id, request_id=msg.get("request_id"),
+            )
+            return
+        runner, _ = entry
+        asyncio.create_task(
+            runner.replay(msg), name=f"replay:{msg.get('request_id')}",
+        )
 
     async def _publish_tip(self, chain_id: str, block_number: int) -> None:
         """Write chain:{chain_id}:tip to Redis (TTL 60s) for the web's /lag endpoint.
@@ -243,6 +259,10 @@ class _Worker:
             poll_interval_s=5.0,
         )
         await self._watcher.start()
+        self._replay_watcher = ReplayWatcher(
+            bus=self._bus, on_replay=self._on_replay_request,
+        )
+        await self._replay_watcher.start()
         # Prometheus metrics server (daemon thread; survives until process exit)
         if self._settings.metrics.enabled:
             from importlib.metadata import PackageNotFoundError
@@ -375,6 +395,8 @@ class _Worker:
             self._cleanup_task = None
         if self._watcher is not None:
             await self._watcher.stop()
+        if self._replay_watcher is not None:
+            await self._replay_watcher.stop()
         if self._runners:
             await asyncio.gather(
                 *(self._stop_runner(cid) for cid in list(self._runners)),

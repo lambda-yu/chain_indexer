@@ -53,6 +53,7 @@ async def test_rpc_error_records_error_status() -> None:
 @pytest.mark.asyncio
 async def test_fetch_block_fails_over_transparently() -> None:
     from unittest.mock import AsyncMock, MagicMock
+
     from core.chains.evm import EvmAdapter
     from core.chains.rpc_pool import EndpointPool
 

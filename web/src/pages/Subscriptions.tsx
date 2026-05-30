@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { api } from '@/api/client'
-import { Plus, Trash2, Pencil, FlaskConical } from 'lucide-react'
+import { Plus, Trash2, Pencil, FlaskConical, Pause, Play } from 'lucide-react'
 
 interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null; last_processed_block: number | null }
 interface AbiItem { id: string; name: string; kind: string; body: unknown }
@@ -16,6 +16,11 @@ export default function Subscriptions() {
   const { data: abis = [] } = useQuery<AbiItem[]>({ queryKey: ['abis'], queryFn: () => api.get('/abis') })
   const { data: allChannels = [] } = useQuery<{ id: string; name: string; type: string }[]>({ queryKey: ['channels'], queryFn: () => api.get('/channels') })
   const delMut = useMutation({ mutationFn: (id: string) => api.del(`/subscriptions/${id}`), onSuccess: () => qc.invalidateQueries({ queryKey: ['subscriptions'] }) })
+  const pauseMut = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'pause' | 'resume' }) =>
+      api.post(`/subscriptions/${id}/${action}`, {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['subscriptions'] }),
+  })
 
   const abiNameMap = useMemo(() => Object.fromEntries(abis.map(a => [a.id, a.name])), [abis])
 
@@ -55,6 +60,9 @@ export default function Subscriptions() {
               <td className="py-2 px-2 flex gap-2">
                 <button onClick={() => setTestingSub(s)} className="text-orange-500 hover:text-orange-700" title="测试"><FlaskConical size={14} /></button>
                 <button onClick={() => { setEditing(s); setShowForm(true) }} className="text-blue-500 hover:text-blue-700" title="编辑"><Pencil size={14} /></button>
+                {s.enabled
+                  ? <button onClick={() => pauseMut.mutate({ id: s.id, action: 'pause' })} className="text-amber-600 hover:text-amber-800" title="暂停"><Pause size={14} /></button>
+                  : <button onClick={() => pauseMut.mutate({ id: s.id, action: 'resume' })} className="text-green-600 hover:text-green-800" title="恢复"><Play size={14} /></button>}
                 <button onClick={() => delMut.mutate(s.id)} className="text-red-500 hover:text-red-700" title="删除"><Trash2 size={14} /></button>
               </td>
             </tr>

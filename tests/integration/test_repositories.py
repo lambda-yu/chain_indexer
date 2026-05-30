@@ -408,3 +408,24 @@ async def test_chain_rpc_pool_fields_default_empty(db) -> None:
         assert row is not None
         assert row.rpc_http_fallbacks == []
         assert row.rpc_timeout_ms == 10000
+
+
+@pytest.mark.asyncio
+async def test_delivery_record_is_replay_round_trip(db) -> None:
+    from core.config.repositories import DeliveryRecordRepo
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        r1 = await repo.create(
+            subscription_id="sub", channel_id="ch", chain_id="eth",
+            event_payload={"replay": True}, status="success", is_replay=True,
+        )
+        r2 = await repo.create(
+            subscription_id="sub", channel_id="ch", chain_id="eth",
+            event_payload={}, status="success",
+        )
+        await s.commit()
+        id1, id2 = r1.id, r2.id
+    async with db.session() as s:
+        repo = DeliveryRecordRepo(s)
+        assert (await repo.get(id1)).is_replay is True
+        assert (await repo.get(id2)).is_replay is False

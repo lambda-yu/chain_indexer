@@ -255,13 +255,13 @@ class DeliveryRecordRepo:
     async def create(
         self, *, subscription_id: str, channel_id: str, chain_id: str,
         event_payload: dict[str, Any], error: str | None = None, attempts: int = 1,
-        status: str = "success",
+        status: str = "success", is_replay: bool = False,
     ) -> DeliveryRecord:
         from core.config.models import DeliveryStatus
         row = DeliveryRecord(
             subscription_id=subscription_id, channel_id=channel_id, chain_id=chain_id,
             event_payload=event_payload, error=error, attempts=attempts,
-            status=DeliveryStatus(status),
+            status=DeliveryStatus(status), is_replay=is_replay,
         )
         self.s.add(row)
         await self.s.flush()

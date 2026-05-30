@@ -136,6 +136,11 @@ class ChannelBindRequest(BaseModel):
     channel_id: str
 
 
+class ReplayRequest(BaseModel):
+    from_block: int = Field(ge=0)
+    to_block: int = Field(ge=0)
+
+
 class SubscriptionDetail(SubscriptionOut):
     channel_ids: list[str] = Field(default_factory=list)
 

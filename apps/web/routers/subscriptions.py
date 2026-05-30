@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -9,6 +12,7 @@ from apps.web.deps import get_bus, get_session
 from apps.web.routers._common import bump_and_publish
 from apps.web.schemas import (
     ChannelBindRequest,
+    ReplayRequest,
     SubscriptionCreate,
     SubscriptionDetail,
     SubscriptionOut,
@@ -20,6 +24,7 @@ from core.config.repositories import (
     ChannelRepo,
     SubscriptionRepo,
 )
+from core.settings import load_settings
 
 router = APIRouter(prefix="/api/subscriptions", tags=["subscriptions"])
 
@@ -151,3 +156,53 @@ async def resume_subscription(
     await repo.update(sub_id, enabled=True)
     await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="resume")
     return {"status": "resumed", "id": sub_id}
+
+
+@router.post("/{sub_id}/replay", status_code=status.HTTP_202_ACCEPTED)
+async def replay_subscription(
+    sub_id: str,
+    payload: ReplayRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> dict[str, Any]:
+    repo = SubscriptionRepo(session)
+    sub = await repo.get(sub_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    if payload.to_block < payload.from_block:
+        raise HTTPException(status_code=422, detail="to_block < from_block")
+    span = payload.to_block - payload.from_block + 1
+    max_span = load_settings().replay.max_replay_blocks
+    if span > max_span:
+        raise HTTPException(status_code=422, detail=f"replay span {span} exceeds max {max_span}")
+
+    res = await session.execute(
+        select(SubscriptionChannel.channel_id).where(
+            SubscriptionChannel.subscription_id == sub_id
+        )
+    )
+    channel_ids: list[str] = list(res.scalars().all())
+    channels: list[dict[str, Any]] = []
+    ch_repo = ChannelRepo(session)
+    for cid in channel_ids:
+        ch = await ch_repo.get(cid)
+        if ch is not None:
+            channels.append({"id": ch.id, "name": ch.name, "type": ch.type.value, "config": ch.config})
+
+    request_id = str(uuid4())
+    await bus.publish("replay_request", {
+        "request_id": request_id,
+        "chain_id": sub.chain_id,
+        "subscription": {
+            "id": sub.id, "name": sub.name, "chain_id": sub.chain_id,
+            "address": sub.address, "abi_id": sub.abi_id,
+            "match_kind": sub.match_kind.value, "match_name": sub.match_name,
+            "arg_filters": sub.arg_filters, "enabled": True,
+            "channel_ids": channel_ids, "start_block": None,
+        },
+        "channels": channels,
+        "from_block": payload.from_block,
+        "to_block": payload.to_block,
+    })
+    return {"status": "accepted", "request_id": request_id,
+            "chain_id": sub.chain_id, "span": span}

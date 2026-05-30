@@ -361,17 +361,15 @@ Expected: FAIL (no `is_replay` column / param).
 
 - [ ] **Step 3: Add the model column**
 
-In `core/config/models.py`, in `DeliveryRecord` after `resolved_at` (confirm `Boolean` is imported — it is):
+In `core/config/models.py`, in `DeliveryRecord` after `resolved_at` (`Boolean` is already imported; `sqlalchemy as sa` is NOT imported in this file):
 
 ```python
     is_replay: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=sa.false()
+        Boolean, nullable=False, default=False, server_default="0"
     )
 ```
 
-Confirm `import sqlalchemy as sa` is present in this file; if not, add it (the migration file imports it separately).
-
-> If `sa` is not imported in `models.py`, use `from sqlalchemy import false as sa_false` and `server_default=sa_false()`, OR use a plain string `server_default="0"` (SQLite/PG both accept `"0"` for a boolean default). Pick whichever keeps the file's existing import style — read the file first.
+Use the string `server_default="0"` (NOT `sa.false()`) to avoid adding a `sqlalchemy as sa` import to `models.py` — this matches the file's existing style (other columns use string server_defaults like `server_default="100"` / `server_default="[]"`). SQLite and PostgreSQL both accept `"0"` as a boolean default. The `default=False` handles ORM-side inserts (so a `create(...)` without `is_replay` flushes `False`).
 
 - [ ] **Step 4: Create the migration**
 
@@ -1092,6 +1090,57 @@ async def test_replay_clamps_to_safe_tip(monkeypatch) -> None:
     # Request to_block=100 but safe_tip=14 → only blocks 10..14 (5 blocks).
     await runner.replay(_replay_msg(10, 100))
     assert adapter.fetch_block.await_count == 5
+
+
+def _build_solana_runner():
+    from apps.worker.chain_runner import ChainRunner
+    from core.config.snapshot import SnapshotChain
+
+    chain = SnapshotChain(
+        id="sol", kind="solana", rpc_http="http://x", rpc_ws=None,
+        confirmations=0, poll_interval_ms=2000, commitment="confirmed",
+        trace_internal_calls=False, log_query_range_blocks=100,
+        slot_query_range_blocks=1000,
+    )
+    runner = ChainRunner(
+        chain=chain,
+        adapter_factory=lambda c: MagicMock(),
+        channel_factory=lambda c: MagicMock(),
+        checkpoint_repo=MagicMock(),
+    )
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_replay_solana_skips_none_blocks_and_no_checkpoint() -> None:
+    runner = _build_solana_runner()
+    adapter = MagicMock()
+    adapter.get_latest_slot = AsyncMock(return_value=1000)
+    # slot 11 is a skipped (empty) slot → fetch_block returns None.
+    sol_block = MagicMock()
+    adapter.fetch_block = AsyncMock(side_effect=lambda s: None if s == 11 else sol_block)
+    runner._adapter = adapter
+    runner._cp = MagicMock(); runner._cp.save = AsyncMock()
+    runner._channel_factory = lambda c: MagicMock()
+    runner._solana_pipeline = MagicMock(); runner._solana_pipeline.run = MagicMock(return_value=[])
+
+    msg = {
+        "request_id": "r1", "chain_id": "sol",
+        "subscription": {
+            "id": "s1", "name": "t", "chain_id": "sol", "address": None,
+            "abi_id": None, "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True, "channel_ids": [], "start_block": None,
+        },
+        "channels": [],
+        "from_block": 10, "to_block": 12,
+    }
+    await runner.replay(msg)
+
+    # Fetched slots 10,11,12 (3 calls); the None at 11 is skipped without error.
+    assert adapter.fetch_block.await_count == 3
+    # run() only called for the 2 non-None blocks (slots 10 and 12).
+    assert runner._solana_pipeline.run.call_count == 2
+    runner._cp.save.assert_not_called()
 ```
 
 > Confirm `ChainRunner.__init__` accepts the kwargs used in `_build_evm_runner` (chain, adapter_factory, channel_factory, checkpoint_repo) — read the constructor. Adjust if the optional callback params differ.
@@ -1195,7 +1244,7 @@ In `apps/worker/chain_runner.py`, add to the `ChainRunner` class:
 
 > `Any` must be imported in `chain_runner.py` (it already is, used by callback params). `build_evm_log_filter`, `Matcher`, `Notifier` are already imported at module top.
 
-- [ ] **Step 4: Run** `uv run pytest tests/unit/test_chain_runner_replay.py -v` — expect 2 PASS.
+- [ ] **Step 4: Run** `uv run pytest tests/unit/test_chain_runner_replay.py -v` — expect 3 PASS (2 EVM + 1 Solana).
 
 - [ ] **Step 5: Run the broader chain_runner suite** for regressions:
 

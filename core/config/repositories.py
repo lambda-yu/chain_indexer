@@ -122,11 +122,13 @@ class SubscriptionRepo:
         arg_filters: dict[str, Any],
         enabled: bool,
         start_block: int | None = None,
+        business_name: str | None = None,
     ) -> Subscription:
         sub = Subscription(
             name=name, chain_id=chain_id, address=address, abi_id=abi_id,
             match_kind=match_kind, match_name=match_name, arg_filters=arg_filters,
             enabled=enabled, start_block=start_block,
+            business_name=business_name,
         )
         self.s.add(sub)
         await self.s.flush()

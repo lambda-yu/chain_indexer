@@ -201,6 +201,7 @@ async def replay_subscription(
             "match_kind": sub.match_kind.value, "match_name": sub.match_name,
             "arg_filters": sub.arg_filters, "enabled": True,
             "channel_ids": channel_ids, "start_block": None,
+            "business_name": sub.business_name,
         },
         "channels": channels,
         "from_block": payload.from_block,

@@ -25,6 +25,7 @@ async def _seed(db: Database) -> str:
             name="t", chain_id="eth", address=None, abi_id=None,
             match_kind=MatchKind.native_transfer, match_name=None,
             arg_filters={}, enabled=True, start_block=None,
+            business_name="trading-team",
         )
         await s.commit()
         return sub.id
@@ -68,6 +69,7 @@ async def test_replay_publishes_request(db: Database, redis_url: str) -> None:
         assert msg["subscription"]["start_block"] is None
         assert msg["subscription"]["enabled"] is True
         assert msg["from_block"] == 100 and msg["to_block"] == 200
+        assert msg["subscription"]["business_name"] == "trading-team"
     finally:
         if drain and not drain.done():
             drain.cancel()

@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom'
 import { api } from '@/api/client'
 import { Plus, Trash2, Pencil, FlaskConical, Pause, Play, History } from 'lucide-react'
 
-interface Sub { id: string; name: string; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null; last_processed_block: number | null }
+interface Sub { id: string; name: string; business_name: string | null; chain_id: string; match_kind: string; match_name: string | null; address: string | null; abi_id: string | null; enabled: boolean; arg_filters: Record<string, unknown>; start_block: number | null; last_processed_block: number | null }
 interface AbiItem { id: string; name: string; kind: string; body: unknown }
 
 export default function Subscriptions() {
@@ -38,7 +38,7 @@ export default function Subscriptions() {
       {isLoading ? <p className="text-gray-500">加载中...</p> : (
         <table className="w-full text-sm border-collapse">
           <thead><tr className="border-b text-left text-gray-500">
-            <th className="py-2 px-2">名称</th><th className="py-2 px-2">链</th><th className="py-2 px-2">类型</th>
+            <th className="py-2 px-2">名称</th><th className="py-2 px-2">业务</th><th className="py-2 px-2">链</th><th className="py-2 px-2">类型</th>
             <th className="py-2 px-2">ABI</th><th className="py-2 px-2">匹配</th><th className="py-2 px-2">渠道</th><th className="py-2 px-2">进度</th><th className="py-2 px-2">启用</th><th className="py-2 px-2">操作</th>
           </tr></thead>
           <tbody>{subs.map(s => (
@@ -52,6 +52,7 @@ export default function Subscriptions() {
                   {s.name}
                 </Link>
               </td>
+              <td className="py-2 px-2 text-xs text-gray-700">{s.business_name ?? '—'}</td>
               <td className="py-2 px-2 font-mono text-xs">{s.chain_id}</td>
               <td className="py-2 px-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100">{s.match_kind}</span></td>
               <td className="py-2 px-2 text-xs">{s.abi_id ? (abiNameMap[s.abi_id] ?? s.abi_id.slice(0, 8)) : '—'}</td>
@@ -164,6 +165,7 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
       arg_filters: af,
       start_block: fd.get('start_block') ? Number(fd.get('start_block')) : null,
       enabled: fd.get('enabled') === 'on',
+      business_name: (fd.get('business_name') as string | null) || null,
     }
 
     if (isEdit) {
@@ -201,6 +203,7 @@ function SubForm({ initial, abis, onClose }: { initial: Sub | null; abis: AbiIte
         <h3 className="text-lg font-bold">{isEdit ? '编辑订阅' : '添加订阅'}</h3>
 
         <input name="name" defaultValue={initial?.name ?? ''} placeholder="订阅名称" required className="w-full border rounded px-3 py-1.5 text-sm" />
+        <input name="business_name" defaultValue={initial?.business_name ?? ''} maxLength={255} placeholder="业务名称（可选，用于下游识别业务）" className="w-full border rounded px-3 py-1.5 text-sm" />
 
         <div className="grid grid-cols-2 gap-2">
           <div>

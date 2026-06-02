@@ -118,6 +118,7 @@ class Subscription(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     start_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
     last_processed_block: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
+    business_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Channel(Base, TimestampMixin):

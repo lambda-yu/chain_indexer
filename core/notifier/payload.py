@@ -31,25 +31,27 @@ def _safe(obj: Any) -> Any:
 def build_payload(
     *, event: Event, subscription: SnapshotSubscription, replay: bool = False
 ) -> dict[str, Any]:
-    payload = {
+    payload: dict[str, Any] = {
         "subscription_id": subscription.id,
         "subscription_name": subscription.name,
-        "chain_id": event.chain_id,
-        "event": {
-            "kind": event.kind,
-            "name": event.name,
-            "contract": _safe(event.contract),
-            "block_number": event.block_number,
-            "block_hash": _safe(event.block_hash),
-            "block_timestamp": event.block_timestamp,
-            "tx_hash": _safe(event.tx_hash),
-            "tx_index": event.tx_index,
-            "log_index": event.log_index,
-            "args": _safe(dict(event.args)),
-        },
-        "delivered_at": _now_unix(),
-        "delivery_id": _gen_id(),
     }
+    if subscription.business_name:
+        payload["business_name"] = subscription.business_name
+    payload["chain_id"] = event.chain_id
+    payload["event"] = {
+        "kind": event.kind,
+        "name": event.name,
+        "contract": _safe(event.contract),
+        "block_number": event.block_number,
+        "block_hash": _safe(event.block_hash),
+        "block_timestamp": event.block_timestamp,
+        "tx_hash": _safe(event.tx_hash),
+        "tx_index": event.tx_index,
+        "log_index": event.log_index,
+        "args": _safe(dict(event.args)),
+    }
+    payload["delivered_at"] = _now_unix()
+    payload["delivery_id"] = _gen_id()
     if replay:
         payload["replay"] = True
     return payload

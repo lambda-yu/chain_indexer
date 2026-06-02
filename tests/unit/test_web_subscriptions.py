@@ -141,3 +141,93 @@ def test_rebind_same_channel_409(db: Database) -> None:
         second = c.post(f"/api/subscriptions/{sub['id']}/channels",
                         json={"channel_id": channel_id})
     assert second.status_code == 409
+
+
+def test_subscription_business_name_roundtrip(db: Database) -> None:
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        chain_id, _ = _seed_chain_and_channel(c)
+        r = c.post("/api/subscriptions", json={
+            "name": "w", "business_name": "trading-team",
+            "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        })
+        assert r.status_code == 201, r.text
+        sub_id = r.json()["id"]
+        assert r.json()["business_name"] == "trading-team"
+
+        d = c.get(f"/api/subscriptions/{sub_id}").json()
+        assert d["business_name"] == "trading-team"
+
+
+def test_subscription_business_name_defaults_to_null(db: Database) -> None:
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        chain_id, _ = _seed_chain_and_channel(c)
+        r = c.post("/api/subscriptions", json={
+            "name": "w", "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        })
+        assert r.status_code == 201
+        assert r.json()["business_name"] is None
+
+
+def test_subscription_business_name_whitespace_normalized_to_null(db: Database) -> None:
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        chain_id, _ = _seed_chain_and_channel(c)
+        r = c.post("/api/subscriptions", json={
+            "name": "w", "business_name": "   ",
+            "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        })
+        assert r.status_code == 201
+        assert r.json()["business_name"] is None
+
+
+def test_subscription_business_name_put_updates_and_clears(db: Database) -> None:
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        chain_id, _ = _seed_chain_and_channel(c)
+        sub_id = c.post("/api/subscriptions", json={
+            "name": "w", "business_name": "old",
+            "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        }).json()["id"]
+
+        # Update to a new value
+        r = c.put(f"/api/subscriptions/{sub_id}", json={
+            "name": "w", "business_name": "new",
+            "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        })
+        assert r.status_code == 200
+        assert r.json()["business_name"] == "new"
+
+        # Update to null (clear)
+        r = c.put(f"/api/subscriptions/{sub_id}", json={
+            "name": "w", "business_name": None,
+            "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        })
+        assert r.status_code == 200
+        assert r.json()["business_name"] is None
+
+
+def test_subscription_business_name_over_length_422(db: Database) -> None:
+    bus = _FakeBus()
+    with _client(db, bus) as c:
+        chain_id, _ = _seed_chain_and_channel(c)
+        r = c.post("/api/subscriptions", json={
+            "name": "w", "business_name": "x" * 256,
+            "chain_id": chain_id, "address": None, "abi_id": None,
+            "match_kind": "native_transfer", "match_name": None,
+            "arg_filters": {}, "enabled": True,
+        })
+        assert r.status_code == 422

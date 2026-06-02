@@ -47,6 +47,7 @@ async def create_subscription(
         arg_filters=payload.arg_filters,
         enabled=payload.enabled,
         start_block=payload.start_block,
+        business_name=payload.business_name,
     )
     await bump_and_publish(session, bus, entity="subscription", entity_id=sub.id, action="create")
     return SubscriptionOut.model_validate(sub)
@@ -73,6 +74,7 @@ async def update_subscription(
         arg_filters=payload.arg_filters,
         enabled=payload.enabled,
         start_block=payload.start_block,
+        business_name=payload.business_name,
     )
     await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="update")
     await session.refresh(row)

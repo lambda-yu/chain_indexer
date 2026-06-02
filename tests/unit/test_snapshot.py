@@ -72,3 +72,13 @@ def test_missing_channel_id_is_ignored() -> None:
     sub = s.subscriptions_for_chain("eth-mainnet")[0]
     chans = s.channels_for_subscription(sub)
     assert [c.id for c in chans] == ["c1"]
+
+
+def test_subscription_snapshot_business_name_defaults_to_none() -> None:
+    s = _sub()
+    assert s.business_name is None
+
+
+def test_subscription_snapshot_business_name_carried_through() -> None:
+    s = _sub(business_name="trading-team")
+    assert s.business_name == "trading-team"

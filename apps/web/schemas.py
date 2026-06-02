@@ -95,6 +95,7 @@ class ChannelOut(BaseModel):
 
 class SubscriptionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    business_name: str | None = Field(default=None, max_length=255)
     chain_id: str
     address: str | None = None
     abi_id: str | None = None
@@ -103,6 +104,14 @@ class SubscriptionCreate(BaseModel):
     arg_filters: dict[str, ArgFilterValue] = Field(default_factory=dict)
     start_block: int | None = None
     enabled: bool = True
+
+    @field_validator("business_name", mode="before")
+    @classmethod
+    def _normalize_business_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
     @field_validator("arg_filters")
     @classmethod
@@ -121,6 +130,7 @@ class SubscriptionOut(BaseModel):
 
     id: str
     name: str
+    business_name: str | None
     chain_id: str
     address: str | None
     abi_id: str | None

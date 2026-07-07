@@ -93,6 +93,7 @@ class SolanaAdapter:
         async with track_rpc(self.chain_id, "getBlock"):
             config: dict[str, Any] = {
                 "commitment": str(self._commitment).lower(),
+                "encoding": "json",
                 "transactionDetails": "full",
                 "rewards": False,
                 "maxSupportedTransactionVersion": 0,
@@ -116,6 +117,25 @@ class SolanaAdapter:
                 return data
 
             body = await self._pool.call(_do)
+            if not isinstance(body, dict):
+                log.error(
+                    "solana.getBlock_body_not_dict",
+                    slot=slot,
+                    body_type=type(body).__name__,
+                    sample=repr(body)[:500],
+                )
+                raise RuntimeError(
+                    f"RPC 返回不是 dict（{type(body).__name__}）——"
+                    f"检查 RPC URL 是否指向 Solana JSON-RPC 端点（不是 batch/webhook）。"
+                    f" 样本: {repr(body)[:200]}"
+                )
+            if "error" in body:
+                log.error(
+                    "solana.getBlock_rpc_error",
+                    slot=slot,
+                    error=body.get("error"),
+                )
+                raise RuntimeError(f"RPC error: {body['error']!r}")
             result = body.get("result")
             return None if result is None else self._parse_block(slot, result)
 
@@ -150,6 +170,15 @@ class SolanaAdapter:
                 return data
 
             body = await self._pool.call(_do)
+            if not isinstance(body, dict):
+                log.error(
+                    "solana.getBlocks_body_not_dict",
+                    body_type=type(body).__name__,
+                    sample=repr(body)[:500],
+                )
+                raise RuntimeError(
+                    f"RPC 返回不是 dict（{type(body).__name__}）"
+                )
             return list(body.get("result") or [])
 
     def _parse_block(self, slot: int, result: dict[str, Any]) -> SolanaBlock:
@@ -157,7 +186,26 @@ class SolanaAdapter:
         for tx_obj in result.get("transactions", []):
             meta = tx_obj.get("meta", {}) or {}
             tx_data = tx_obj.get("transaction", {})
+            # Some providers return the transaction as a [base64, "base64"] list
+            # when encoding wasn't explicitly requested. We ask for encoding=json
+            # in fetch_block, but be defensive against non-conforming providers.
+            if not isinstance(tx_data, dict):
+                log.warning(
+                    "solana.tx_non_dict_skipped",
+                    slot=slot,
+                    tx_data_type=type(tx_data).__name__,
+                    sample=repr(tx_data)[:200] if tx_data else None,
+                )
+                continue
             msg = tx_data.get("message", {})
+            if not isinstance(msg, dict):
+                log.warning(
+                    "solana.tx_message_non_dict_skipped",
+                    slot=slot,
+                    message_type=type(msg).__name__,
+                    sample=repr(msg)[:200] if msg else None,
+                )
+                continue
 
             signatures = tx_data.get("signatures", [])
             sig = signatures[0] if signatures else ""

@@ -1236,7 +1236,8 @@ async def test_source_only_field_survives_db_roundtrip(
         # Read the stored mapping back from the DB directly.
         async with db.session() as s:
             row = await SubscriptionRepo(s).get(sid)
-            stored = row.payload_mapping  # type: ignore[union-attr]
+            assert row is not None
+            stored = row.payload_mapping
 
         # `const` key must not exist on the stored dict — else the mapper
         # takes the const branch and returns null.

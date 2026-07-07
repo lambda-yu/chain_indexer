@@ -129,6 +129,15 @@ def build_payload(*, event, subscription, replay=False) -> tuple[dict, dict]:
 it through. `Notifier.dispatch` uses the two-tuple: source goes into `delivery_records`,
 `out` goes to channels (see §6).
 
+**`Notifier._send_one` signature change.** Today the method takes
+`(ch, payload, sub_id, ch_id)` and uses the single `payload` for both `ch.send(...)`
+and the `on_success` / `on_failure` callbacks. New signature:
+`(ch, source, delivery_payload, sub_id, ch_id)`. `ch.send` receives `delivery_payload`;
+callbacks receive `source` as the payload argument (so `event_payload` written to
+`delivery_records` is the pre-mapping structure — this is what §6 relies on).
+`payload.get("chain_id", "")` inside callbacks still works because `source` retains
+`chain_id`.
+
 **`apply_mapping` implementation:**
 
 - Iterate `mapping["fields"]` in order.
@@ -160,7 +169,10 @@ Resolution order:
    - `event` / `call` — read the subscription's bound ABI (EVM ABI JSON or Solana IDL)
      for the specific `match_name`, produce `args` where each field is `"<type>"`
      (e.g. `"<uint256>"`, `"<address>"`, `"<pubkey>"`).
-   - ABI missing / not bound → degrade to `args: {}`.
+   - ABI missing / not bound → degrade to `args: {}`. All other envelope fields
+     (`kind`, `name`, `contract`, `block_number`, `block_hash`, `block_timestamp`,
+     `tx_hash`, `tx_index`, `log_index`) still receive the same
+     placeholder values as the native/token path.
 
    Return `origin = "synthetic"`.
 
@@ -227,7 +239,10 @@ POST /api/subscriptions/{id}/payload_preview
 ```
 
 Pure function: no DB writes, no channel side effects. Runs the same `apply_mapping`
-that production dispatch uses.
+that production dispatch uses. When `sample` is omitted / `null`, the endpoint runs
+the same resolution as `GET /payload_sample` (real delivery first, synthetic
+fallback) so the preview reflects a realistic downstream view even before the user
+has ever received a delivery.
 
 ### 5. Frontend UI
 
@@ -313,16 +328,19 @@ current mapping and runs it against the stored source via a new endpoint:
 
 ```
 GET /api/delivery_records/{id}/downstream_preview
-→ 200 { "output": {...}, "warnings": [...], "mapping_version": "current" }
+→ 200 { "output": {...}, "warnings": [...], "mapping_source": "current" }
 ```
 
-`mapping_version: "current"` clarifies that this reflects the subscription's mapping
+`mapping_source: "current"` clarifies that this reflects the subscription's mapping
 as it exists now, not necessarily the mapping in effect at delivery time. (We do not
 version mappings — YAGNI; if a downstream disputes an old payload, use the source.)
 
 **Replay:** `notifier.dispatch` is shared, so replay automatically picks up the
 subscription's current mapping. This is the expected behavior — replays test the
 current pipeline, not archaeology.
+
+**Preview response field naming.** The response uses `mapping_source: "current"`
+(not `mapping_version`) to avoid implying we version mappings.
 
 ### 7. Testing
 
@@ -415,7 +433,9 @@ current pipeline, not archaeology.
 - [ ] `core/notifier/payload_mapper.py` (new)
 - [ ] `core/notifier/payload.py` refactor: extract `build_source_payload`, change
   `build_payload` return signature to `(source, delivery)`
-- [ ] `core/notifier/notifier.py`: use the two-tuple, persist source
+- [ ] `core/notifier/notifier.py`: use the two-tuple, persist source; update
+  `_send_one` to `(ch, source, delivery_payload, sub_id, ch_id)` and pass `source`
+  into the `on_success` / `on_failure` callbacks
 - [ ] `core/config/models.py`: `payload_mapping` column
 - [ ] `core/config/snapshot.py`: `SnapshotSubscription.payload_mapping`
 - [ ] `apps/web/schemas.py`: `MappingField`, `PayloadMapping`, `SubscriptionCreate/Update/Read`

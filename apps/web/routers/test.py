@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import traceback
 from dataclasses import asdict
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -29,6 +31,7 @@ from core.parser.spl_ops import SplOpsParser
 from core.parser.spl_transfer import SplTransferParser
 
 router = APIRouter(prefix="/api/test", tags=["test"])
+log = structlog.get_logger(__name__)
 
 
 class ParseBlockRequest(BaseModel):
@@ -86,7 +89,18 @@ async def parse_block(
     except HTTPException:
         raise
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"detail": f"解析失败: {exc!r}"})
+        tb = traceback.format_exc()
+        log.error(
+            "test.parse_block_failed",
+            chain_id=req.chain_id,
+            block_number=req.block_number,
+            error=repr(exc),
+            traceback=tb,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"解析失败: {exc!r}", "traceback": tb},
+        )
 
 
 async def _do_parse_block(
@@ -335,4 +349,15 @@ async def test_subscription(
     except HTTPException:
         raise
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"detail": f"测试失败: {exc!r}"})
+        tb = traceback.format_exc()
+        log.error(
+            "test.test_subscription_failed",
+            subscription_id=req.subscription_id,
+            block_number=req.block_number,
+            error=repr(exc),
+            traceback=tb,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"测试失败: {exc!r}", "traceback": tb},
+        )

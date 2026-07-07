@@ -459,7 +459,10 @@ def test_build_payload_returns_source_and_delivery_tuple(
     monkeypatch.setattr("core.notifier.payload._gen_id", lambda: "did")
 
     source, delivery = build_payload(event=_event(), subscription=_sub())
-    assert source == delivery  # No mapping → the two dicts are equal (same object OK too).
+    assert source == delivery
+    # Distinct objects — no aliasing that would let a downstream mutation
+    # leak from delivery to persisted source.
+    assert source is not delivery
     assert source["delivery_id"] == "did"
     assert delivery["delivery_id"] == "did"
 
@@ -646,13 +649,14 @@ def build_payload(
     - `source` is always the un-mapped shape and is what gets persisted to
       delivery_records.event_payload.
     - `delivery_payload` is what channels send. When the subscription has no
-      mapping, it IS `source` (same object; safe because callers don't mutate).
-      When mapping is set, it is the mapped result with delivery_id /
-      delivered_at / replay carried over from `source` (setdefault semantics).
+      mapping, it is a *shallow copy* of `source` so a mutating middleware on
+      one dict doesn't corrupt the other. When mapping is set, it is the
+      mapped result with delivery_id / delivered_at / replay carried over from
+      `source` (setdefault semantics).
     """
     source = build_source_payload(event=event, subscription=subscription, replay=replay)
     if not subscription.payload_mapping:
-        return source, source
+        return source, dict(source)
 
     delivery, warnings = apply_mapping(source, subscription.payload_mapping)
     for w in warnings:
@@ -674,19 +678,19 @@ def build_payload(
 
 - [ ] **Step 5: Fix every existing call site**
 
-Grep for `build_payload(` across the codebase:
+Grep for `build_payload(` across production code:
 
 ```bash
-grep -rn "build_payload(" core apps tests --include="*.py"
+grep -rn "build_payload(" apps/ core/ | grep -v /test_
 ```
 
-Expected hits (production paths):
-- `core/notifier/notifier.py` — the notifier itself (updated in Task 1.7).
+Expected: exactly ONE hit — `core/notifier/notifier.py` inside `dispatch` (updated
+in Task 1.7). If any other production call surfaces (e.g. in `apps/worker` or
+`core/parser`), unpack the tuple there too — the receiver should always want
+either the source (for persistence) or the delivery (for sending), never the
+ambiguous single dict. Report before proceeding if the count differs.
 
-Test hits: the ones you already edited in Step 2. If any other production call
-appears (e.g. a replay path in `core/parser` or `apps/worker`), unpack the tuple
-there too — the receiver should always want either the source (for persistence)
-or the delivery (for sending), never the ambiguous single dict.
+Test hits: the ones you already edited in Step 2. `grep -rn "build_payload(" tests/` should show them all consuming the tuple form.
 
 - [ ] **Step 6: Run all payload + mapper tests to verify PASS**
 
@@ -1199,6 +1203,56 @@ async def test_create_read_update_clear_payload_mapping(
             assert r.json()["payload_mapping"] is None
     finally:
         await bus.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_source_only_field_survives_db_roundtrip(
+    db: Database, redis_url: str,
+) -> None:
+    """Regression: source-only field must not degrade to `const:null` after CRUD.
+
+    pydantic's default model_dump() serializes `const: None` for a source-only
+    field. If the router uses the default (instead of exclude_unset=True), the
+    stored dict has `const: null`, and the runtime mapper's key-presence check
+    switches to the const branch, overriding the source resolution with null.
+    """
+    from core.notifier.payload_mapper import apply_mapping
+    from core.config.repositories import SubscriptionRepo
+
+    bus = RedisBus(url=redis_url); await bus.connect()
+    try:
+        chain_id = await _seed_chain(db, "eth-rt")
+        async with _app_client(db, bus) as c:
+            r = await c.post("/api/subscriptions", json={
+                "name": "s", "chain_id": chain_id,
+                "match_kind": "native_transfer",
+                "payload_mapping": {"fields": [
+                    {"target": "tx", "source": "event.tx_hash"},
+                ]},
+            })
+            assert r.status_code == 201
+            sid = r.json()["id"]
+
+        # Read the stored mapping back from the DB directly.
+        async with db.session() as s:
+            row = await SubscriptionRepo(s).get(sid)
+            stored = row.payload_mapping  # type: ignore[union-attr]
+
+        # `const` key must not exist on the stored dict — else the mapper
+        # takes the const branch and returns null.
+        assert stored is not None
+        assert "const" not in stored["fields"][0], (
+            "source-only field has stale const:null; router should use "
+            "model_dump(exclude_unset=True)"
+        )
+
+        # Confirm the mapper resolves the source, not null.
+        out, _warnings = apply_mapping(
+            {"event": {"tx_hash": "0xdead"}}, stored,
+        )
+        assert out == {"tx": "0xdead"}
+    finally:
+        await bus.disconnect()
 ```
 
 - [ ] **Step 2: Run to verify FAIL**
@@ -1244,28 +1298,37 @@ Add to `SubscriptionOut`:
         self.s.add(sub); await self.s.flush(); return sub
 ```
 
-`apps/web/routers/subscriptions.py` — in `create_subscription` and `update_subscription`, plumb the field through. **Important:** in `update_subscription`, `PUT` with `payload_mapping: null` must actively set the column to NULL (not "leave unchanged"). Convert the pydantic model back to plain dict for storage:
+`apps/web/routers/subscriptions.py` — in `create_subscription` and `update_subscription`, plumb the field through. **Two subtleties matter here:**
+
+1. **`PUT` with `payload_mapping: null` must actively set the column to NULL** (not "leave unchanged"), so operators can clear a mapping.
+2. **Use `model_dump(exclude_unset=True)`, not the default `model_dump()`.** With the default, `{"target":"x","source":"event.tx_hash"}` serializes to `{"target":"x","source":"event.tx_hash","const":null}` because `const: Any | None = None` is a defaulted field. That poisons the runtime mapper: `apply_mapping` uses `"const" in field` (key presence) to detect the const branch, so a stored `const: null` on a source-only field silently overrides the source at delivery time. `exclude_unset=True` drops the defaulted key and keeps `const` only when the user explicitly set it — which is exactly the discriminator the mapper relies on.
 
 ```python
     # In create_subscription:
+    mapping_dict = (
+        payload.payload_mapping.model_dump(exclude_unset=True)
+        if payload.payload_mapping else None
+    )
     sub = await SubscriptionRepo(session).create(
         # ... existing fields ...
         business_name=payload.business_name,
-        payload_mapping=(
-            payload.payload_mapping.model_dump() if payload.payload_mapping else None
-        ),
+        payload_mapping=mapping_dict,
     )
 
     # In update_subscription:
+    mapping_dict = (
+        payload.payload_mapping.model_dump(exclude_unset=True)
+        if payload.payload_mapping else None
+    )
     await repo.update(
         sub_id,
         # ... existing fields ...
         business_name=payload.business_name,
-        payload_mapping=(
-            payload.payload_mapping.model_dump() if payload.payload_mapping else None
-        ),
+        payload_mapping=mapping_dict,
     )
 ```
+
+**Note about nested `model_dump`:** `PayloadMapping.model_dump(exclude_unset=True)` propagates the flag to each `MappingField`, so a field that only set `target` + `source` (leaving `const` at default) round-trips as `{"target":"x","source":"..."}` — no `const` key. Verified.
 
 - [ ] **Step 4: Run tests**
 
@@ -1367,11 +1430,11 @@ Expected: 404 (endpoint doesn't exist).
 # core/notifier/sample.py
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from core.config.snapshot import SnapshotSubscription
 from core.notifier.payload import build_source_payload
-from core.parser.event import Event
+from core.parser.event import Event, EventKind
 
 _SYNTH_EVENT = Event(
     chain_id="synthetic",
@@ -1434,8 +1497,6 @@ def build_synthetic_sample(
             )
 
     # Narrow to the Literal expected by Event without silencing mypy.
-    from typing import cast
-    from core.parser.event import EventKind
     valid_kinds: tuple[EventKind, ...] = (
         "native_transfer", "token_transfer", "event", "call",
     )
@@ -1496,6 +1557,7 @@ async def get_payload_sample(
         match_kind=sub_row.match_kind.value, match_name=sub_row.match_name,
         arg_filters=sub_row.arg_filters or {}, enabled=True,
         business_name=sub_row.business_name,
+        payload_mapping=sub_row.payload_mapping,
     )
     return PayloadSampleOut(sample=build_synthetic_sample(snap, abi_body), origin="synthetic")
 ```
@@ -1706,6 +1768,10 @@ async def test_downstream_preview_uses_current_mapping(
             assert r.status_code == 200
             body = r.json()
             assert body["output"] == {"h": "0xabc"}
+            # Regression: source-only field must resolve from the source path,
+            # not collapse to null because of a stray `const:null` in the
+            # stored mapping. (See test_source_only_field_survives_db_roundtrip.)
+            assert body["output"]["h"] is not None
             assert body["mapping_source"] == "current"
     finally:
         await bus.disconnect()
@@ -1971,8 +2037,19 @@ function PayloadMappingEditor({
   value: PayloadMapping | null
   onChange: (v: PayloadMapping | null) => void
 }) {
+  // Normalize an incoming field to the shape the editor emits:
+  //   { target, source }        for source-mode
+  //   { target, const }         for const-mode
+  // Server payloads with model_dump(exclude_unset=True) already come clean,
+  // but a legacy row could still carry stray null keys. Strip them.
+  const normalize = (fs: MappingField[] | undefined): MappingField[] =>
+    (fs ?? []).map(f => {
+      if ('const' in f && f.const !== undefined) return { target: f.target, const: f.const }
+      return { target: f.target, source: f.source ?? '' }
+    })
+
   const [open, setOpen] = useState<boolean>(value !== null)
-  const [rows, setRows] = useState<MappingField[]>(value?.fields ?? [])
+  const [rows, setRows] = useState<MappingField[]>(normalize(value?.fields))
   const [sample, setSample] = useState<PayloadSample | null>(null)
   const [preview, setPreview] = useState<PreviewOut | null>(null)
 
@@ -2004,7 +2081,10 @@ function PayloadMappingEditor({
 
   // Propagate up — only when the mapping actually differs, so a mount with an
   // existing `value` doesn't mark the parent form dirty.
-  const lastEmittedRef = useRef<PayloadMapping | null>(value ?? null)
+  const initialFields = normalize(value?.fields)
+  const lastEmittedRef = useRef<PayloadMapping | null>(
+    initialFields.length === 0 ? null : { fields: initialFields }
+  )
   useEffect(() => {
     const next: PayloadMapping | null = rows.length === 0 ? null : { fields: rows }
     if (JSON.stringify(next) === JSON.stringify(lastEmittedRef.current)) return

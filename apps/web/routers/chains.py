@@ -91,6 +91,20 @@ async def get_chain(
     return ChainOut.model_validate(row)
 
 
+@router.delete("/{chain_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chain(
+    chain_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> None:
+    repo = ChainRepo(session)
+    row = await repo.get(chain_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="chain not found")
+    await repo.delete(chain_id)
+    await bump_and_publish(session, bus, entity="chain", entity_id=chain_id, action="delete")
+
+
 @router.get("/{chain_id}/status")
 async def chain_status(
     chain_id: str,

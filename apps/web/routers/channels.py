@@ -79,6 +79,20 @@ async def get_channel(
     return ChannelOut.model_validate(row)
 
 
+@router.delete("/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_channel(
+    channel_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> None:
+    repo = ChannelRepo(session)
+    row = await repo.get(channel_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="channel not found")
+    await repo.delete(channel_id)
+    await bump_and_publish(session, bus, entity="channel", entity_id=channel_id, action="delete")
+
+
 @router.get("/{channel_id}/health")
 async def channel_health(
     channel_id: str,

@@ -109,6 +109,20 @@ async def get_subscription(
     return SubscriptionDetail(**base.model_dump(), channel_ids=channel_ids)
 
 
+@router.delete("/{sub_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_subscription(
+    sub_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    bus: RedisBus = Depends(get_bus),  # noqa: B008
+) -> None:
+    repo = SubscriptionRepo(session)
+    row = await repo.get(sub_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    await repo.delete(sub_id)
+    await bump_and_publish(session, bus, entity="subscription", entity_id=sub_id, action="delete")
+
+
 @router.post("/{sub_id}/channels", status_code=status.HTTP_204_NO_CONTENT)
 async def bind_channel(
     sub_id: str,
